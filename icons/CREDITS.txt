@@ -1,0 +1,4 @@
+Icons
+lantern, sun, loop: Lorc, https://game-icons.net, CC BY 3.0
+sound, music, vibration: Delapouite, https://game-icons.net, CC BY 3.0
+pause, play: Phosphor Icons, https://phosphoricons.com, MIT

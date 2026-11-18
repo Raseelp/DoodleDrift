@@ -1,0 +1,16 @@
+# Godot editor cache, imported files and export credentials
+.godot/
+/android/
+
+# Builds
+build/
+*.apk
+*.aab
+
+# Throwaway test scripts
+tools_tmp/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
