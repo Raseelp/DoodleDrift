@@ -11,16 +11,18 @@ const MARK_LOOPS := 4
 
 var lakes: Array = []
 var unlocked := 1
+var chapter_seen := false  # the "still lakes are bright again" moment has played
 var marks: Array = []
 var stats: Array = []  # per lake: tries, wins, fails, crashes, revives, best, last fails
 var sound_on := true
 var music_on := true
 var vibration_on := true
 var dev := {"chains": true, "life": true, "fading": false,
-	"crash": true, "boost": true, "unlock_all": false}
+	"crash": true, "boost": true, "unlock_all": false, "boat3d": true}
 ## Daylight tuning from the Dev panel: a multiplier on the automatic time, or a fixed time (0 = automatic).
 var day_mult := 1.0
 var day_fixed := 0
+var boat_tilt := 35.0  # Dev: camera tilt of the 3D boat in degrees (0 = straight down)
 
 var ui_theme: Theme
 var title_font: FontVariation
@@ -55,7 +57,7 @@ func _build_lakes() -> void:
 	lakes = [
 		{
 			"name": "First Light",
-			"hint": "Hold the left or right side to steer.\nDraw a loop around the lanterns.",
+			"hint": "Light every lantern before dark.",
 			"par": 1, "pitch": 1.0, "motes": "petals",
 			"pal": _pal({
 				"land": "7d9a72", "land_dark": "6c8964", "tree": "56755a", "tree_hi": "86a67c",
@@ -73,7 +75,7 @@ func _build_lakes() -> void:
 		},
 		{
 			"name": "Two Coves",
-			"hint": "The wake fades behind you.\nClose each loop before it does.",
+			"hint": "",
 			"par": 2, "pitch": 1.1225, "motes": "petals",
 			"pal": _pal({
 				"land": "93ab6c", "land_dark": "829a5e", "tree": "66824c", "tree_hi": "a0bb7b",
@@ -103,7 +105,7 @@ func _build_lakes() -> void:
 			}),
 			"water": [[70, 330], [220, 210], [500, 200], [650, 330], [670, 620], [640, 900],
 				[560, 1150], [330, 1210], [130, 1140], [60, 880], [90, 600]],
-			"lanterns": [[250, 400, 0], [470, 380, 0], [360, 680, 0], [255, 960, 0], [560, 760, 0]],
+			"lanterns": [[250, 400, 0], [470, 380, 0], [360, 680, 0], [255, 960, 0], [545, 700, 0]],
 			"constellation": {"name": "The Crossroads", "edges": [[0, 2], [1, 2], [2, 3], [2, 4]]},
 			"rocks": [[360, 520, 40], [215, 790, 32], [495, 850, 45], [385, 1035, 28]],
 			"reeds": [],
@@ -261,6 +263,11 @@ func set_daylight(mult: float, fixed: int) -> void:
 	_save()
 
 
+func set_boat_tilt(deg: float) -> void:
+	boat_tilt = deg
+	_save()
+
+
 func reset_stats() -> void:
 	for i in stats.size():
 		stats[i] = _new_stat()
@@ -319,6 +326,18 @@ func reset_progress() -> void:
 	_save()
 
 
+func chapter_done() -> bool:
+	for i in lakes.size():
+		if not lake_done(i):
+			return false
+	return true
+
+
+func mark_chapter_seen() -> void:
+	chapter_seen = true
+	_save()
+
+
 func lake_done(i: int) -> bool:
 	return int(marks[i]) & MARK_ALL != 0
 
@@ -342,6 +361,7 @@ func _load() -> void:
 	if cf.load(SAVE_PATH) != OK:
 		return
 	unlocked = clampi(int(cf.get_value("progress", "unlocked", 1)), 1, lakes.size())
+	chapter_seen = bool(cf.get_value("progress", "chapter_seen", false))
 	var saved: Array = cf.get_value("progress", "marks", [])
 	for i in mini(saved.size(), marks.size()):
 		marks[i] = int(saved[i])
@@ -352,6 +372,7 @@ func _load() -> void:
 		dev[k] = bool(cf.get_value("dev", k, dev[k]))
 	day_mult = clampf(float(cf.get_value("dev", "day_mult", 1.0)), 0.5, 2.0)
 	day_fixed = clampi(int(cf.get_value("dev", "day_fixed", 0)), 0, 120)
+	boat_tilt = clampf(float(cf.get_value("dev", "boat_tilt", 35.0)), 0.0, 60.0)
 	var st: Array = cf.get_value("stats", "lakes", [])
 	for i in mini(st.size(), stats.size()):
 		if st[i] is Dictionary:
@@ -361,6 +382,7 @@ func _load() -> void:
 func _save() -> void:
 	var cf := ConfigFile.new()
 	cf.set_value("progress", "unlocked", unlocked)
+	cf.set_value("progress", "chapter_seen", chapter_seen)
 	cf.set_value("progress", "marks", marks)
 	cf.set_value("settings", "sound", sound_on)
 	cf.set_value("settings", "music", music_on)
@@ -369,6 +391,7 @@ func _save() -> void:
 		cf.set_value("dev", k, dev[k])
 	cf.set_value("dev", "day_mult", day_mult)
 	cf.set_value("dev", "day_fixed", day_fixed)
+	cf.set_value("dev", "boat_tilt", boat_tilt)
 	cf.set_value("stats", "lakes", stats)
 	cf.save(SAVE_PATH)
 
@@ -455,6 +478,32 @@ func icon(kind: String) -> Texture2D:
 func draw_icon(ci: CanvasItem, kind: String, c: Vector2, s: float, col: Color) -> void:
 	var sz := s * 1.1 * float(ICON_OPTICAL.get(kind, 1.0))
 	ci.draw_texture_rect(icon(kind), Rect2(c - Vector2(sz, sz) * 0.5, Vector2(sz, sz)), false, col)
+
+
+## A solid square game button with a darker bottom edge that it presses down into, holding one white icon.
+func square_button(tex: Texture2D, side: float, icon_w: int) -> Button:
+	var b := Button.new()
+	b.icon = tex
+	b.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	b.add_theme_constant_override("icon_max_width", icon_w)
+	b.custom_minimum_size = Vector2(side, side)
+	b.size = Vector2(side, side)
+	var edge := maxi(4, int(side * 0.065))
+	for st in [["normal", Color("1d3a44")], ["hover", Color("1d3a44")], ["pressed", Color("16303a")], ["hover_pressed", Color("16303a")]]:
+		var down := String(st[0]).ends_with("pressed")
+		var sb := StyleBoxFlat.new()
+		sb.bg_color = st[1]
+		sb.border_color = Color("0f242c")
+		sb.border_width_bottom = 0 if down else edge
+		sb.content_margin_top = edge if down else 0
+		sb.content_margin_left = 0
+		sb.content_margin_right = 0
+		sb.content_margin_bottom = 0
+		sb.set_corner_radius_all(int(side * 0.17))
+		sb.anti_aliasing = true
+		b.add_theme_stylebox_override(st[0], sb)
+	b.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+	return b
 
 
 ## Turns a settings button into an icon toggle: dimmed with a slash when off.

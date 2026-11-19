@@ -5,6 +5,7 @@ signal exit_requested
 signal level_requested(index: int)
 
 const DrawNode = preload("res://scripts/draw_node.gd")
+const Boat3D = preload("res://scripts/boat3d.gd")
 const WaterShader = preload("res://scripts/water.gdshader")
 const LandShader = preload("res://scripts/land.gdshader")
 
@@ -14,7 +15,9 @@ const TURN_RATE := 2.5
 const WAKE_LIFE := 9.0
 const CUT_FADE := 1.5
 const WAKE_STEP := 7.0
-const BOAT_RADIUS := 12.0
+const BOAT_RADIUS := 22.0  # the boat is about 2x its first size
+const STERN := 32.0  # distance from the boat's centre to its stern, where the wake starts
+const BOW := 34.0
 const MIN_LOOP_AREA := 2600.0
 const NOTES := [1.0, 1.125, 1.25, 1.5, 1.6667, 2.0, 2.25, 2.5]
 const HULL := [Vector2(19, 0), Vector2(9, -7.5), Vector2(-13, -7.5), Vector2(-16, -4.5),
@@ -28,10 +31,15 @@ const CHAIN_WINDOW := 4.5
 const CHAIN_BONUS := 3.0
 const FADE_TIME := 28.0
 const DRIFT := Vector2(18, 12)
-const LANTERN_SOFT := 30.0  # the boat starts being eased away from a lantern here
-const LANTERN_HARD := 21.0  # and stops here: the hull just touching the lantern
+const LANTERN_SOFT := 42.0  # the boat starts being eased away from a lantern here
+const LANTERN_HARD := 32.0  # and stops here: the hull just touching the lantern
 const DAY_BONUS := 0.25  # extra daylight from the ad, as a share of the lake's whole day
-const MAX_REVIVES := 2  # per try, for each kind of ad offer
+const MAX_REVIVES := 2
+const EMBER_FLIGHT := 0.55  # seconds an ember takes to arc from the boat to a lantern
+const EMBER_GAP := 0.4  # seconds between embers when one loop lights several lanterns
+const BAR_H := 88.0  # height of the top bar under the safe area
+const HUD_EDGE := 32.0  # side margin of everything in the top bar
+const HUD_PLATE := Color(0.031, 0.067, 0.086, 0.8)  # per try, for each kind of ad offer
 const CRASH_LINES := {
 	"rock": ["The stones were closer than they looked.", "A soft knock on the rocks.\nThe lanterns will wait.",
 		"Even herons misjudge the stones.", "Bump. The lake forgives you."],
@@ -86,6 +94,13 @@ var hint_alpha := 1.0
 var turn_vel := 0.0
 var move_dir := 0.0
 var parts: Array = []
+var boat3d: SubViewport  # test: the boat as a 3D model (Dev setting "3D boat")
+var boat_sprite: Sprite2D
+var boat_shadow: Sprite2D
+const BOAT_SPRITE_SCALE := 0.29
+var shards: Array = []  # pieces of trail a duck snapped off: they flash, drift apart and sink
+var embers: Array = []  # glowing embers flying from the boat's lamp to lanterns
+var lamp_flare := -10.0  # when the boat's lamp last sent an ember
 var spray_t := 0.0
 var boost_until := -10.0
 var light_times: Array = []
@@ -120,8 +135,6 @@ var light_node: Node2D
 var ui_draw: Node2D
 var modulate_node: CanvasModulate
 var ui_root: Control
-var hint_label: Label
-var go_label: Label
 var overlay: Control
 
 
@@ -144,6 +157,7 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	get_tree().paused = false
+	Engine.time_scale = 1.0
 
 
 func _safe_top() -> float:
@@ -285,6 +299,18 @@ func _build_nodes() -> void:
 	detail_node = DrawNode.new()
 	detail_node.draw_fn = _draw_details
 	world.add_child(detail_node)
+	if Game.dev_on("boat3d"):
+		boat3d = Boat3D.new()
+		add_child(boat3d)
+		boat_shadow = Sprite2D.new()
+		boat_shadow.texture = boat3d.get_texture()
+		boat_shadow.scale = Vector2.ONE * BOAT_SPRITE_SCALE
+		boat_shadow.modulate = Color(0.02, 0.06, 0.08, 0.32)
+		world.add_child(boat_shadow)
+		boat_sprite = Sprite2D.new()
+		boat_sprite.texture = boat3d.get_texture()
+		boat_sprite.scale = Vector2.ONE * BOAT_SPRITE_SCALE  # the boat is about 70 px long on the lake
+		world.add_child(boat_sprite)
 
 	var tree_node := DrawNode.new()
 	tree_node.draw_fn = _draw_trees
@@ -319,37 +345,19 @@ func _build_ui() -> void:
 	ui_draw.draw_fn = _draw_ui
 	ui_root.add_child(ui_draw)
 
-	var name_label := Label.new()
-	name_label.text = String(lake["name"])
-	name_label.position = Vector2(36, top_inset + 30)
-	name_label.add_theme_font_size_override("font_size", 30)
-	ui_root.add_child(name_label)
-
-	var pause := Button.new()
-	pause.icon = Game.icon("pause")
-	pause.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	pause.add_theme_constant_override("icon_max_width", 30)
-	pause.custom_minimum_size = Vector2(84, 84)
-	pause.position = Vector2(view_size.x - 120, top_inset + 26)
-	pause.add_theme_font_size_override("font_size", 26)
+	# Top bar: a dark strip holding the lanterns (left), the loop count and pause (right).
+	var strip := ColorRect.new()
+	strip.color = HUD_PLATE
+	strip.position = Vector2.ZERO
+	strip.size = Vector2(view_size.x, top_inset + BAR_H)
+	strip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui_root.add_child(strip)
+	ui_root.move_child(strip, 0)
+	var pause := Game.square_button(Game.icon("pause"), 64, 26)
+	pause.position = Vector2(view_size.x - HUD_EDGE - 64, top_inset + (BAR_H - 64) * 0.5 - 2)
 	pause.pressed.connect(_pause)
 	ui_root.add_child(pause)
-
-	hint_label = Label.new()
-	hint_label.text = String(lake["hint"])
-	hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint_label.position = Vector2(0, top_inset + 170)
-	hint_label.size = Vector2(view_size.x, 120)
-	hint_label.add_theme_font_size_override("font_size", 27)
-	ui_root.add_child(hint_label)
-
-	go_label = Label.new()
-	go_label.text = "Touch to set off"
-	go_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	go_label.position = Vector2(0, top_inset + 260)
-	go_label.size = Vector2(view_size.x, 50)
-	go_label.add_theme_font_size_override("font_size", 23)
-	ui_root.add_child(go_label)
+	pause.reset_size()
 
 
 # ---------------------------------------------------------------- loop
@@ -376,11 +384,8 @@ func _process(delta: float) -> void:
 				history.append(boat_pos)
 				if history.size() > 12:
 					history.remove_at(0)
-			if dusk >= 1.0 and state == "play":
-				if days_used < MAX_REVIVES and _lit_count() < lanterns.size():
-					_offer_daylight()
-				else:
-					_end("dark")
+			if dusk >= 1.0 and state == "play" and _lit_count() < lanterns.size():
+				_show_game_over("dark")
 		"complete", "dark":
 			_move_boat(delta, false)
 			end_timer -= delta
@@ -389,22 +394,31 @@ func _process(delta: float) -> void:
 				_show_results()
 		"crashed":
 			end_timer -= delta
-			heading += delta * 0.8 * maxf(0.0, end_timer)
+			if not boat3d:
+				heading += delta * 0.8 * maxf(0.0, end_timer)
 			if end_timer <= 0.0:
-				state = "results"
-				_show_crash()
+				_show_game_over("wreck")
 		"results":
 			_move_boat(delta, false)
 
 	_run_events()
 	_update_effects(delta)
+	if boat3d:
+		boat_sprite.position = boat_pos
+		boat_sprite.modulate.a = 1.0 - 0.9 * boat3d.sunk()
+		boat_shadow.position = boat_pos + Vector2(-12, 16)
+		boat_shadow.modulate.a = 0.32 * (1.0 - boat3d.sunk())
+		# A gentle rock and pitch on top of the lean into turns, so it sits in the water.
+		var lean := -turn_vel / TURN_RATE * 0.2 + sin(clock * 1.3) * 0.035
+		var pitch := speed / SPEED * 0.05 + sin(clock * 1.9) * 0.03
+		boat3d.set_pose(heading, lean, pitch, 0.0)
 	if state in ["ready", "play"]:
 		Sfx.set_mood(dusk, speed / SPEED, _in_reeds(boat_pos))
+	else:
+		Sfx.set_mood(dusk, 0.0, false)
 
 	var target_hint := 1.0 if state == "ready" else 0.0
-	hint_alpha = move_toward(hint_alpha, target_hint, delta * 1.6)
-	hint_label.modulate.a = hint_alpha
-	go_label.modulate.a = hint_alpha * (0.55 + 0.45 * sin(clock * 3.0))
+	hint_alpha = move_toward(hint_alpha, target_hint, delta * 2.4)
 
 	modulate_node.color = Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, dusk) * 0.92)
 	detail_node.queue_redraw()
@@ -438,7 +452,7 @@ func _unhandled_input(event: InputEvent) -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
 		if overlay != null and is_instance_valid(overlay):
-			if state == "results":
+			if state in ["results", "over"]:
 				exit_requested.emit()
 			else:
 				_resume()
@@ -506,12 +520,12 @@ func _move_boat(delta: float, steering: bool) -> void:
 		if bump_cool <= 0.0:
 			bump_cool = 0.7
 			Sfx.bump()
-			ripples.append({"p": np + Vector2.from_angle(heading) * 14.0, "t": clock,
+			ripples.append({"p": np + Vector2.from_angle(heading) * BOW, "t": clock,
 				"life": 1.0, "r0": 4.0, "r1": 22.0, "light": false})
 	np = _lantern_push(np, delta)
 	boat_pos = np
 
-	var stern := boat_pos - Vector2.from_angle(heading) * 14.0
+	var stern := boat_pos - Vector2.from_angle(heading) * STERN
 	if wp.is_empty() or wp[wp.size() - 1].distance_to(stern) >= WAKE_STEP:
 		_add_wake_point(stern, state == "play")
 
@@ -529,7 +543,7 @@ func _move_boat(delta: float, steering: bool) -> void:
 		var side := fwd.orthogonal()
 		var turn := absf(turn_vel) / TURN_RATE
 		for s2 in [-1.0, 1.0]:
-			_part(boat_pos + fwd * 15.0 + side * s2 * 5.0, side * s2 * randf_range(25, 55) * (1.0 + turn) - fwd * randf_range(5, 30),
+			_part(boat_pos + fwd * BOW * 0.9 + side * s2 * 6.0, side * s2 * randf_range(25, 55) * (1.0 + turn) - fwd * randf_range(5, 30),
 				randf_range(0.3, 0.55), randf_range(1.4, 2.6) * (1.3 if boosting else 1.0), Color(1, 1, 1, 0.9), false)
 		_part(stern + side * randf_range(-4, 4), -fwd * randf_range(4, 14) + side * randf_range(-6, 6), randf_range(0.9, 1.6), randf_range(1.2, 2.4), Color(1, 1, 1, 0.55), false)
 		if boosting:
@@ -617,6 +631,12 @@ func _crash(kind: String) -> void:
 	touches.clear()
 	Sfx.crash()
 	Game.vibrate(90)
+	if boat3d:
+		# The hull splits in slow motion; splinters of wood fly from the impact.
+		boat3d.wreck()
+		Engine.time_scale = 0.35
+		for k in 16:
+			_part(boat_pos, Vector2.from_angle(randf() * TAU) * randf_range(40, 140), randf_range(0.6, 1.2), randf_range(2.0, 3.6), Color("a8743f"), false)
 	for k in 3:
 		ripples.append({"p": boat_pos, "t": clock + k * 0.15, "life": 1.6, "r0": 6.0, "r1": 40.0 + k * 14.0, "light": false})
 
@@ -830,10 +850,12 @@ func _on_loop(poly: PackedVector2Array) -> void:
 	var last_t := clock
 	for k in accepted.size():
 		var i: int = accepted[k]
-		var at := clock + 0.15 + k * 0.13
+		var launch := clock + 0.1 + k * EMBER_GAP
+		var at := launch + EMBER_FLIGHT
 		lanterns[i]["lit"] = true
 		lanterns[i]["lit_t"] = at
 		events.append({"at": at, "kind": "light", "i": i})
+		embers.append({"i": i, "t0": launch, "from": Vector2.ZERO, "launched": false})
 		last_t = at
 
 	if _lit_count() == lanterns.size():
@@ -869,6 +891,7 @@ func _run_events() -> void:
 		match String(e["kind"]):
 			"light":
 				var l: Dictionary = lanterns[e["i"]]
+				Sfx.ignite()
 				Sfx.chime(NOTES[int(l["note"]) % NOTES.size()] * float(lake["pitch"]))
 				Game.vibrate(22)
 				ripples.append({"p": l["p"], "t": clock, "life": 1.8, "r0": 10.0, "r1": 90.0, "light": true})
@@ -895,6 +918,20 @@ func _end(kind: String, wait := 1.8) -> void:
 func _update_effects(delta: float) -> void:
 	_prune_wake()
 	_update_parts(delta)
+	var keep_e: Array = []
+	for e in embers:
+		if not e["launched"] and clock >= float(e["t0"]):
+			e["launched"] = true
+			e["from"] = boat_pos + Vector2.from_angle(heading) * BOW * 0.4
+			lamp_flare = clock
+			Sfx.ember()
+		if clock < float(e["t0"]) + EMBER_FLIGHT:
+			keep_e.append(e)
+		else:
+			var lp: Vector2 = lanterns[e["i"]]["p"]
+			for k in 6:
+				_part(lp, Vector2.from_angle(randf() * TAU) * randf_range(20, 70), randf_range(0.3, 0.6), randf_range(1.6, 2.6), Color("fff1c8"), true)
+	embers = keep_e
 	var life := Game.dev_on("life")
 	for l in lanterns:
 		if life:
@@ -917,6 +954,7 @@ func _update_effects(delta: float) -> void:
 			fish_timer = randf_range(2.5, 6.0)
 			_spawn_fish()
 	_update_ducks()
+	_update_shards(delta)
 	var fk: Array = []
 	for f in floaters:
 		if clock - float(f["t"]) < 1.8:
@@ -1037,7 +1075,7 @@ func _update_ducks() -> void:
 		var head := _duck_pos(d, 0.0)
 		var struck := false
 		for i in int(d["n"]):
-			if state == "play" and _duck_pos(d, i * 20.0).distance_to(boat_pos) < 15.0:
+			if state == "play" and _duck_pos(d, i * 20.0).distance_to(boat_pos) < 26.0:
 				struck = true
 		if struck:
 			d["hit"] = clock
@@ -1055,16 +1093,103 @@ func _update_ducks() -> void:
 			d["rip"] = clock
 			for i in int(d["n"]):
 				ripples.append({"p": _duck_pos(d, 6.0 + i * 18.0), "t": clock, "life": 1.3, "r0": 3.0, "r1": 16.0, "light": false})
-		# Ducks cut the wake: the part behind the cut can no longer close a loop and fades out over CUT_FADE.
+		# Ducks cut the wake: the part behind the cut can no longer close a loop, so it snaps off.
 		var cut := -1
 		for i in wp.size():
-			if wp[i].distance_to(head) < 13.0:
+			if wp[i].distance_to(head) < 13.0 and wc[i] > 1e8:
 				cut = i
 		if cut >= 0 and state == "play":
-			loop_base = maxi(loop_base, cut + 1)
-			for i in cut + 1:
-				wc[i] = minf(wc[i], clock)
+			# One snap sound and splash per crossing; while the duck is still on the line it only trims.
+			var loud: bool = clock - float(d.get("snap", -9.0)) > 0.8
+			_snap_trail(cut, head, loud)
+			d["snap"] = clock
 	ducks = keep
+
+
+## The trail up to `cut` snaps where the duck crossed: it leaves the live wake at once and becomes
+## short pieces that flash, then break off one after another from the cut outwards, drift apart,
+## curl and sink. Pieces near the cut are short and fly harder; far ones are longer and slower.
+func _snap_trail(cut: int, at: Vector2, loud := true) -> void:
+	loop_base = maxi(loop_base, cut + 1)
+	var pts := PackedVector2Array()
+	var fs := PackedFloat32Array()
+	for i in cut + 1:
+		if wc[i] > 1e8:
+			pts.append(wp[i])
+			fs.append(clampf(1.0 - (clock - wt[i]) / WAKE_LIFE, 0.0, 1.0))
+		wc[i] = clock - CUT_FADE - 1.0  # gone from the live wake; _prune_wake drops it
+	# Walk from the cut back along the trail, chopping it into pieces.
+	var k := pts.size() - 1
+	var dist := 0.0
+	while k >= 1:
+		var want := lerpf(16.0, 44.0, clampf(dist / 260.0, 0.0, 1.0)) * randf_range(0.8, 1.25)
+		var piece := PackedVector2Array([pts[k]])
+		var pf := PackedFloat32Array([fs[k]])
+		var run := 0.0
+		while k >= 1 and run < want:
+			var step := pts[k].distance_to(pts[k - 1])
+			k -= 1
+			if step > 40.0:
+				break  # a gap in the trail, e.g. after a patch-up
+			run += step
+			piece.append(pts[k])
+			pf.append(fs[k])
+		k -= 1  # one segment left out between pieces, so the break shows at once
+		var start_d := dist
+		dist += run + WAKE_STEP
+		if piece.size() < 2 or pf[0] + pf[pf.size() - 1] < 0.06:
+			continue  # too short, or already too faint to see
+		var c := Vector2.ZERO
+		for p in piece:
+			c += p
+		c /= piece.size()
+		var local := PackedVector2Array()
+		for p in piece:
+			local.append(p - c)
+		var near := clampf(1.0 - start_d / 320.0, 0.0, 1.0)
+		var tang := (piece[piece.size() - 1] - piece[0]).normalized()
+		var side := tang.orthogonal()
+		if side.dot(c - at) < 0.0:
+			side = -side
+		var away := (c - at).normalized() if c.distance_to(at) > 1.0 else side
+		var v := (away * 0.55 + side * 0.45 + tang * randf_range(-0.25, 0.25)).normalized()
+		shards.append({
+			"pts": local, "f": pf, "c": c,
+			"v": v * lerpf(28.0, 95.0, near) * randf_range(0.8, 1.2),
+			"rot": 0.0, "av": randf_range(-1.0, 1.0) * lerpf(0.25, 1.1, near),
+			"curl": randf_range(-0.7, 0.7),
+			"t0": clock, "delay": 0.1 + start_d / 900.0, "life": randf_range(1.0, 1.35), "sank": false,
+		})
+	if not loud:
+		return
+	# At the break itself: a bright flick, a splash and rings, and the snap.
+	for j in 10:
+		var fc := Color.WHITE if j % 2 == 0 else Color(pal["light"])
+		_part(at + Vector2(randf_range(-4, 4), randf_range(-4, 4)), Vector2.from_angle(randf() * TAU) * randf_range(35, 95), randf_range(0.35, 0.7), randf_range(1.4, 2.6), fc, true)
+	ripples.append({"p": at, "t": clock, "life": 1.1, "r0": 4.0, "r1": 28.0, "light": true})
+	ripples.append({"p": at, "t": clock, "life": 1.5, "r0": 3.0, "r1": 18.0, "light": false})
+	Sfx.trail_snap()
+	Game.vibrate(15)
+
+
+func _update_shards(delta: float) -> void:
+	var keep: Array = []
+	for s in shards:
+		var t := clock - float(s["t0"]) - float(s["delay"])
+		var life := float(s["life"])
+		if t > life:
+			continue
+		keep.append(s)
+		if t <= 0.0:
+			continue
+		s["c"] += s["v"] * delta
+		s["v"] *= exp(-1.4 * delta)
+		s["rot"] += float(s["av"]) * delta
+		s["av"] *= exp(-1.2 * delta)
+		if not s["sank"] and t > life * 0.55:
+			s["sank"] = true  # it goes under: a small ring where it was
+			ripples.append({"p": s["c"], "t": clock, "life": 0.9, "r0": 2.0, "r1": 11.0, "light": false})
+	shards = keep
 
 
 # ---------------------------------------------------------------- drawing
@@ -1210,10 +1335,28 @@ func _draw_details(n: Node2D) -> void:
 		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 	_draw_parts(n, false)
+	# Embers in flight, drawn solid so they read as warm sparks even on bright daytime water.
+	for e in embers:
+		if not e["launched"]:
+			continue
+		var ek := clampf((clock - float(e["t0"])) / EMBER_FLIGHT, 0.0, 1.0)
+		var ea: Vector2 = e["from"]
+		var eb: Vector2 = lanterns[e["i"]]["p"]
+		var emid := (ea + eb) * 0.5 + Vector2(0, -minf(140.0, 60.0 + ea.distance_to(eb) * 0.35))
+		for s2 in range(6, -1, -1):
+			var kk := maxf(0.0, ek - s2 * 0.04)
+			var ep := ea.lerp(emid, kk).lerp(emid.lerp(eb, kk), kk)
+			if s2 == 0:
+				n.draw_circle(ep, 7.0, Color("ff9a3c"), true, -1.0, true)
+				n.draw_circle(ep, 4.0, Color("ffe7a6"), true, -1.0, true)
+			else:
+				n.draw_circle(ep, 4.2 - s2 * 0.5, Color(1.0, 0.62, 0.24, 0.75 - s2 * 0.1), true, -1.0, true)
 	var hull := PackedVector2Array(HULL)
-	n.draw_set_transform(boat_pos + Vector2(4, 6), heading, Vector2.ONE)
+	if boat3d:
+		return
+	n.draw_set_transform(boat_pos + Vector2(6, 10), heading, Vector2.ONE * 2.0)
 	n.draw_colored_polygon(hull, shade)
-	n.draw_set_transform(boat_pos, heading, Vector2.ONE)
+	n.draw_set_transform(boat_pos, heading, Vector2.ONE * 2.0)
 	n.draw_colored_polygon(hull, Color("efe6d6"))
 	var rim := hull.duplicate()
 	rim.append(hull[0])
@@ -1229,6 +1372,23 @@ func _draw_light(n: Node2D) -> void:
 	_draw_parts(n, true)
 	var light: Color = pal["light"]
 	var glow: Texture2D = Game.glow_tex
+	# The boat's lamp: a small warm light at the bow that flares when it sends an ember.
+	var flare := clampf(1.0 - (clock - lamp_flare) / 0.35, 0.0, 1.0)
+	var lamp := boat_pos + Vector2.from_angle(heading) * BOW * 0.7
+	var lamp_r := 18.0 + 16.0 * flare
+	n.draw_texture_rect(glow, Rect2(lamp - Vector2(lamp_r, lamp_r), Vector2(lamp_r, lamp_r) * 2.0), false, Color(light, 0.35 + 0.2 * dusk + 0.5 * flare))
+	for e in embers:
+		if not e["launched"]:
+			continue
+		var k := clampf((clock - float(e["t0"])) / EMBER_FLIGHT, 0.0, 1.0)
+		var a: Vector2 = e["from"]
+		var b: Vector2 = lanterns[e["i"]]["p"]
+		var mid := (a + b) * 0.5 + Vector2(0, -minf(140.0, 60.0 + a.distance_to(b) * 0.35))
+		for s in range(7, -1, -1):
+			var kk := maxf(0.0, k - s * 0.04)
+			var p := a.lerp(mid, kk).lerp(mid.lerp(b, kk), kk)
+			var r := 34.0 if s == 0 else 14.0 - s * 1.4
+			n.draw_texture_rect(glow, Rect2(p - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(light, (0.45 + 0.3 * dusk) if s == 0 else 0.35 - s * 0.04))
 	var power := 0.8 + 0.45 * dusk
 
 	for f in flashes:
@@ -1307,7 +1467,7 @@ func _draw_wake(n: Node2D) -> void:
 	for i in wt.size():
 		ages.append(clock - wt[i])
 		cuts.append(clampf(1.0 - (clock - wc[i]) / CUT_FADE, 0.0, 1.0))
-	pts.append(boat_pos - Vector2.from_angle(heading) * 14.0)
+	pts.append(boat_pos - Vector2.from_angle(heading) * STERN)
 	ages.append(0.0)
 	cuts.append(1.0)
 	var m := pts.size()
@@ -1344,50 +1504,226 @@ func _draw_wake(n: Node2D) -> void:
 			var b := i * 2
 			idx.append_array([b, b + 1, b + 2, b + 1, b + 3, b + 2])
 		RenderingServer.canvas_item_add_triangle_array(n.get_canvas_item(), idx, verts, cols)
+	_draw_shards(n)
+
+
+func _draw_shards(n: Node2D) -> void:
+	if shards.is_empty():
+		return
+	var light: Color = pal["light"]
+	var sunk_col: Color = pal["deep"].lightened(0.35)
+	var verts := PackedVector2Array()
+	var cols := PackedColorArray()
+	var idx := PackedInt32Array()
+	for s in shards:
+		var age := clock - float(s["t0"])
+		var tt := clampf((age - float(s["delay"])) / float(s["life"]), 0.0, 1.0)
+		var flash := clampf(1.0 - age / 0.22, 0.0, 1.0)  # everything cut lights up once at the snap
+		var fade := pow(1.0 - tt, 1.6)
+		var col := light.lerp(Color.WHITE, flash * 0.8).lerp(sunk_col, smoothstep(0.3, 1.0, tt))
+		var pts: PackedVector2Array = s["pts"]
+		var fs: PackedFloat32Array = s["f"]
+		var m := pts.size()
+		var shrink := 1.0 - 0.3 * tt
+		var world_pts := PackedVector2Array()
+		for i in m:
+			var u := float(i) / float(m - 1) - 0.5
+			var ang := float(s["rot"]) + float(s["curl"]) * tt * u * 2.0
+			world_pts.append(s["c"] + (pts[i] * shrink).rotated(ang))
+		for pass_i in 2:
+			var base := verts.size()
+			for i in m:
+				var f := fs[i]
+				var tip := 0.35 if i == 0 or i == m - 1 else 1.0  # snapped ends taper to a point
+				var w := (2.0 + 7.0 * f) * tip * (1.0 - 0.5 * tt) * (1.0 + 0.12 * flash)
+				var a := minf(1.0, pow(f, 1.25) + flash * 0.5) * fade
+				if pass_i == 0:
+					w *= 2.4
+					a *= 0.12 + 0.1 * flash
+				else:
+					a *= 0.8
+				var prev := world_pts[maxi(i - 1, 0)]
+				var next := world_pts[mini(i + 1, m - 1)]
+				var nrm := (next - prev).orthogonal().normalized() * w * 0.5
+				verts.append(world_pts[i] + nrm)
+				verts.append(world_pts[i] - nrm)
+				cols.append(Color(col, a))
+				cols.append(Color(col, a))
+			for i in m - 1:
+				var b := base + i * 2
+				idx.append_array([b, b + 1, b + 2, b + 1, b + 3, b + 2])
+	RenderingServer.canvas_item_add_triangle_array(n.get_canvas_item(), idx, verts, cols)
 
 
 func _draw_ui(n: Node2D) -> void:
 	var light: Color = pal["light"]
-	var y := top_inset + 92.0
-	for i in lanterns.size():
-		var l: Dictionary = lanterns[i]
-		var p := Vector2(48 + i * 26, y)
-		if l["lit"] and clock >= float(l["lit_t"]):
-			n.draw_circle(p, 7.0, light)
-		else:
-			n.draw_arc(p, 6.0, 0.0, TAU, 24, Color(1, 1, 1, 0.55), 2.0, true)
-	var font: Font = Game.ui_theme.default_font
-	for f in floaters:
-		var k := (clock - float(f["t"])) / 1.8
-		var fp: Vector2 = f["p"] + off + Vector2(-200, -30 - k * 40.0)
-		n.draw_string(font, fp + Vector2(0, 2), f["text"], HORIZONTAL_ALIGNMENT_CENTER, 400, 25, Color(0, 0, 0, 0.35 * (1.0 - k)))
-		n.draw_string(font, fp, f["text"], HORIZONTAL_ALIGNMENT_CENTER, 400, 25, Color(light.lightened(0.4), 1.0 - k * k))
-	if clock < boost_until and state == "play":
-		var bx := 48.0 + lanterns.size() * 26.0 + 14.0
-		var left := (boost_until - clock) / BOOST_TIME
-		n.draw_line(Vector2(bx, y), Vector2(bx + 70.0 * left, y), Color(light, 0.9), 4.0, true)
-	var gx := view_size.x - 150.0
-	var gy := top_inset + 150.0
-	var lit_now := 0
-	for l in lanterns:
-		if l["lit"] and clock >= float(l["lit_t"]):
-			lit_now += 1
+	var font: Font = Game.heading_font
+	var cy := top_inset + BAR_H * 0.5
 	var par := int(lake["par"])
+
+	# Lanterns, left: one icon per lantern, lit ones glow in the lake's light colour.
+	const LI := 44.0
+	const LGAP := 10.0
+	for k in lanterns.size():
+		var l: Dictionary = lanterns[k]
+		var c := Vector2(HUD_EDGE + LI * 0.5 + k * (LI + LGAP), cy)
+		var on: bool = l["lit"] and clock >= float(l["lit_t"])
+		if on:
+			n.draw_texture_rect(Game.glow_tex, Rect2(c - Vector2(34, 34), Vector2(68, 68)), false, Color(light, 0.55))
+		Game.draw_icon(n, "lantern", c, LI / 1.1, light if on else Color(1, 1, 1, 0.42))
+
+	# Loops, right of centre next to pause: icon and count, red once over the limit.
+	var over := loops_used > par
+	var loop_col := Color("ff9a8a") if over else light
+	var txt := "%d/%d" % [loops_used, par]
+	var tw := font.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
+	var lx := view_size.x - HUD_EDGE - 64 - 24 - tw
+	Game.draw_icon(n, "loop", Vector2(lx - 8 - 17, cy), 34, loop_col)
+	n.draw_string(font, Vector2(lx, cy + 10), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 28, Color.WHITE if not over else loop_col)
+
+	# Seconds of light left, in the bar next to the loops: sun icon and number.
+	var secs := "%d s" % ceili((1.0 - dusk) * duration)
+	var sw := font.get_string_size(secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
+	var sun_x := lx - 8 - 34 - 32 - sw
+	var day_col := light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk))
+	Game.draw_icon(n, "sun", Vector2(sun_x - 8 - 17, cy), 34, day_col)
+	n.draw_string(font, Vector2(sun_x, cy + 10), secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28, Color.WHITE)
+
+	# Daylight: a bar under the strip that fills to the right as the day passes, the sun riding its end.
+	# Two marks on it, told apart by colour, shape and label: DUSK (white tick, the "before dusk" goal)
+	# and BEST (gold pointer, where your best time on this lake finished).
+	var by := top_inset + BAR_H
+	var w := view_size.x
+	var day_f := clampf(dusk, 0.0, 1.0)
 	var late := dusk > 0.75 or day_taken
-	Game.draw_icon(n, "lantern", Vector2(gx, gy), 30, light if lit_now == lanterns.size() else Color(1, 1, 1, 0.9))
-	n.draw_string(font, Vector2(gx + 24, gy + 9), "%d/%d" % [lit_now, lanterns.size()], HORIZONTAL_ALIGNMENT_LEFT, -1, 24, Color(1, 1, 1, 0.92))
-	Game.draw_icon(n, "sun", Vector2(gx, gy + 44), 30, Color(1, 1, 1, 0.3) if late else light)
-	n.draw_string(font, Vector2(gx + 24, gy + 53), "late" if late else "%d s" % int((0.75 - dusk) * duration), HORIZONTAL_ALIGNMENT_LEFT, -1, 24, Color(1, 1, 1, 0.45 if late else 0.92))
-	# Loop goal: gold while within the limit, red once it is exceeded.
-	Game.draw_icon(n, "loop", Vector2(gx, gy + 88), 30, Color("ff9a8a") if loops_used > par else light)
-	n.draw_string(font, Vector2(gx + 24, gy + 97), "%d/%d" % [loops_used, par], HORIZONTAL_ALIGNMENT_LEFT, -1, 24, Color("ff9a8a") if loops_used > par else Color(1, 1, 1, 0.92))
-	var x0 := 40.0
-	var x1 := view_size.x - 40.0
-	var ty := top_inset + 10.0
-	n.draw_line(Vector2(x0, ty), Vector2(x1, ty), Color(1, 1, 1, 0.16), 2.0, true)
-	var sx := lerpf(x0, x1, dusk)
-	n.draw_line(Vector2(x0, ty), Vector2(sx, ty), Color(light, 0.55), 2.0, true)
-	n.draw_circle(Vector2(sx, ty), 5.0, Color(light, 1.0 - dusk * 0.6))
+	n.draw_rect(Rect2(0, by, w, 10), HUD_PLATE)
+	n.draw_rect(Rect2(0, by, w, 10), Color(1, 1, 1, 0.14))
+	n.draw_rect(Rect2(0, by, w * day_f, 10), day_col)
+	var dusk_x := w * 0.75
+	var dusk_a := 0.35 if late else 0.95
+	n.draw_rect(Rect2(dusk_x - 2, by - 6, 4, 22), Color(1, 1, 1, dusk_a))
+	var label_y := by + 22.0
+	var dusk_w := _tag_width(font, "DUSK")
+	var dusk_l := dusk_x - dusk_w * 0.5
+	var best := float(Game.stats[lake_index]["best"])
+	if best > 0.0:
+		var best_x := clampf(best / maxf(1.0, duration), 0.0, 1.0) * w
+		n.draw_colored_polygon(PackedVector2Array([Vector2(best_x - 9, by - 14), Vector2(best_x + 9, by - 14), Vector2(best_x, by - 2)]), light)
+		n.draw_rect(Rect2(best_x - 2, by - 2, 4, 16), light)
+		var bt := "BEST %d s" % roundi(best)
+		var bw := _tag_width(font, bt)
+		var best_l := best_x - bw * 0.5
+		# Too close to share the row centred: slide the two tags apart around the point between the marks.
+		if absf(best_x - dusk_x) < (bw + dusk_w) * 0.5 + 8.0:
+			var mid := (best_x + dusk_x) * 0.5
+			if best_x <= dusk_x:
+				best_l = mid - 4.0 - bw
+				dusk_l = mid + 4.0
+			else:
+				dusk_l = mid - 4.0 - dusk_w
+				best_l = mid + 4.0
+		_tag(n, font, best_l, label_y, bt, light)
+	_tag(n, font, dusk_l, label_y, "DUSK", Color(1, 1, 1, dusk_a))
+	var sx := clampf(w * day_f, 22.0, w - 22.0)
+	Game.draw_icon(n, "sun", Vector2(sx, by + 5), 36, day_col)
+
+	# Pop-ups (chain, swift water, patched up…): gold on a dark plate under the bar, newest at the top.
+	var py := by + 64.0
+	for k in range(floaters.size() - 1, -1, -1):
+		var f: Dictionary = floaters[k]
+		var age := (clock - float(f["t"])) / 1.8
+		var a := clampf(minf(age * 8.0, (1.0 - age) * 4.0), 0.0, 1.0)
+		var t: String = String(f["text"]).to_upper()
+		var fw := font.get_string_size(t, HORIZONTAL_ALIGNMENT_LEFT, -1, 22).x
+		var rect := Rect2(Vector2((w - fw) * 0.5 - 24, py + 24), Vector2(fw + 48, 48))
+		n.draw_style_box(_plate_box(), rect)
+		n.draw_string(font, Vector2(rect.position.x + 24, rect.position.y + 32), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 22, Color(light, a))
+		py += 56.0
+
+	# Before setting off: the lake's rule under the bar, the steering zones and a callout on a lantern.
+	if hint_alpha > 0.01:
+		_draw_tutorial(n, font, by, light, hint_alpha)
+
+
+## The tutorial shown before you set off; it fades once you start moving.
+func _draw_tutorial(n: Node2D, font: Font, by: float, light: Color, a: float) -> void:
+	var w := view_size.x
+	n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	# The lake's rule, one plate under the bar (lakes without a rule show none).
+	var rule := String(lake["hint"])
+	if rule != "":
+		var rw := 0.0
+		for line in rule.split("\n"):
+			rw = maxf(rw, font.get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1, 24).x)
+		rw = minf(rw + 16.0, w - 2 * HUD_EDGE - 48)
+		var lines := font.get_multiline_string_size(rule, HORIZONTAL_ALIGNMENT_CENTER, rw, 24).y
+		var rr := Rect2(Vector2((w - rw) * 0.5 - 24, by + 72), Vector2(rw + 48, lines + 24))
+		var box := _plate_box()
+		box.bg_color.a *= a
+		n.draw_style_box(box, rr)
+		n.draw_multiline_string(font, Vector2(rr.position.x + 24, rr.position.y + 12 + 24), rule, HORIZONTAL_ALIGNMENT_CENTER, rw, 24, -1, Color(1, 1, 1, a))
+
+	# Steering zones: the lower 40% of the screen, split down the middle.
+	var zt := view_size.y * 0.6
+	var zh := view_size.y - zt
+	var dy := zt + zh * 0.08
+	while dy < view_size.y - zh * 0.08:
+		n.draw_line(Vector2(w * 0.5, dy), Vector2(w * 0.5, minf(dy + 14, view_size.y)), Color(1, 1, 1, 0.35 * a), 3.0)
+		dy += 26.0
+	for side in [-1.0, 1.0]:
+		var cx := w * (0.25 if side < 0 else 0.75)
+		var ccy := zt + zh * 0.34
+		var ch := PackedVector2Array([Vector2(cx - side * 10, ccy - 26), Vector2(cx + side * 14, ccy), Vector2(cx - side * 10, ccy + 26)])
+		n.draw_polyline(ch, Color(0, 0, 0, 0.5 * a), 11.0, true)
+		n.draw_polyline(ch, Color(1, 1, 1, 0.9 * a), 6.0, true)
+		_shadow_text(n, font, Vector2(cx - 120, ccy + 70), "HOLD TO TURN", 22, Color(1, 1, 1, 0.9 * a), 240, HORIZONTAL_ALIGNMENT_CENTER)
+
+	# Callout on the first lake only: a ring around the lantern nearest the boat, a thin line out to a short note.
+	if lake_index != 0:
+		return
+	var best_l: Dictionary = lanterns[0]
+	for l in lanterns:
+		if Vector2(l["p"]).distance_to(boat_pos) < Vector2(best_l["p"]).distance_to(boat_pos):
+			best_l = l
+	var lp: Vector2 = Vector2(best_l["p"]) + off
+	var toward_centre := -1.0 if lp.x > w * 0.5 else 1.0
+	n.draw_arc(lp, 26.0, 0.0, TAU, 40, Color(0, 0, 0, 0.45 * a), 5.0, true)
+	n.draw_arc(lp, 26.0, 0.0, TAU, 40, Color(light, a), 2.5, true)
+	var elbow := lp + Vector2(toward_centre * 26.0 * 0.7071, -26.0 * 0.7071)
+	var end := elbow + Vector2(toward_centre * 28.0, -64.0)
+	n.draw_line(elbow, end, Color(0, 0, 0, 0.45 * a), 5.0, true)
+	n.draw_line(elbow, end, Color(light, a), 2.5, true)
+	var note := "Loop to light the lantern"
+	var nw := font.get_string_size(note, HORIZONTAL_ALIGNMENT_LEFT, -1, 24).x
+	var nx := end.x - 16 if toward_centre > 0 else end.x + 16 - nw
+	_shadow_text(n, font, Vector2(clampf(nx, 16, w - 16 - nw), end.y - 12), note, 24, Color(light, a))
+
+
+func _shadow_text(n: Node2D, font: Font, pos: Vector2, text: String, size: int, col: Color, width := -1.0, align := HORIZONTAL_ALIGNMENT_LEFT) -> void:
+	n.draw_string(font, pos + Vector2(0, 3), text, align, width, size, Color(0, 0, 0, 0.7 * col.a))
+	n.draw_string(font, pos, text, align, width, size, col)
+
+
+func _tag_width(font: Font, text: String) -> float:
+	return font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, 18).x + 20.0
+
+
+## A small label on a dark tag starting at x (kept on screen).
+func _tag(n: Node2D, font: Font, x: float, y: float, text: String, col: Color) -> void:
+	var tw := _tag_width(font, text)
+	var r := Rect2(Vector2(clampf(x, 8.0, view_size.x - 8.0 - tw), y), Vector2(tw, 30.0))
+	var b := _plate_box()
+	b.set_corner_radius_all(8)
+	n.draw_style_box(b, r)
+	n.draw_string(font, Vector2(r.position.x + 10.0, y + 22.0), text, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, col)
+
+
+func _plate_box() -> StyleBoxFlat:
+	var b := StyleBoxFlat.new()
+	b.bg_color = HUD_PLATE
+	b.set_corner_radius_all(12)
+	b.anti_aliasing = true
+	return b
 
 
 # ---------------------------------------------------------------- screens
@@ -1401,67 +1737,169 @@ func _pause() -> void:
 	overlay.process_mode = Node.PROCESS_MODE_ALWAYS
 	overlay.size = view_size
 	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	_set_hud_visible(false)
 	ui_root.add_child(overlay)
-	var dim := ColorRect.new()
-	dim.color = Color(0.02, 0.04, 0.09, 0.6)
-	dim.size = view_size
-	dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	overlay.add_child(dim)
-	var head := Label.new()
-	head.text = String(lake["name"])
-	head.add_theme_font_override("font", Game.heading_font)
-	head.add_theme_font_size_override("font_size", 40)
-	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	head.size = Vector2(view_size.x, 60)
-	head.position = Vector2(0, view_size.y * 0.16)
-	overlay.add_child(head)
-	var opts := [["Continue", _resume], ["Try again", _retry], ["Lakes", _to_map]]
-	for i in 3:
-		var c := _lantern_button(String(opts[i][0]), opts[i][1], i)
-		c.position = Vector2(view_size.x * 0.5 - 100, view_size.y * 0.27 + i * 200)
-		overlay.add_child(c)
-	var box := VBoxContainer.new()
-	box.position = Vector2(40, view_size.y - 150)
-	box.size = Vector2(view_size.x - 80, 80)
-	overlay.add_child(box)
-	_add_settings(box)
-	overlay.modulate.a = 0.0
-	overlay.create_tween().tween_property(overlay, "modulate:a", 1.0, 0.3)
-
-
-## A floating lantern you tap: glow, paper body, label underneath.
-func _lantern_button(text: String, fn: Callable, idx: int) -> Control:
-	var c := Control.new()
-	c.size = Vector2(200, 180)
-	c.custom_minimum_size = c.size
-	c.mouse_filter = Control.MOUSE_FILTER_STOP
 	var light: Color = pal["light"]
-	c.draw.connect(func():
-		var ctr := Vector2(100, 66)
-		var glow: Texture2D = Game.glow_tex
-		c.draw_texture_rect(glow, Rect2(ctr - Vector2(90, 90), Vector2(180, 180)), false, Color(light, 0.55))
-		c.draw_circle(ctr + Vector2(4, 6), 36, Color(0, 0, 0, 0.25), true, -1.0, true)
-		c.draw_circle(ctr, 36, light.lightened(0.15), true, -1.0, true)
-		c.draw_circle(ctr, 20, Color(1, 1, 1, 0.9), true, -1.0, true)
-		c.draw_rect(Rect2(ctr + Vector2(-22, -46), Vector2(44, 10)), light.darkened(0.45))
-		c.draw_line(ctr + Vector2(0, -46), ctr + Vector2(0, -62), light.darkened(0.45), 3.0, true)
-		c.draw_string(Game.ui_theme.default_font, Vector2(0, 160), text, HORIZONTAL_ALIGNMENT_CENTER, 200, 30, Color(1, 1, 1, 0.95)))
-	c.gui_input.connect(func(e: InputEvent):
+
+	# Tapping anywhere that is not a button carries on.
+	var dim := ColorRect.new()
+	dim.color = Color(0.024, 0.047, 0.063, 0.72)
+	dim.size = view_size
+	dim.gui_input.connect(func(e: InputEvent):
 		if e is InputEventScreenTouch and not e.pressed:
 			Sfx.tap()
+			_resume())
+	overlay.add_child(dim)
+
+	var top := top_inset + view_size.y * 0.06
+	var name_l := Label.new()
+	name_l.text = String(lake["name"])
+	name_l.add_theme_font_override("font", Game.heading_font)
+	name_l.add_theme_font_size_override("font_size", 36)
+	name_l.position = Vector2(44, top)
+	name_l.size = Vector2(360, 76)
+	name_l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	overlay.add_child(name_l)
+	var tg_row := HBoxContainer.new()
+	tg_row.add_theme_constant_override("separation", 18)
+	tg_row.alignment = BoxContainer.ALIGNMENT_END
+	tg_row.position = Vector2(view_size.x - 44 - 3 * 76 - 2 * 18, top)
+	tg_row.size = Vector2(3 * 76 + 2 * 18, 76)
+	overlay.add_child(tg_row)
+	for key in ["sound", "music", "vibration"]:
+		var b := _square_button(Game.icon(key), 76, 36)
+		Game.style_toggle(b, key, _setting(key))
+		b.custom_minimum_size = Vector2(76, 76)
+		b.pressed.connect(func():
+			Game.set_setting(key, not _setting(key))
+			Game.style_toggle(b, key, _setting(key))
+			b.custom_minimum_size = Vector2(76, 76)
+			Sfx.tap())
+		tg_row.add_child(b)
+
+	var paused := Label.new()
+	paused.text = "PAUSED"
+	paused.add_theme_font_override("font", Game.title_font)
+	paused.add_theme_font_size_override("font_size", 62)
+	paused.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	paused.position = Vector2(0, view_size.y * 0.27)
+	paused.size = Vector2(view_size.x, 90)
+	overlay.add_child(paused)
+
+	# Goals, the same three readouts as in play.
+	var lit_now := 0
+	for l in lanterns:
+		if l["lit"] and clock >= float(l["lit_t"]):
+			lit_now += 1
+	var late := dusk > 0.75 or day_taken
+	var par := int(lake["par"])
+	var goals := [["lantern", "%d/%d" % [lit_now, lanterns.size()]],
+		["sun", "late" if late else "%d s" % int((0.75 - dusk) * duration)],
+		["loop", "%d/%d" % [loops_used, par]]]
+	var g_row := HBoxContainer.new()
+	g_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	g_row.add_theme_constant_override("separation", 50)
+	g_row.position = Vector2(0, view_size.y * 0.37)
+	g_row.size = Vector2(view_size.x, 50)
+	g_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(g_row)
+	for g in goals:
+		var item := HBoxContainer.new()
+		item.add_theme_constant_override("separation", 12)
+		item.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var ic := TextureRect.new()
+		ic.texture = Game.icon(String(g[0]))
+		ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		var isz := 40.0 * float(Game.ICON_OPTICAL.get(String(g[0]), 1.0))
+		ic.custom_minimum_size = Vector2(isz, isz)
+		ic.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		ic.modulate = Color(1, 1, 1, 0.35) if (g[0] == "sun" and late) else (Color("ff9a8a") if (g[0] == "loop" and loops_used > par) else light)
+		item.add_child(ic)
+		var t := Label.new()
+		t.text = String(g[1])
+		t.add_theme_font_size_override("font_size", 33)
+		item.add_child(t)
+		g_row.add_child(item)
+
+	var play := TextureRect.new()
+	play.texture = Game.icon("play")
+	play.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	play.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	play.size = Vector2(116, 116)
+	play.position = Vector2(view_size.x * 0.5 - 58, view_size.y * 0.54 - 58)
+	play.modulate = light
+	play.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(play)
+	var pulse := play.create_tween().set_loops()
+	pulse.tween_property(play, "modulate:a", 0.6, 1.2).set_trans(Tween.TRANS_SINE)
+	pulse.tween_property(play, "modulate:a", 1.0, 1.2).set_trans(Tween.TRANS_SINE)
+	var tap := Label.new()
+	tap.text = "TAP TO RESUME"
+	tap.add_theme_font_override("font", Game.title_font)
+	tap.add_theme_font_size_override("font_size", 26)
+	tap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	tap.position = Vector2(0, view_size.y * 0.63)
+	tap.size = Vector2(view_size.x, 40)
+	tap.modulate.a = 0.8
+	overlay.add_child(tap)
+
+	_add_corner_buttons(overlay)
+
+	overlay.modulate.a = 0.0
+	overlay.create_tween().tween_property(overlay, "modulate:a", 1.0, 0.25)
+
+
+## Menu (bottom left) and Restart (bottom right): each a column of button over label, so they stay centred.
+## Menu goes to the lake map for now.
+func _add_corner_buttons(parent: Control) -> void:
+	const SIDE := 108.0
+	const COL_W := 148.0
+	const EDGE := 50.0
+	var bottom := view_size.y - view_size.y * 0.06
+	for spec in [["menu", "Menu", _to_map, EDGE - (COL_W - SIDE) * 0.5],
+			["restart", "Restart", _retry, view_size.x - EDGE - SIDE - (COL_W - SIDE) * 0.5]]:
+		var col := VBoxContainer.new()
+		col.add_theme_constant_override("separation", 8)
+		col.position = Vector2(float(spec[3]), bottom - SIDE - 8 - 34)
+		col.size = Vector2(COL_W, SIDE + 8 + 34)
+		col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		parent.add_child(col)
+		var b := _square_button(Game.icon(String(spec[0])), SIDE, 50)
+		b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		var fn: Callable = spec[2]
+		b.pressed.connect(func():
+			Sfx.tap()
 			fn.call())
-	var tw := c.create_tween().set_loops()
-	tw.tween_property(c, "position:y", 6.0, 1.2 + idx * 0.2).as_relative().set_trans(Tween.TRANS_SINE)
-	tw.tween_property(c, "position:y", -6.0, 1.2 + idx * 0.2).as_relative().set_trans(Tween.TRANS_SINE)
-	return c
+		col.add_child(b)
+		var l := Label.new()
+		l.text = String(spec[1])
+		l.add_theme_font_size_override("font_size", 24)
+		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		l.custom_minimum_size = Vector2(COL_W, 34)
+		l.modulate.a = 0.75
+		col.add_child(l)
+
+
+## A solid square game button with a darker bottom edge, holding one white icon.
+func _square_button(tex: Texture2D, side: float, icon_w: int) -> Button:
+	return Game.square_button(tex, side, icon_w)
 
 
 func _resume() -> void:
 	if overlay != null:
 		overlay.queue_free()
 		overlay = null
+	_set_hud_visible(true)
 	touches.clear()
 	get_tree().paused = false
+
+
+## Hides the play screen's own top bar (name, goals, pause button) while the pause screen is up.
+func _set_hud_visible(on: bool) -> void:
+	for ch in ui_root.get_children():
+		if ch != overlay:
+			ch.visible = on
 
 
 func _retry() -> void:
@@ -1485,123 +1923,468 @@ func _show_results() -> void:
 		if loops_used <= int(lake["par"]):
 			got |= Game.MARK_LOOPS
 	Game.record_result(lake_index, got)
+	var prev_best := float(Game.stats[lake_index]["best"])
 	if lit == total:
 		Game.stat_win(lake_index, run_time)
 	else:
 		Game.stat_fail(lake_index, lit, total)
 	var last := lake_index == Game.lake_count() - 1
-	var box := _open_overlay(String(lake["name"]))
-	var sub := Label.new()
-	if lit == total:
-		sub.text = "Every lantern is lit." if not last else "Every lantern is lit.\nThe still lakes are bright again."
-	else:
-		sub.text = "%d of %d lanterns lit before dark." % [lit, total]
-	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub.add_theme_font_size_override("font_size", 26)
-	sub.modulate.a = 0.8
-	box.add_child(sub)
-	var par := int(lake["par"])
-	var goals := [["lantern", "Light all %d lanterns" % total, got & Game.MARK_ALL != 0],
-		["sun", "Finish before the sun is low", got & Game.MARK_TIME != 0],
-		["loop", "Use %d loop%s or fewer" % [par, "" if par == 1 else "s"], got & Game.MARK_LOOPS != 0]]
-	var rows: Array = []
-	var icons: Array = []
+	_show_victory(got, prev_best, last)
+
+
+## Every lantern lit: "ALL LIT", the three goals stamped down one by one, a daylight bar with this time
+## and the best time, then tap anywhere for the next lake. Menu and Restart sit in the corners as on pause.
+func _show_victory(got: int, prev_best: float, last: bool) -> void:
 	var light: Color = pal["light"]
-	for g in goals:
-		var row := HBoxContainer.new()
-		row.alignment = BoxContainer.ALIGNMENT_CENTER
-		row.add_theme_constant_override("separation", 18)
-		var ic := Control.new()
-		ic.custom_minimum_size = Vector2(64, 64)
-		ic.pivot_offset = Vector2(32, 32)
-		ic.set_meta("lit", false)
-		var kind: String = g[0]
-		ic.draw.connect(func():
-			var on: bool = ic.get_meta("lit", false)
-			if on:
-				ic.draw_texture_rect(Game.glow_tex, Rect2(Vector2(-18, -18), Vector2(100, 100)), false, Color(light, 0.5))
-			Game.draw_icon(ic, kind, Vector2(32, 32), 46, light if on else Color(1, 1, 1, 0.3)))
-		row.add_child(ic)
-		var l := Label.new()
-		l.text = String(g[1])
-		l.custom_minimum_size = Vector2(380, 0)
-		l.add_theme_font_size_override("font_size", 25)
-		row.add_child(l)
-		row.modulate.a = 0.0
-		box.add_child(row)
-		rows.append(row)
-		icons.append(ic)
-	var spacer := Control.new()
-	spacer.custom_minimum_size = Vector2(0, 14)
-	box.add_child(spacer)
-	var buttons: Array = []
-	if lit == total and not last:
-		buttons.append(_add_button(box, "Next lake", func(): level_requested.emit(lake_index + 1)))
-	buttons.append(_add_button(box, "Try again", _retry))
-	buttons.append(_add_button(box, "Lakes", _to_map))
-	for b in buttons:
-		b.modulate.a = 0.0
+	var total := lanterns.size()
+	var par := int(lake["par"])
+	_set_hud_visible(false)
+	overlay = Control.new()
+	overlay.process_mode = Node.PROCESS_MODE_ALWAYS
+	overlay.size = view_size
+	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	ui_root.add_child(overlay)
+	var can_continue := [false]
+	var dim := ColorRect.new()
+	dim.color = Color(0.024, 0.047, 0.063, 0.74)
+	dim.size = view_size
+	dim.gui_input.connect(func(e: InputEvent):
+		if e is InputEventScreenTouch and not e.pressed and can_continue[0]:
+			Sfx.tap()
+			if last:
+				_to_map()
+			else:
+				level_requested.emit(lake_index + 1))
+	overlay.add_child(dim)
+
+	var title := Label.new()
+	title.text = "ALL LIT"
+	title.add_theme_font_override("font", Game.title_font)
+	title.add_theme_font_size_override("font_size", 62)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.position = Vector2(0, view_size.y * 0.15)
+	title.size = Vector2(view_size.x, 90)
+	overlay.add_child(title)
+	var name_l := Label.new()
+	name_l.text = String(lake["name"])
+	name_l.add_theme_font_size_override("font_size", 32)
+	name_l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	name_l.position = Vector2(0, view_size.y * 0.245)
+	name_l.size = Vector2(view_size.x, 46)
+	name_l.modulate.a = 0.7
+	overlay.add_child(name_l)
+
+	# Goals: empty dashed slots first, then each icon is stamped into its slot.
+	const SLOT := 115.0
+	const ITEM_W := 151.0
+	const GAP := 58.0
+	var goals := [["lantern", "All %d lanterns" % total, got & Game.MARK_ALL != 0],
+		["sun", "Before dusk", got & Game.MARK_TIME != 0],
+		["loop", "%d loop%s" % [par, "" if par == 1 else "s"], got & Game.MARK_LOOPS != 0]]
+	var x0 := (view_size.x - (3.0 * ITEM_W + 2.0 * GAP)) * 0.5
+	var gy := view_size.y * 0.33
 	var tw := overlay.create_tween()
 	tw.tween_interval(0.5)
 	for k in 3:
-		var row: Control = rows[k]
-		var ic: Control = icons[k]
 		var ok: bool = goals[k][2]
-		tw.tween_property(row, "modulate:a", 1.0, 0.25)
+		var kind: String = goals[k][0]
+		var cx := x0 + k * (ITEM_W + GAP) + ITEM_W * 0.5
+		var slot := Control.new()
+		slot.position = Vector2(cx - SLOT * 0.5, gy)
+		slot.size = Vector2(SLOT, SLOT)
+		slot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		slot.draw.connect(func():
+			for d in 16:
+				var a := TAU * d / 16.0
+				slot.draw_arc(Vector2(SLOT, SLOT) * 0.5, SLOT * 0.5 - 2.0, a, a + TAU / 32.0, 4, Color(1, 1, 1, 0.18), 3.0, true))
+		overlay.add_child(slot)
+		var ring := Control.new()
+		ring.size = Vector2(SLOT, SLOT)
+		ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		ring.set_meta("k", -1.0)
+		ring.draw.connect(func():
+			var rk: float = ring.get_meta("k")
+			if rk >= 0.0:
+				ring.draw_arc(Vector2(SLOT, SLOT) * 0.5, SLOT * 0.5 * (0.8 + 1.1 * rk), 0.0, TAU, 48, Color(light, 0.9 * (1.0 - rk)), 5.0, true))
+		slot.add_child(ring)
+		var sparks: Array = []
+		for d in 6:
+			var sp := Control.new()
+			sp.size = Vector2(10, 10)
+			sp.position = Vector2(SLOT, SLOT) * 0.5 - Vector2(5, 5)
+			sp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			sp.modulate.a = 0.0
+			sp.draw.connect(func(): sp.draw_circle(Vector2(5, 5), 5.0, light, true, -1.0, true))
+			slot.add_child(sp)
+			sparks.append(sp)
+		var ic := TextureRect.new()
+		ic.texture = Game.icon(kind)
+		ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		var isz := (SLOT - 8.0) * float(Game.ICON_OPTICAL.get(kind, 1.0))
+		ic.size = Vector2(isz, isz)
+		ic.position = (Vector2(SLOT, SLOT) - ic.size) * 0.5
+		ic.pivot_offset = ic.size * 0.5
+		ic.modulate = Color(light, 0.0) if ok else Color(1, 1, 1, 0.0)
+		ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		slot.add_child(ic)
+		var cap := Label.new()
+		cap.text = String(goals[k][1])
+		cap.add_theme_font_size_override("font_size", 24)
+		cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		cap.position = Vector2(cx - ITEM_W * 0.5, gy + SLOT + 16)
+		cap.size = Vector2(ITEM_W, 34)
+		cap.modulate.a = 0.0
+		overlay.add_child(cap)
 		tw.tween_callback(func():
 			if ok:
-				ic.set_meta("lit", true)
-				ic.queue_redraw()
+				ic.scale = Vector2.ONE * 2.6
+				ic.rotation = deg_to_rad(-14.0)
+				var st := ic.create_tween().set_parallel()
+				st.tween_property(ic, "modulate:a", 1.0, 0.25)
+				st.tween_property(ic, "scale", Vector2.ONE, 0.42).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+				st.tween_property(ic, "rotation", 0.0, 0.42).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+			else:
 				ic.scale = Vector2.ONE * 1.5
-				ic.create_tween().tween_property(ic, "scale", Vector2.ONE, 0.3).set_trans(Tween.TRANS_BACK)
-				Sfx.chime(float(lake["pitch"]) * [1.0, 1.25, 1.5][k] * 2.0)
-				Game.vibrate(15))
-		tw.tween_interval(0.35)
-	for b in buttons:
-		tw.tween_property(b, "modulate:a", 1.0, 0.2)
+				var st := ic.create_tween().set_parallel()
+				st.tween_property(ic, "modulate:a", 0.28, 0.3)
+				st.tween_property(ic, "scale", Vector2.ONE, 0.35).set_ease(Tween.EASE_OUT)
+				var sh := ic.create_tween()
+				sh.tween_interval(0.35)
+				for dx in [-10.0, 9.0, -5.0, 0.0]:
+					sh.tween_property(ic, "position:x", (SLOT - ic.size.x) * 0.5 + dx, 0.07))
+		tw.tween_interval(0.3)
+		tw.tween_callback(func():
+			Sfx.stamp(ok)
+			cap.create_tween().tween_property(cap, "modulate:a", 1.0 if ok else 0.5, 0.3)
+			if ok:
+				Game.vibrate(20)
+				ring.create_tween().tween_method(func(v: float):
+					ring.set_meta("k", v)
+					ring.queue_redraw(), 0.0, 1.0, 0.7)
+				for d in 6:
+					var sp: Control = sparks[d]
+					var dir := Vector2.from_angle(TAU * d / 6.0 - PI * 0.5)
+					sp.modulate.a = 1.0
+					var ss := sp.create_tween().set_parallel()
+					ss.tween_property(sp, "position", sp.position + dir * 80.0, 0.6).set_ease(Tween.EASE_OUT)
+					ss.tween_property(sp, "modulate:a", 0.0, 0.6))
+		tw.tween_interval(0.3)
+
+	# Daylight bar: the whole day of this lake. Gold up to this run's time (label above, gold),
+	# a white tick at the best time (label below, white). A new best puts "NEW BEST" under the gold mark.
+	const BAR_W := 475.0
+	var bx := (view_size.x - BAR_W) * 0.5
+	var by := view_size.y * 0.58
+	var day := maxf(1.0, duration)
+	var now_f := clampf(run_time / day, 0.02, 1.0)
+	var new_best := prev_best <= 0.0 or run_time < prev_best
+	var best_t := run_time if new_best else prev_best
+	var best_f := clampf(best_t / day, 0.02, 1.0)
+	var bar := Control.new()
+	bar.position = Vector2(bx, by)
+	bar.size = Vector2(BAR_W, 12)
+	bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bar.set_meta("f", 0.0)
+	bar.draw.connect(func():
+		var f: float = bar.get_meta("f")
+		bar.draw_rect(Rect2(Vector2.ZERO, Vector2(BAR_W, 12)), Color(1, 1, 1, 0.16))
+		bar.draw_rect(Rect2(Vector2.ZERO, Vector2(BAR_W * now_f * f, 12)), light)
+		if not new_best:
+			bar.draw_rect(Rect2(Vector2(BAR_W * best_f - 2.0, -10), Vector2(4, 32)), Color(1, 1, 1, 0.95 * f))
+		var tip := Vector2(BAR_W * now_f * f, -8)
+		bar.draw_colored_polygon(PackedVector2Array([tip + Vector2(-9, -12), tip + Vector2(9, -12), tip]), Color(light, f)))
+	bar.modulate.a = 0.0
+	overlay.add_child(bar)
+	var sun := TextureRect.new()
+	sun.texture = Game.icon("sun")
+	sun.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	sun.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	sun.size = Vector2(34, 34)
+	sun.position = Vector2(bx + BAR_W + 14, by + 6 - 17)
+	sun.modulate = Color(1, 1, 1, 0.5)
+	sun.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	sun.visible = false
+	overlay.add_child(sun)
+	var mk_label := func(text: String, small: String, x: float, y: float, col: Color) -> HBoxContainer:
+		var h := HBoxContainer.new()
+		h.add_theme_constant_override("separation", 10)
+		h.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var sl := Label.new()
+		sl.text = small
+		sl.add_theme_font_override("font", Game.heading_font)
+		sl.add_theme_font_size_override("font_size", 20)
+		sl.add_theme_color_override("font_color", Color(col, 0.75))
+		sl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		h.add_child(sl)
+		var vl := Label.new()
+		vl.text = text
+		vl.add_theme_font_size_override("font_size", 34)
+		vl.add_theme_color_override("font_color", col)
+		h.add_child(vl)
+		overlay.add_child(h)
+		h.reset_size()
+		h.position = Vector2(clampf(x - h.size.x * 0.5, 30.0, view_size.x - 30.0 - h.size.x), y)
+		h.modulate.a = 0.0
+		return h
+	var time_l: HBoxContainer = mk_label.call("%d s" % roundi(run_time), "TIME", bx + BAR_W * now_f, by - 72, light)
+	var best_l: HBoxContainer
+	if new_best:
+		best_l = mk_label.call("", "NEW BEST", bx + BAR_W * now_f, by + 26, light)
+	else:
+		best_l = mk_label.call("%d s" % roundi(best_t), "BEST", bx + BAR_W * best_f, by + 26, Color.WHITE)
+	tw.tween_callback(func():
+		sun.visible = true
+		bar.create_tween().tween_property(bar, "modulate:a", 1.0, 0.2)
+		bar.create_tween().tween_method(func(v: float):
+			bar.set_meta("f", v)
+			bar.queue_redraw(), 0.0, 1.0, 0.6).set_ease(Tween.EASE_OUT))
+	tw.tween_interval(0.5)
+	tw.tween_callback(func():
+		time_l.create_tween().tween_property(time_l, "modulate:a", 1.0, 0.25)
+		best_l.create_tween().tween_property(best_l, "modulate:a", 1.0, 0.25))
+	tw.tween_interval(0.3)
+
+	# Tap for the next lake.
+	var arrow := TextureRect.new()
+	arrow.texture = Game.icon("next")
+	arrow.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	arrow.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	arrow.size = Vector2(80, 80)
+	arrow.position = Vector2(view_size.x * 0.5 - 40, view_size.y * 0.69 - 40)
+	arrow.modulate = Color(light, 0.0)
+	arrow.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(arrow)
+	var tap := Label.new()
+	tap.text = "TAP TO CONTINUE" if last else "TAP FOR NEXT LAKE"
+	tap.add_theme_font_override("font", Game.title_font)
+	tap.add_theme_font_size_override("font_size", 26)
+	tap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	tap.position = Vector2(0, view_size.y * 0.75)
+	tap.size = Vector2(view_size.x, 40)
+	tap.modulate.a = 0.0
+	overlay.add_child(tap)
+	tw.tween_callback(func():
+		can_continue[0] = true
+		tap.create_tween().tween_property(tap, "modulate:a", 0.8, 0.3)
+		var nudge := arrow.create_tween().set_loops()
+		nudge.tween_property(arrow, "position:x", arrow.position.x + 14.0, 0.8).set_trans(Tween.TRANS_SINE)
+		nudge.tween_property(arrow, "position:x", arrow.position.x, 0.8).set_trans(Tween.TRANS_SINE)
+		arrow.create_tween().tween_property(arrow, "modulate:a", 1.0, 0.3))
+
+	_add_corner_buttons(overlay)
+	overlay.modulate.a = 0.0
+	overlay.create_tween().tween_property(overlay, "modulate:a", 1.0, 0.3)
 
 
-func _show_crash() -> void:
-	var lines: Array = CRASH_LINES[crash_kind]
-	var box := _open_overlay(String(lines[randi() % lines.size()]), 34)
-	var sub := Label.new()
-	var lit := _lit_count()
-	sub.text = "%d of %d lanterns were glowing." % [lit, lanterns.size()] if lit > 0 else "The lanterns are still waiting."
-	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub.add_theme_font_size_override("font_size", 25)
-	sub.modulate.a = 0.75
-	box.add_child(sub)
-	var spacer := Control.new()
-	spacer.custom_minimum_size = Vector2(0, 14)
-	box.add_child(spacer)
-	Game.stat_add(lake_index, "crashes")
-	if patches_used < MAX_REVIVES:
-		_add_ad_button(box, "Patch the boat", _patch_boat, MAX_REVIVES - patches_used)
-	_add_button(box, "Try again", _retry)
-	_add_button(box, "Lakes", _to_map)
+## Game over for both endings. While a revive is left (an ad: patch the boat, or more daylight), a round
+## gold button sits inside a ring that drains over COUNTDOWN seconds; when it runs out, or no revives are
+## left, the screen turns into "tap to try again". Menu and Restart sit in the corners as everywhere else.
+const COUNTDOWN := 5.0
 
 
-## The sun is down but lanterns are left: offer more daylight once per try (an ad, later).
-func _offer_daylight() -> void:
+func _show_game_over(kind: String) -> void:
+	Engine.time_scale = 1.0
+	state = "over"
 	touches.clear()
 	get_tree().paused = true
+	_set_hud_visible(false)
+	var light: Color = pal["light"]
 	var lit := _lit_count()
-	var box := _open_overlay("The sun is setting", 42)
-	var sub := Label.new()
-	var left := lanterns.size() - lit
-	sub.text = "%d of %d lanterns lit.\n%s to go." % [lit, lanterns.size(), "Just one" if left == 1 else str(left)]
-	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub.add_theme_font_size_override("font_size", 26)
-	sub.modulate.a = 0.8
-	box.add_child(sub)
-	var spacer := Control.new()
-	spacer.custom_minimum_size = Vector2(0, 14)
-	box.add_child(spacer)
-	_add_ad_button(box, "+%d s of daylight" % int(_day_bonus()), _take_daylight, MAX_REVIVES - days_used)
-	_add_button(box, "Let it set", _decline_daylight)
+	var total := lanterns.size()
+	var wreck := kind == "wreck"
+	if wreck:
+		Game.stat_add(lake_index, "crashes")
+	var can_revive := (patches_used if wreck else days_used) < MAX_REVIVES
+	overlay = Control.new()
+	overlay.process_mode = Node.PROCESS_MODE_ALWAYS
+	overlay.size = view_size
+	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	ui_root.add_child(overlay)
+	var tap_ready := [false]
+	var dim := ColorRect.new()
+	dim.color = Color(0.024, 0.047, 0.063, 0.74)
+	dim.size = view_size
+	dim.gui_input.connect(func(e: InputEvent):
+		if e is InputEventScreenTouch and not e.pressed and tap_ready[0]:
+			Sfx.tap()
+			_retry())
+	overlay.add_child(dim)
+
+	var title := Label.new()
+	title.text = "WRECKED" if wreck else "NIGHTFALL"
+	title.add_theme_font_override("font", Game.title_font)
+	title.add_theme_font_size_override("font_size", 60)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.position = Vector2(0, view_size.y * 0.14)
+	title.size = Vector2(view_size.x, 90)
+	overlay.add_child(title)
+	var line := Label.new()
+	if wreck:
+		var lines: Array = CRASH_LINES[crash_kind]
+		line.text = String(lines[randi() % lines.size()]).replace("\n", " ")
+	else:
+		var left := total - lit
+		line.text = "The sun set with %d lantern%s still waiting." % [left, "" if left == 1 else "s"]
+	line.add_theme_font_size_override("font_size", 30)
+	line.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	line.position = Vector2(60, view_size.y * 0.23)
+	line.size = Vector2(view_size.x - 120, 90)
+	line.modulate.a = 0.75
+	overlay.add_child(line)
+
+	# How close you got: one lantern per lantern on the lake, lit ones gold.
+	var pips := HBoxContainer.new()
+	pips.alignment = BoxContainer.ALIGNMENT_CENTER
+	pips.add_theme_constant_override("separation", 22)
+	pips.position = Vector2(0, view_size.y * 0.34)
+	pips.size = Vector2(view_size.x, 58)
+	pips.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(pips)
+	for k in total:
+		var pi := TextureRect.new()
+		pi.texture = Game.icon("lantern")
+		pi.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		pi.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		pi.custom_minimum_size = Vector2(58, 58)
+		pi.modulate = light if k < lit else Color(1, 1, 1, 0.25)
+		pips.add_child(pi)
+	var pip_cap := Label.new()
+	pip_cap.text = "%d of %d lanterns lit" % [lit, total]
+	pip_cap.add_theme_font_size_override("font_size", 24)
+	pip_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	pip_cap.position = Vector2(0, view_size.y * 0.415)
+	pip_cap.size = Vector2(view_size.x, 34)
+	pip_cap.modulate.a = 0.6
+	overlay.add_child(pip_cap)
+
+	_add_corner_buttons(overlay)
+	var corner_restart: Control = overlay.get_child(overlay.get_child_count() - 1)
+
+	# The "try again" state, shown once no revive is on offer.
+	var again := Control.new()
+	again.size = view_size
+	again.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	again.modulate.a = 0.0
+	overlay.add_child(again)
+	var r_icon := TextureRect.new()
+	r_icon.texture = Game.icon("restart")
+	r_icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	r_icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	r_icon.size = Vector2(94, 94)
+	r_icon.position = Vector2(view_size.x * 0.5 - 47, view_size.y * 0.58 - 47)
+	r_icon.pivot_offset = r_icon.size * 0.5
+	r_icon.modulate = light
+	r_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	again.add_child(r_icon)
+	var tap := Label.new()
+	tap.text = "TAP TO TRY AGAIN"
+	tap.add_theme_font_override("font", Game.title_font)
+	tap.add_theme_font_size_override("font_size", 26)
+	tap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	tap.position = Vector2(0, view_size.y * 0.66)
+	tap.size = Vector2(view_size.x, 40)
+	tap.modulate.a = 0.8
+	again.add_child(tap)
+	var show_again := func():
+		if not is_instance_valid(again):
+			return
+		if not wreck:
+			Game.record_result(lake_index, 0)
+			Game.stat_fail(lake_index, lit, total)
+		tap_ready[0] = true
+		corner_restart.visible = false
+		again.create_tween().tween_property(again, "modulate:a", 1.0, 0.3)
+		var spin := r_icon.create_tween().set_loops()
+		spin.tween_property(r_icon, "rotation", TAU, 2.4).as_relative()
+
+	if not can_revive:
+		show_again.call()
+	else:
+		# Countdown offer: ring drains around a round gold button.
+		var offer := Control.new()
+		offer.size = view_size
+		offer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		overlay.add_child(offer)
+		var cx := view_size.x * 0.5
+		var cy := view_size.y * 0.57
+		const RING := 245.0
+		const CORE := 180.0
+		var ring := Control.new()
+		ring.position = Vector2(cx - RING * 0.5, cy - RING * 0.5)
+		ring.size = Vector2(RING, RING)
+		ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		ring.set_meta("left", 1.0)
+		ring.draw.connect(func():
+			var c := Vector2(RING, RING) * 0.5
+			var f: float = ring.get_meta("left")
+			ring.draw_arc(c, RING * 0.5 - 8.0, 0.0, TAU, 64, Color(1, 1, 1, 0.14), 12.0, true)
+			if f > 0.0:
+				ring.draw_arc(c, RING * 0.5 - 8.0, -PI * 0.5, -PI * 0.5 + TAU * f, 64, light, 12.0, true))
+		offer.add_child(ring)
+		var core := Button.new()
+		core.icon = Game.icon("play")
+		core.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		core.add_theme_constant_override("icon_max_width", 64)
+		for c in ["icon_normal_color", "icon_hover_color", "icon_pressed_color", "icon_hover_pressed_color", "icon_focus_color"]:
+			core.add_theme_color_override(c, Color("2a1d05"))
+		for st in ["normal", "hover", "pressed", "hover_pressed"]:
+			var sb := StyleBoxFlat.new()
+			sb.bg_color = light if not st.ends_with("pressed") else light.darkened(0.08)
+			sb.border_color = light.darkened(0.35)
+			sb.border_width_bottom = 0 if st.ends_with("pressed") else 9
+			sb.set_corner_radius_all(int(CORE * 0.5))
+			sb.content_margin_left = 10
+			sb.content_margin_right = 0
+			sb.content_margin_top = 9 if st.ends_with("pressed") else 0
+			sb.content_margin_bottom = 0
+			sb.anti_aliasing = true
+			core.add_theme_stylebox_override(st, sb)
+		core.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
+		core.custom_minimum_size = Vector2(CORE, CORE)
+		core.size = Vector2(CORE, CORE)
+		core.position = Vector2(cx - CORE * 0.5, cy - CORE * 0.5)
+		offer.add_child(core)
+		var ask := Label.new()
+		ask.text = "Patch the boat?" if wreck else "%d more seconds?" % int(_day_bonus())
+		ask.add_theme_font_size_override("font_size", 33)
+		ask.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		ask.position = Vector2(0, view_size.y * 0.67)
+		ask.size = Vector2(view_size.x, 46)
+		offer.add_child(ask)
+		var note := Label.new()
+		var left_n := MAX_REVIVES - (patches_used if wreck else days_used)
+		note.text = "Watch a short ad  ·  %d of %d left" % [left_n, MAX_REVIVES]
+		note.add_theme_font_size_override("font_size", 22)
+		note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		note.position = Vector2(0, view_size.y * 0.67 + 46)
+		note.size = Vector2(view_size.x, 32)
+		note.modulate.a = 0.55
+		offer.add_child(note)
+		var drain := offer.create_tween()
+		drain.tween_method(func(v: float):
+			ring.set_meta("left", v)
+			ring.queue_redraw(), 1.0, 0.0, COUNTDOWN)
+		drain.tween_callback(func():
+			var fade := offer.create_tween()
+			fade.tween_property(offer, "modulate:a", 0.0, 0.25)
+			fade.tween_callback(offer.queue_free)
+			show_again.call())
+		core.pressed.connect(func():
+			drain.kill()
+			Sfx.tap()
+			if wreck:
+				_patch_boat()
+			else:
+				_take_daylight())
+
+	overlay.modulate.a = 0.0
+	overlay.create_tween().tween_property(overlay, "modulate:a", 1.0, 0.3)
 
 
 func _take_daylight() -> void:
+	state = "play"
 	_close_overlay()
 	day_taken = true
 	days_used += 1
@@ -1617,14 +2400,11 @@ func _day_bonus() -> float:
 	return maxf(5.0, roundf(duration * DAY_BONUS))
 
 
-func _decline_daylight() -> void:
-	_close_overlay()
-	_end("dark", 0.8)
-
-
 ## Put the boat back where it was a moment before the crash, facing away from it.
 func _patch_boat() -> void:
 	patches_used += 1
+	if boat3d:
+		boat3d.reset()
 	_close_overlay()
 	var spot := Vector2.INF
 	for k in range(history.size() - 1, -1, -1):
@@ -1653,81 +2433,9 @@ func _close_overlay() -> void:
 	if overlay != null:
 		overlay.queue_free()
 		overlay = null
+	_set_hud_visible(true)
 	touches.clear()
 	get_tree().paused = false
-
-
-## A rewarded-ad button. No ad network yet: it grants the reward straight away.
-func _add_ad_button(box: Container, text: String, fn: Callable, left: int) -> void:
-	var b := _add_button(box, text, fn)
-	# Play icon sits right before the centred text.
-	b.text = ""
-	var inner := HBoxContainer.new()
-	inner.alignment = BoxContainer.ALIGNMENT_CENTER
-	inner.add_theme_constant_override("separation", 12)
-	inner.set_anchors_preset(Control.PRESET_FULL_RECT)
-	inner.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var ic := TextureRect.new()
-	ic.texture = Game.icon("play")
-	ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	ic.custom_minimum_size = Vector2(22, 22)
-	ic.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	ic.modulate = pal["light"]
-	ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	inner.add_child(ic)
-	var tl := Label.new()
-	tl.text = text
-	tl.add_theme_color_override("font_color", pal["light"])
-	tl.add_theme_font_size_override("font_size", b.get_theme_font_size("font_size"))
-	tl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	inner.add_child(tl)
-	b.add_child(inner)
-	b.add_theme_color_override("font_color", pal["light"])
-	var note := Label.new()
-	note.text = "Watch a short ad  ·  %d of %d left  ·  test build, none plays yet" % [left, MAX_REVIVES]
-	note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	note.add_theme_font_size_override("font_size", 18)
-	note.modulate.a = 0.5
-	box.add_child(note)
-
-
-func _open_overlay(title: String, title_size := 46) -> VBoxContainer:
-	overlay = Control.new()
-	overlay.process_mode = Node.PROCESS_MODE_ALWAYS
-	overlay.size = view_size
-	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui_root.add_child(overlay)
-	var dim := ColorRect.new()
-	dim.color = Color(0.03, 0.05, 0.08, 0.62)
-	dim.size = view_size
-	overlay.add_child(dim)
-	var box := VBoxContainer.new()
-	box.alignment = BoxContainer.ALIGNMENT_CENTER
-	box.size = Vector2(view_size.x - 120, view_size.y)
-	box.position = Vector2(60, 0)
-	overlay.add_child(box)
-	var head := Label.new()
-	head.text = title
-	head.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	head.add_theme_font_override("font", Game.heading_font)
-	head.add_theme_font_size_override("font_size", title_size)
-	head.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	box.add_child(head)
-	overlay.modulate.a = 0.0
-	overlay.create_tween().tween_property(overlay, "modulate:a", 1.0, 0.35)
-	return box
-
-
-func _add_button(box: Container, text: String, fn: Callable) -> Button:
-	var b := Button.new()
-	b.text = text
-	b.custom_minimum_size = Vector2(0, 76)
-	b.pressed.connect(func():
-		Sfx.tap()
-		fn.call())
-	box.add_child(b)
-	return b
 
 
 func _add_mark(box: Container, got: bool, text: String) -> void:
@@ -1756,29 +2464,8 @@ func _add_mark(box: Container, got: bool, text: String) -> void:
 	box.add_child(row)
 
 
-func _add_settings(box: Container) -> void:
-	var row := HBoxContainer.new()
-	row.alignment = BoxContainer.ALIGNMENT_CENTER
-	row.add_theme_constant_override("separation", 12)
-	box.add_child(row)
-	for key in ["sound", "music", "vibration"]:
-		var b := Button.new()
-		b.add_theme_font_size_override("font_size", 21)
-		b.custom_minimum_size = Vector2(0, 64)
-		_label_setting(b, key)
-		b.pressed.connect(func():
-			Game.set_setting(key, not _setting(key))
-			_label_setting(b, key)
-			Sfx.tap())
-		row.add_child(b)
-
-
 func _setting(key: String) -> bool:
 	match key:
 		"sound": return Game.sound_on
 		"music": return Game.music_on
 	return Game.vibration_on
-
-
-func _label_setting(b: Button, key: String) -> void:
-	Game.style_toggle(b, key, _setting(key))

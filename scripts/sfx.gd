@@ -23,6 +23,7 @@ var _dusk := 0.0
 var _speed := 0.0
 var _in_reeds := false
 var _critter_t := 2.0
+var _on_lake := false  # the boat-on-water loop only plays on a lake, never on the map
 
 
 func _ready() -> void:
@@ -57,6 +58,7 @@ func _generate() -> void:
 		"pad": _make_pad(), "shimmer": _make_shimmer(), "bells": _make_bells(),
 		"hull": _make_hull(), "reeds": _make_reeds(), "crickets": _make_crickets(),
 		"bird": _make_bird(), "frog": _make_frog(), "owl": _make_owl(), "quack": _make_quack(),
+		"stamp": _make_stamp(), "snap": _make_snap(),
 	}
 	call_deferred("_on_generated", out)
 
@@ -75,7 +77,7 @@ func _on_generated(out: Dictionary) -> void:
 	if _ambience_pitch > 0.0:
 		var p := _ambience_pitch
 		_ambience_pitch = -1.0
-		start_ambience(p)
+		start_ambience(p, _on_lake)
 
 
 # ---------------------------------------------------------------- public
@@ -121,6 +123,31 @@ func quack() -> void:
 	_play("whoosh", 1.8, -14.0)
 
 
+## A rubber stamp pressed onto paper: an earned goal lands firm, a missed one lands dull and low.
+func stamp(earned: bool) -> void:
+	if earned:
+		_play("stamp", randf_range(0.97, 1.03), -1.0)
+	else:
+		_play("stamp", 0.72, -9.0)
+
+
+## A duck snaps the trail: a quick wet flick, droplets falling back, and the duck's small complaint.
+func trail_snap() -> void:
+	_play("snap", randf_range(0.95, 1.08), -5.0)
+	_play("quack", randf_range(1.05, 1.2), -15.0)
+
+
+## An ember leaving the boat's lamp: a soft, quick breath.
+func ember() -> void:
+	_play("whoosh", 3.0, -18.0)
+
+
+## The ember landing: a match-strike flick and a low warm catch, under the lantern's chime.
+func ignite() -> void:
+	_play("whoosh", 2.4, -12.0)
+	_play("bump", 1.7, -14.0)
+
+
 func fade_out() -> void:
 	_play("chime", 0.5, -20.0)
 
@@ -137,12 +164,16 @@ func boost(pitch: float) -> void:
 		get_tree().create_timer(0.07 * i).timeout.connect(func(): _play("chime", pitch * r, -12.0))
 
 
-func start_ambience(pitch: float) -> void:
+func start_ambience(pitch: float, on_lake := true) -> void:
+	_on_lake = on_lake
 	if not _ready_flag:
 		_ambience_pitch = pitch
 		return
 	_active = true
 	_progress = 0.0
+	_dusk = 0.0
+	_speed = 0.0
+	_in_reeds = false
 	for l in _layers:
 		l.pitch_scale = pitch
 	apply_settings()
@@ -177,7 +208,7 @@ func _process(delta: float) -> void:
 	if not _ready_flag:
 		return
 	var music: bool = Game.music_on and _active
-	var sound: bool = Game.sound_on and _active
+	var sound: bool = Game.sound_on and _active and not get_tree().paused
 	var targets := [
 		-14.0 + _progress * 4.0 if music else -60.0,
 		(-30.0 + 18.0 * smoothstep(0.25, 0.6, _progress)) if music else -60.0,
@@ -185,7 +216,7 @@ func _process(delta: float) -> void:
 	]
 	for i in 3:
 		_layers[i].volume_db = move_toward(_layers[i].volume_db, targets[i], delta * 12.0)
-	_hull.volume_db = move_toward(_hull.volume_db, (-30.0 + 16.0 * _speed) if sound else -60.0, delta * 20.0)
+	_hull.volume_db = move_toward(_hull.volume_db, (-30.0 + 16.0 * _speed) if sound and _on_lake else -60.0, delta * 20.0)
 	_hull.pitch_scale = 0.85 + _speed * 0.3
 	_reeds.volume_db = move_toward(_reeds.volume_db, -10.0 if sound and _in_reeds else -60.0, delta * 40.0)
 	_crickets.volume_db = move_toward(_crickets.volume_db, (-40.0 + 22.0 * smoothstep(0.4, 0.9, _dusk)) if sound else -60.0, delta * 10.0)
@@ -279,6 +310,55 @@ func _make_bump() -> AudioStreamWAV:
 		var t := float(i) / RATE_HI
 		lp += (rng.randf_range(-1.0, 1.0) - lp) * 0.08
 		s[i] = sin(TAU * 92.0 * t) * exp(-t * 14.0) + lp * exp(-t * 30.0) * 0.8
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_snap() -> AudioStreamWAV:
+	# A bright, very short crack of filtered noise (the line snapping), then three small droplets
+	# falling back into the water: quick sine "plips" that drop in pitch.
+	var s := _buf(0.5, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 23
+	var lp := 0.0
+	var drops := [[0.05, 1500.0, 0.8], [0.13, 1150.0, 0.55], [0.22, 1800.0, 0.35]]
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var nz := rng.randf_range(-1.0, 1.0)
+		lp += (nz - lp) * 0.35
+		var v := (nz - lp) * exp(-t * 85.0) * 0.9  # high-passed crack
+		for d in drops:
+			var dt: float = t - float(d[0])
+			if dt > 0.0:
+				var f: float = float(d[1]) * (1.0 - 0.45 * minf(1.0, dt / 0.05))
+				v += sin(TAU * f * dt) * exp(-dt * 38.0) * float(d[2]) * minf(1.0, dt / 0.002)
+		s[i] = v
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_stamp() -> AudioStreamWAV:
+	# Sharp clack of the stamp face (bright filtered noise), a short wooden body thud underneath,
+	# and a faint papery scuff as it lifts.
+	var s := _buf(0.32, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 23
+	var hp := 0.0
+	var lp := 0.0
+	var prev := 0.0
+	var ph := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var n := rng.randf_range(-1.0, 1.0)
+		hp = 0.86 * (hp + n - prev)
+		prev = n
+		lp += (hp - lp) * 0.55
+		var clack := lp * exp(-t * 90.0)
+		var f := 70.0 + 130.0 * exp(-t * 40.0)
+		ph += TAU * f / RATE_HI
+		var body := sin(ph) * exp(-t * 22.0)
+		var scuff := 0.0
+		if t > 0.11:
+			scuff = n * 0.05 * exp(-(t - 0.11) * 30.0) * minf(1.0, (t - 0.11) / 0.01)
+		s[i] = (clack * 0.9 + body * 0.85 + scuff) * minf(1.0, t / 0.0008)
 	return _to_wav(s, RATE_HI, false)
 
 
