@@ -31,10 +31,16 @@ var glow_tex: GradientTexture2D
 
 var _water_cache := {}
 const HitButton = preload("res://scripts/hit_button.gd")
+## The 3D boat model, loaded once in the background at start-up and kept, so starting a lake
+## doesn't stop to load it again.
+const BOAT_MODEL := "res://models/fishing_boat.glb"
+var _boat_scene: PackedScene
 
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	if ResourceLoader.exists(BOAT_MODEL):
+		ResourceLoader.load_threaded_request(BOAT_MODEL)
 	_build_lakes()
 	marks.resize(lakes.size())
 	marks.fill(0)
@@ -148,6 +154,13 @@ func _build_lakes() -> void:
 			"start": [330, 780, PI], "jetty": [],
 		},
 	]
+
+
+## The boat model (waits for the background load the first time), or null if the file is missing.
+func boat_scene() -> PackedScene:
+	if _boat_scene == null and ResourceLoader.exists(BOAT_MODEL):
+		_boat_scene = ResourceLoader.load_threaded_get(BOAT_MODEL) as PackedScene
+	return _boat_scene
 
 
 func lake_count() -> int:

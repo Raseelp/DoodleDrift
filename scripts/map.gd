@@ -24,9 +24,32 @@ var thumbs: Array = []
 var current := 0
 var ui_root: Control
 var dev_panel: Control
-var card: Control
+var map_ui: Control  # title, lake names and the gear; hidden while zoomed in on a lake
 var settings: Control
 var celebrating := false
+# Arriving from a lake (after a win, or Menu): the lake zooms out into its picture, a lake this win
+# opened unlocks, and the boat sails to the next lake, which the map then zooms in on. A fresh tap skips to the end.
+const A_FADE := 0.3
+const A_ZOOM := 0.9
+const A_GAP := 0.15
+const A_UNLOCK := 0.7
+var arrive_level = null  # the lake (level.gd) zooming out over the map; freed when it lands
+var arrive_from := -1
+var travel_to := -1  # the lake the boat sails to and then zooms in on (-1: none)
+var reveal := -1  # the lake this win opened
+var arrive_t := -1.0  # seconds into the arrival, -1 when not arriving
+var arr_e := 1.0  # how far the lake has zoomed out
+var unlock_played := false
+var skip_armed := false  # a new touch began after the arrival started; only its lift skips
+var trip := PackedVector2Array()  # the boat's route to the next lake
+var trip_len := 0.0
+var trail: Array = []  # recent boat positions on the trip, for a small wake
+var tint_node: CanvasModulate
+var tint_color := Color.WHITE
+const Boat3D = preload("res://scripts/boat3d.gd")
+const MAP_BOAT_RENDER := 112  # render size: about 1.5x the drawn size, so it shrinks cleanly
+const MAP_BOAT_SCALE := 0.16 * 448.0 / MAP_BOAT_RENDER  # about 38 px long, the flat boat's size
+var boat3d: SubViewport  # the same 3D boat as on the lakes, drawn by the map
 var rings: Array = []  # gold ripples spreading from lakes during the chapter-complete moment
 
 # Time of day on the map follows the chapter: bright morning with no lake lit, golden afternoon,
@@ -88,7 +111,8 @@ func _ready() -> void:
 			"ph": rng.randf() * TAU, "v": Vector2(rng.randf_range(-6, 6), rng.randf_range(-8, -2))})
 
 	var bg := Polygon2D.new()
-	bg.polygon = PackedVector2Array([Vector2.ZERO, Vector2(view_size.x, 0), view_size, Vector2(0, view_size.y)])
+	# Ground well past the screen, so zooming in on a lake near the edge never runs out of it.
+	bg.polygon = PackedVector2Array([-view_size, Vector2(view_size.x * 2.0, -view_size.y), view_size * 2.0, Vector2(-view_size.x, view_size.y * 2.0)])
 	var m := ShaderMaterial.new()
 	m.shader = LandShader
 	m.set_shader_parameter("base", stop["base"])
@@ -98,6 +122,10 @@ func _ready() -> void:
 	var tint := CanvasModulate.new()
 	tint.color = stop["tint"]
 	add_child(tint)
+	tint_node = tint
+	tint_color = stop["tint"]
+	if is_instance_valid(arrive_level):
+		tint.visible = false  # the lake's own tint blends into this one, then hands over
 
 	# Cloud shadows: soft clusters drifting slowly across the meadow, fewer as the day ends.
 	for k in 4:
@@ -147,11 +175,153 @@ func _ready() -> void:
 	glow_node.draw_fn = _draw_glow
 	add_child(glow_node)
 
+	if Game.dev_on("boat3d"):
+		boat3d = Boat3D.new()
+		boat3d.render_size = MAP_BOAT_RENDER
+		add_child(boat3d)
+		boat3d.set_pose(-PI * 0.5, 0.0, 0.0, 0.0)
 	_build_ui()
 	Sfx.start_ambience(0.84, false)
 	Sfx.set_mood(day_t, 0.0, false)
-	if Game.chapter_done() and not Game.chapter_seen:
+	if is_instance_valid(arrive_level):
+		_start_arrival()
+	elif Game.chapter_done() and not Game.chapter_seen:
 		_celebrate.call_deferred()
+
+
+func _start_arrival() -> void:
+	arrive_t = 0.0
+	arr_e = 0.0
+	ui_root.modulate.a = 0.0
+	if reveal >= 0:
+		map_labels[2 + reveal].modulate.a = 0.4
+	if travel_to >= 0:
+		var a := arrive_from
+		var b := travel_to
+		trip = PackedVector2Array([_rest(a)])
+		if b > a:
+			trip.append_array(path_pts.slice(a * 16 + 3, b * 16 - 2))
+		trip.append(_rest(b))
+		trip_len = 0.0
+		for k in range(1, trip.size()):
+			trip_len += trip[k - 1].distance_to(trip[k])
+	_arrive_step()
+
+
+## Where the boat waits by a lake.
+func _rest(i: int) -> Vector2:
+	var cs: Vector2 = SPOTS[i] + off
+	var side := 1.0 if cs.x < 360.0 + off.x else -1.0
+	return cs + Vector2(side * 66.0, 62.0)
+
+
+## Top-left of a lake's picture on screen (the lake drawn at thumb_scale() from here), with the
+## map's zoom applied.
+func thumb_origin(i: int) -> Vector2:
+	return position + (SPOTS[i] + off - LAKE_CENTER * THUMB + Vector2(0, sin(clock * 0.9 + i) * 2.0)) * scale.x
+
+
+func thumb_scale() -> float:
+	return THUMB * scale.x
+
+
+func _t_zoomed() -> float:
+	return A_FADE + A_ZOOM
+
+
+func _t_unlock() -> float:
+	return _t_zoomed() + A_GAP
+
+
+func _t_trip() -> float:
+	return _t_unlock() + (A_UNLOCK if reveal >= 0 else 0.0)
+
+
+func _trip_time() -> float:
+	return clampf(trip_len / 200.0, 1.0, 2.4) if travel_to >= 0 else 0.0
+
+
+func _t_end() -> float:
+	return _t_trip() + _trip_time() + 0.15
+
+
+func _arrive_step() -> void:
+	var t := arrive_t
+	if is_instance_valid(arrive_level):
+		arrive_level.set_overlay_alpha(1.0 - clampf(t / A_FADE, 0.0, 1.0))
+		var k := clampf((t - A_FADE) / A_ZOOM, 0.0, 1.0)
+		arr_e = k * k * (3.0 - 2.0 * k)
+		arrive_level.set_zoom(arr_e, thumb_origin(arrive_from), thumb_scale(), tint_color)
+		ui_root.modulate.a = smoothstep(0.5, 1.0, arr_e)
+		if t >= _t_zoomed():
+			_land_level()
+	if reveal >= 0:
+		if not unlock_played and t >= _t_unlock():
+			unlock_played = true
+			var lc: Color = Game.lakes[reveal]["pal"]["light"]
+			rings.append({"p": SPOTS[reveal] + off, "t": clock, "c": lc})
+			Sfx.chime(0.84 * 2.0)
+			Sfx.stamp(true)
+			Game.vibrate(20)
+		map_labels[2 + reveal].modulate.a = lerpf(0.4, 1.0, _reveal_f())
+	if t >= _t_end():
+		_finish_arrival()
+
+
+func _land_level() -> void:
+	if is_instance_valid(arrive_level):
+		arrive_level.queue_free()
+	arrive_level = null
+	arr_e = 1.0
+	tint_node.visible = true
+	ui_root.modulate.a = 1.0
+
+
+func _finish_arrival() -> void:
+	_land_level()
+	if reveal >= 0:
+		map_labels[2 + reveal].modulate.a = 1.0
+	arrive_t = -1.0
+	trail.clear()
+	if travel_to >= 0:
+		current = travel_to
+	if Game.chapter_done() and not Game.chapter_seen:
+		_celebrate()
+	elif travel_to >= 0:
+		_focus(travel_to)
+
+
+## 0 = still locked, 1 = open; the lake this win opened goes from one to the other during the arrival.
+func _reveal_f() -> float:
+	return clampf((arrive_t - _t_unlock()) / A_UNLOCK, 0.0, 1.0) if arrive_t >= 0.0 else 1.0
+
+
+func _open_f(i: int) -> float:
+	if i == reveal and arrive_t >= 0.0:
+		return _reveal_f()
+	return 1.0 if Game.is_unlocked(i) else 0.0
+
+
+## The boat now: [position, heading, sailing]. It waits by a lake, or follows the trip during an arrival.
+func _boat_now() -> Array:
+	if arrive_t >= 0.0 and travel_to >= 0 and trip.size() >= 2:
+		var u := clampf((arrive_t - _t_trip()) / _trip_time(), 0.0, 1.0)
+		if u <= 0.0:
+			return [_rest(arrive_from), -PI * 0.5, false]
+		var want := u * u * (3.0 - 2.0 * u) * trip_len
+		var p := trip[trip.size() - 1]
+		var dir := Vector2.UP
+		for k in range(1, trip.size()):
+			var seg := trip[k - 1].distance_to(trip[k])
+			if want <= seg or k == trip.size() - 1:
+				var f := clampf(want / maxf(seg, 0.001), 0.0, 1.0)
+				p = trip[k - 1].lerp(trip[k], f)
+				dir = (trip[k] - trip[k - 1]).normalized()
+				break
+			want -= seg
+		var w := minf(smoothstep(0.0, 0.15, u), 1.0 - smoothstep(0.85, 1.0, u))
+		return [p, lerp_angle(-PI * 0.5, dir.angle(), w), u < 1.0]
+	return [_rest(current), -PI * 0.5, false]
 
 
 func _build_ui() -> void:
@@ -164,15 +334,40 @@ func _build_ui() -> void:
 	root.size = view_size
 	layer.add_child(root)
 	ui_root = root
+	map_ui = Control.new()
+	map_ui.size = view_size
+	map_ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(map_ui)
 
 	# Settings, top right: sound, music, vibration, credits and the developer options live there.
-	var gear := Game.square_button(Game.icon("settings"), 64, 30)
+	var gear := Game.square_button(null, 64, 30)
 	gear.position = Vector2(view_size.x - 32 - 64, top_inset + 24)
 	gear.pressed.connect(func():
+		if arrive_t >= 0.0 or leaving_map:
+			return
+		if focus >= 0:
+			_unfocus()
+			return
 		Sfx.tap()
 		_open_settings())
 	root.add_child(gear)
 	gear.reset_size()
+	corner_btn = gear
+	# Two icons on the button, crossfading with a quarter turn: settings on the map, close when zoomed in.
+	for spec in [["settings", 30.0], ["close", 26.0]]:
+		var ic := TextureRect.new()
+		ic.texture = Game.icon(spec[0])
+		ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		ic.size = Vector2(spec[1], spec[1])
+		ic.pivot_offset = ic.size * 0.5
+		ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		gear.add_child(ic)
+		corner_icons.append(ic)
+	_place_corner_icons(false)
+	gear.button_down.connect(func(): _place_corner_icons(true))
+	gear.button_up.connect(func(): _place_corner_icons(false))
+	_set_corner(0.0)
 
 	var title := Label.new()
 	title.text = "WAKE"
@@ -182,7 +377,7 @@ func _build_ui() -> void:
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.position = Vector2(0, top_inset + off.y * 0.5 + 70)
 	title.size = Vector2(view_size.x, 110)
-	root.add_child(title)
+	map_ui.add_child(title)
 
 	var sub := Label.new()
 	sub.text = "Chapter one  ·  The still lakes"
@@ -192,7 +387,7 @@ func _build_ui() -> void:
 	map_labels.append(sub)
 	sub.position = Vector2(0, top_inset + off.y * 0.5 + 180)
 	sub.size = Vector2(view_size.x, 40)
-	root.add_child(sub)
+	map_ui.add_child(sub)
 
 	for i in Game.lake_count():
 		var spot: Vector2 = SPOTS[i] + off
@@ -208,7 +403,7 @@ func _build_ui() -> void:
 			l.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 		l.modulate.a = 1.0 if Game.is_unlocked(i) else 0.4
 		map_labels.append(l)
-		root.add_child(l)
+		map_ui.add_child(l)
 	# Labels take the day's ink colour; in daylight the dark drop shadow becomes a faint light one.
 	for lb in map_labels:
 		lb.add_theme_color_override("font_color", ink)
@@ -233,6 +428,16 @@ func _day_stop(t: float) -> Dictionary:
 
 func _process(delta: float) -> void:
 	clock += delta
+	if arrive_t >= 0.0:
+		arrive_t += delta
+		_arrive_step()
+	var bn := _boat_now()
+	if boat3d:
+		boat3d.set_pose(float(bn[1]), 0.0, 0.0, 0.0)
+	if bn[2] and (trail.is_empty() or Vector2(trail[-1]["p"]).distance_to(bn[0]) > 6.0):
+		trail.append({"p": bn[0], "t": clock})
+	while not trail.is_empty() and clock - float(trail[0]["t"]) > 1.2:
+		trail.remove_at(0)
 	for c in clouds:
 		c["p"] = Vector2(c["p"]) + Vector2(float(c["v"]), float(c["v"]) * 0.25) * delta
 		if Vector2(c["p"]).x > view_size.x + 380.0:
@@ -254,251 +459,265 @@ func _process(delta: float) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	if dev_panel != null or card != null or settings != null or celebrating:
+	if arrive_t >= 0.0:
+		# The lift of the tap that left the lake arrives here too; only a fresh tap skips.
+		if event is InputEventScreenTouch:
+			if event.pressed:
+				skip_armed = true
+			elif skip_armed:
+				arrive_t = _t_end()  # skip to the end
+				_arrive_step()
 		return
-	if event is InputEventScreenTouch and event.pressed:
-		var best := -1
-		var best_d := 120.0
-		for i in Game.lake_count():
-			var d: float = event.position.distance_to(SPOTS[i] + off)
-			if d < best_d:
-				best_d = d
-				best = i
-		if best >= 0:
-			if Game.is_unlocked(best):
-				Sfx.tap()
-				_open_card(best)
-			else:
-				Sfx.reject()
-				_toast("Light every lantern on %s to open it" % Game.lakes[best - 1]["name"])
+	if dev_panel != null or settings != null or celebrating or leaving_map:
+		return
+	if not (event is InputEventScreenTouch and not event.pressed):
+		return
+	var p := _to_map_space(event.position)
+	if focus >= 0:
+		if p.distance_to(SPOTS[focus] + off) < FOCUS_RING_MAX:
+			_set_off(focus)
+		else:
+			_unfocus()
+		return
+	var best := -1
+	var best_d := 120.0
+	for i in Game.lake_count():
+		var d: float = p.distance_to(SPOTS[i] + off)
+		if d < best_d:
+			best_d = d
+			best = i
+	if best >= 0 and Game.is_unlocked(best):
+		Sfx.tap()
+		_focus(best)
+	elif best >= 0:
+		Sfx.reject()
+		_toast("Light every lantern on %s to open it" % Game.lakes[best - 1]["name"])
 
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
-		if card != null:
-			_close_card()
+		if arrive_t >= 0.0:
+			arrive_t = _t_end()
+			_arrive_step()
+		elif leaving_map:
+			pass
 		elif settings != null:
 			_close_settings()
+		elif focus >= 0:
+			_unfocus()
 		elif dev_panel != null:
 			reload_requested.emit()
 		else:
 			get_tree().quit()
 
 
-## The lake card: same size as before, polished. The lake picture is the button: tap it to set off.
-## All spacing is on an 8 px grid (padding 40 at the sides and bottom, 32 at the top), and every row is centred.
-const CARD_PAD_X := 40.0
+# ---------------------------------------------------------------- focus on a lake
+# Tapping a lake zooms the map in on it and shows its details on the map under it; tapping the lake
+# again sets off (the lake zooms the rest of the way in), tapping elsewhere or back zooms out again.
+const CARD_PAD_X := 40.0  # the settings card's padding
 const CARD_PAD_TOP := 32.0
-const CARD_PAD_BOTTOM := 40.0 + 10.0  # 40 px of space above the card's 10 px base edge
-const ART_H := 264.0
-const GOAL_H := 128.0
+const CARD_PAD_BOTTOM := 40.0 + 10.0
+const FOCUS_Z := 2.0  # how far the map zooms in on a lake
+const FOCUS_Y := 0.29  # where the focused lake sits, as a share of the screen height
+const FOCUS_TIME := 0.5
+const FOCUS_RING := 92.0  # the ring around the focused lake, in map units: from here...
+const FOCUS_RING_MAX := 112.0  # ...to here
+var focus := -1  # the lake zoomed in on, -1 when showing the whole map
+var last_focus := -1  # the lake last zoomed in on: it stays bright while the map zooms back out
+var focus_f := 0.0  # 0..1 while zooming in: the other lakes, the path and the small goal icons fade back
+var focus_ui: Control
+var cam_tween: Tween
+var leaving_map := false  # a lake has been set off
+var corner_btn: Button  # top right: settings on the map, close while zoomed in on a lake
+var corner_icons: Array = []  # [settings, close]
+var corner_f := 0.0  # 0 = settings, 1 = close
 
 
-func _open_card(i: int) -> void:
+## Centres the corner icons on the button face (lower while it is pressed down into its edge).
+func _place_corner_icons(down: bool) -> void:
+	var face := Vector2(64, 64 - 4.0)
+	for ic in corner_icons:
+		ic.position = (face - ic.size) * 0.5 + Vector2(0, 4.0 if down else 0.0)
+
+
+func _set_corner(f: float) -> void:
+	corner_f = f
+	var gear_i: TextureRect = corner_icons[0]
+	var close_i: TextureRect = corner_icons[1]
+	gear_i.modulate.a = 1.0 - f
+	gear_i.rotation = f * PI * 0.5
+	close_i.modulate.a = f
+	close_i.rotation = (f - 1.0) * PI * 0.5
+
+
+func _to_map_space(p: Vector2) -> Vector2:
+	return (p - position) / scale.x
+
+
+## Map scale and offset that put lake i's picture at the focus spot.
+func _focus_cam(i: int) -> Array:
+	var target := Vector2(view_size.x * 0.5, top_inset + view_size.y * FOCUS_Y)
+	return [target - (SPOTS[i] + off) * FOCUS_Z, FOCUS_Z]
+
+
+func _move_cam(pos: Vector2, z: float, f: float) -> void:
+	if cam_tween:
+		cam_tween.kill()
+	cam_tween = create_tween().set_parallel().set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN_OUT)
+	cam_tween.tween_property(self, "position", pos, FOCUS_TIME)
+	cam_tween.tween_property(self, "scale", Vector2(z, z), FOCUS_TIME)
+	cam_tween.tween_property(self, "focus_f", f, FOCUS_TIME)
+	cam_tween.tween_method(_set_corner, corner_f, f, FOCUS_TIME * 0.7)
+
+
+func _focus(i: int) -> void:
+	focus = i
+	last_focus = i
+	var cam := _focus_cam(i)
+	_move_cam(cam[0], cam[1], 1.0)
+	var fade := create_tween()
+	fade.tween_property(map_ui, "modulate:a", 0.0, FOCUS_TIME * 0.5)
+	if is_instance_valid(focus_ui):
+		focus_ui.queue_free()
+	focus_ui = _build_focus_ui(i)
+	focus_ui.modulate.a = 0.0
+	var show := focus_ui.create_tween()
+	show.tween_interval(FOCUS_TIME * 0.6)
+	show.tween_property(focus_ui, "modulate:a", 1.0, 0.25)
+
+
+func _unfocus() -> void:
+	if focus < 0:
+		return
+	focus = -1
+	Sfx.tap()
+	_move_cam(Vector2.ZERO, 1.0, 0.0)
+	if is_instance_valid(focus_ui):
+		var old := focus_ui
+		var out := old.create_tween()
+		out.tween_property(old, "modulate:a", 0.0, 0.15)
+		out.tween_callback(old.queue_free)
+	focus_ui = null
+	var back := create_tween()
+	back.tween_interval(FOCUS_TIME * 0.5)
+	back.tween_property(map_ui, "modulate:a", 1.0, FOCUS_TIME * 0.5)
+
+
+## The focused lake's details, laid out under its picture: number and name, the three goals,
+## best time and daylight, and how to set off. Text in the map's ink so it sits on the ground.
+func _build_focus_ui(i: int) -> Control:
 	var lake: Dictionary = Game.lakes[i]
-	var pal: Dictionary = lake["pal"]
-	var light: Color = pal["light"]
+	var light: Color = lake["pal"]["light"]
 	var m := int(Game.marks[i])
 	var total: int = lake["lanterns"].size()
 	var par := int(lake["par"])
-	var card_w := minf(620.0, view_size.x - 48.0)
-	var inner_w := card_w - CARD_PAD_X * 2.0
-
-	card = Control.new()
-	card.size = view_size
-	card.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui_root.add_child(card)
-	var dim := ColorRect.new()
-	dim.color = Color(0.024, 0.047, 0.063, 0.66)
-	dim.size = view_size
-	dim.gui_input.connect(func(e: InputEvent):
-		if e is InputEventScreenTouch and not e.pressed:
-			_close_card())
-	card.add_child(dim)
-
-	var panel := Panel.new()
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color("13232a")
-	sb.border_color = Color("0a161b")
-	sb.border_width_bottom = 10
-	sb.set_corner_radius_all(22)
-	sb.shadow_color = Color(0, 0, 0, 0.35)
-	sb.shadow_size = 32
-	sb.shadow_offset = Vector2(0, 16)
-	sb.anti_aliasing = true
-	panel.add_theme_stylebox_override("panel", sb)
-	panel.mouse_filter = Control.MOUSE_FILTER_STOP
-	card.add_child(panel)
+	var inner_w := minf(560.0, view_size.x - 96.0)
+	var shadow := Color(1, 1, 1, 0.22) if day_t < 0.62 else Color(0, 0, 0, 0.32)
+	var root := Control.new()
+	root.size = view_size
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui_root.add_child(root)
 
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 0)
-	col.position = Vector2(CARD_PAD_X, CARD_PAD_TOP)
-	col.size = Vector2(inner_w, 0)
-	panel.add_child(col)
+	col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(col)
+	var text := func(t: String, size: int, font: Font, a: float) -> Label:
+		var l := Label.new()
+		l.text = t
+		if font:
+			l.add_theme_font_override("font", font)
+		l.add_theme_font_size_override("font_size", size)
+		l.add_theme_color_override("font_color", Color(ink, a))
+		l.add_theme_color_override("font_shadow_color", shadow)
+		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		l.custom_minimum_size = Vector2(inner_w, 0)
+		col.add_child(l)
+		return l
 	var gap := func(h: float):
 		var g := Control.new()
 		g.custom_minimum_size = Vector2(0, h)
 		g.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		col.add_child(g)
 
-	# Header: lake number left, close right, both centred on one 64 px row.
-	var head := HBoxContainer.new()
-	head.custom_minimum_size = Vector2(inner_w, 64)
-	col.add_child(head)
-	var kick := Label.new()
-	kick.text = "LAKE %d" % (i + 1)
-	kick.add_theme_font_override("font", Game.heading_font)
-	kick.add_theme_font_size_override("font_size", 22)
-	kick.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	kick.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	kick.size_flags_vertical = Control.SIZE_FILL
-	kick.modulate.a = 0.55
-	head.add_child(kick)
-	var close := Game.square_button(Game.icon("close"), 64, 26)
-	close.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	close.pressed.connect(func():
-		Sfx.tap()
-		_close_card())
-	head.add_child(close)
-	gap.call(8)
-
-	# The lake itself is the button. A ripple spreads from it and the boat waits at its start.
-	var th: Dictionary = thumbs[i]
-	var art := Control.new()
-	art.custom_minimum_size = Vector2(inner_w, ART_H)
-	art.mouse_filter = Control.MOUSE_FILTER_STOP
-	art.set_meta("k", 0.0)
-	art.set_meta("bob", 0.0)
-	var sc := 0.2
-	art.draw.connect(func():
-		var mid := Vector2(inner_w * 0.5, ART_H * 0.5)
-		var k: float = art.get_meta("k")
-		art.draw_arc(mid, 112.0 * (0.75 + 0.5 * k), 0.0, TAU, 64, Color(light, 0.5 * (1.0 - k)), 3.0, true)
-		art.draw_set_transform(mid - LAKE_CENTER * sc, 0.0, Vector2(sc, sc))
-		for p in th["sand"]:
-			art.draw_colored_polygon(p, pal["sand"])
-		art.draw_colored_polygon(th["water"], pal["shallow"])
-		for p in th["mid"]:
-			art.draw_colored_polygon(p, pal["mid"])
-		for p in th["deep"]:
-			art.draw_colored_polygon(p, pal["deep"])
-		for l in lake["lanterns"]:
-			art.draw_circle(Vector2(l[0], l[1]), 22.0, light if m & Game.MARK_ALL else light.darkened(0.45), true, -1.0, true)
-		var st: Array = lake["start"]
-		var bob: float = art.get_meta("bob")
-		art.draw_set_transform(mid + (Vector2(st[0], st[1]) - LAKE_CENTER) * sc + Vector2(0, bob), float(st[2]), Vector2(1.1, 1.1))
-		art.draw_colored_polygon(PackedVector2Array(HULL), Color("efe6d6"))
-		art.draw_rect(Rect2(-9, -4.5, 11, 9), Color("c9bca5"))
-		art.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE))
-	art.gui_input.connect(func(e: InputEvent):
-		if e is InputEventScreenTouch and not e.pressed:
-			_set_off(i))
-	col.add_child(art)
-	var ripple := art.create_tween().set_loops()
-	ripple.tween_method(func(v: float):
-		art.set_meta("k", v)
-		art.set_meta("bob", sin(v * TAU) * 2.0)
-		art.queue_redraw(), 0.0, 1.0, 2.6)
+	text.call("LAKE %d" % (i + 1), 22, Game.heading_font, 0.65)
+	gap.call(4)
+	text.call(String(lake["name"]).to_upper(), 40, Game.title_font, 1.0)
 	gap.call(24)
 
-	var name_l := Label.new()
-	name_l.text = String(lake["name"]).to_upper()
-	name_l.add_theme_font_override("font", Game.title_font)
-	name_l.add_theme_font_size_override("font_size", 40)
-	name_l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	name_l.custom_minimum_size = Vector2(inner_w, 56)
-	name_l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	col.add_child(name_l)
-	gap.call(32)
-
-	# Goals: three equal cells between thin rules, icon over label, earned in the lake's light colour.
+	# Goals: the map's dark discs, bigger, each over its label.
 	var goals := [["lantern", "All %d lanterns" % total, Game.MARK_ALL],
 		["sun", "Before dusk", Game.MARK_TIME],
 		["loop", "Max %d loop%s" % [par, "" if par == 1 else "s"], Game.MARK_LOOPS]]
-	var rule := Color(1, 1, 1, 0.08)
-	var grid := Control.new()
-	grid.custom_minimum_size = Vector2(inner_w, GOAL_H)
-	grid.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	grid.draw.connect(func():
-		grid.draw_line(Vector2(0, 1), Vector2(inner_w, 1), rule, 2.0)
-		grid.draw_line(Vector2(0, GOAL_H - 1), Vector2(inner_w, GOAL_H - 1), rule, 2.0)
-		for k in [1, 2]:
-			var x := roundf(inner_w * k / 3.0)
-			grid.draw_line(Vector2(x, 24), Vector2(x, GOAL_H - 24), rule, 2.0))
-	col.add_child(grid)
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 0)
+	row.custom_minimum_size = Vector2(inner_w, 0)
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	col.add_child(row)
 	for k in 3:
 		var on: bool = m & int(goals[k][2]) != 0
-		var cell := VBoxContainer.new()
-		cell.add_theme_constant_override("separation", 8)
-		cell.alignment = BoxContainer.ALIGNMENT_CENTER
-		cell.position = Vector2(inner_w * k / 3.0, 0)
-		cell.size = Vector2(inner_w / 3.0, GOAL_H)
-		cell.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		grid.add_child(cell)
 		var kind: String = goals[k][0]
-		var ic := TextureRect.new()
-		ic.texture = Game.icon(kind)
-		ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-		ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-		var isz := 48.0 * float(Game.ICON_OPTICAL.get(kind, 1.0))
-		ic.custom_minimum_size = Vector2(48, 48)
-		ic.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-		ic.modulate = light if on else Color(1, 1, 1, 0.24)
-		ic.scale = Vector2.ONE * (isz / 48.0)
-		ic.pivot_offset = Vector2(24, 24)
-		cell.add_child(ic)
+		var cell := VBoxContainer.new()
+		cell.add_theme_constant_override("separation", 10)
+		cell.custom_minimum_size = Vector2(inner_w / 3.0, 0)
+		cell.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		row.add_child(cell)
+		var disc := Control.new()
+		disc.custom_minimum_size = Vector2(inner_w / 3.0, 64)
+		disc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		disc.draw.connect(func():
+			var c := disc.size * 0.5
+			disc.draw_circle(c, 30.0, Color(0.03, 0.06, 0.08, 0.62 if on else 0.42), true, -1.0, true)
+			Game.draw_icon(disc, kind, c, 34, light if on else Color(1, 1, 1, 0.5)))
+		cell.add_child(disc)
 		var gl := Label.new()
 		gl.text = String(goals[k][1])
 		gl.add_theme_font_size_override("font_size", 20)
+		gl.add_theme_color_override("font_color", Color(ink, 0.9 if on else 0.72))
+		gl.add_theme_color_override("font_shadow_color", shadow)
 		gl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		gl.modulate.a = 0.8 if on else 0.45
 		cell.add_child(gl)
 	gap.call(24)
 
 	var best := float(Game.stats[i]["best"])
-	var facts := Label.new()
-	facts.text = ("Best  %d s      Daylight  %d s" % [roundi(best), int(Game.lake_duration(i))]) if best > 0.0 else "Daylight  %d s" % int(Game.lake_duration(i))
-	facts.add_theme_font_size_override("font_size", 24)
-	facts.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	facts.custom_minimum_size = Vector2(inner_w, 40)
-	facts.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	facts.modulate.a = 0.7
-	col.add_child(facts)
+	var day := int(Game.lake_duration(i))
+	text.call(("Best  %d s      Daylight  %d s" % [roundi(best), day]) if best > 0.0 else "Daylight  %d s" % day, 24, null, 0.8)
 	gap.call(24)
 
+	# How to set off, on a small dark plate so it reads on any ground.
+	var plate := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.031, 0.067, 0.086, 0.85)
+	sb.set_corner_radius_all(12)
+	sb.content_margin_left = 24
+	sb.content_margin_right = 24
+	sb.content_margin_top = 12
+	sb.content_margin_bottom = 12
+	plate.add_theme_stylebox_override("panel", sb)
+	plate.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	plate.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var hint := Label.new()
 	hint.text = "TAP THE LAKE TO SET OFF"
 	hint.add_theme_font_override("font", Game.heading_font)
 	hint.add_theme_font_size_override("font_size", 22)
 	hint.add_theme_color_override("font_color", light)
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.custom_minimum_size = Vector2(inner_w, 32)
-	hint.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	col.add_child(hint)
+	plate.add_child(hint)
+	col.add_child(plate)
 
+	# Under the lake's picture once zoomed in, clear of the ring that pulses around it.
 	col.reset_size()
-	var card_h := CARD_PAD_TOP + col.get_combined_minimum_size().y + CARD_PAD_BOTTOM
-	panel.size = Vector2(card_w, card_h)
-	panel.position = ((view_size - panel.size) * 0.5).floor()
-	card.modulate.a = 0.0
-	card.create_tween().tween_property(card, "modulate:a", 1.0, 0.2)
+	col.position = Vector2((view_size.x - inner_w) * 0.5,
+		top_inset + view_size.y * FOCUS_Y + FOCUS_RING_MAX * FOCUS_Z + 12.0)
+	return root
 
 
-## Tapping the lake: a short press on the picture, then the lake starts.
+## Tapping the focused lake: the lake zooms the rest of the way in and starts.
 func _set_off(i: int) -> void:
-	if card == null or card.has_meta("leaving"):
+	if leaving_map:
 		return
-	card.set_meta("leaving", true)
+	leaving_map = true
 	Sfx.tap()
-	var tw := card.create_tween()
-	tw.tween_property(card, "modulate:a", 0.0, 0.18)
-	tw.tween_callback(func(): lake_chosen.emit(i))
-
-
-func _close_card() -> void:
-	if card != null:
-		card.queue_free()
-		card = null
+	lake_chosen.emit(i)
 
 
 func _open_curve(pts: PackedVector2Array, sub: int) -> PackedVector2Array:
@@ -528,7 +747,7 @@ func _draw_map(n: Node2D) -> void:
 		var seg := a.distance_to(b)
 		while acc < seg:
 			var p := a.lerp(b, acc / seg)
-			n.draw_circle(p, 2.4, Color(ink, 0.28))
+			n.draw_circle(p, 2.4, Color(ink, 0.28 * (1.0 - 0.75 * focus_f)))
 			acc += 15.0
 		acc -= seg
 
@@ -548,8 +767,12 @@ func _draw_map(n: Node2D) -> void:
 	for i in Game.lake_count():
 		var lake: Dictionary = Game.lakes[i]
 		var pal: Dictionary = lake["pal"]
-		var open := Game.is_unlocked(i)
-		var alpha := 1.0 if open else 0.3
+		var of := _open_f(i)
+		var alpha := lerpf(0.3, 1.0, of)
+		if i == arrive_from and is_instance_valid(arrive_level):
+			alpha *= smoothstep(0.8, 1.0, arr_e)
+		if i != (focus if focus >= 0 else last_focus):
+			alpha *= 1.0 - 0.7 * focus_f
 		var spot: Vector2 = SPOTS[i] + off
 		var origin := spot - LAKE_CENTER * THUMB
 		var bob := sin(clock * 0.9 + i) * 2.0
@@ -576,16 +799,20 @@ func _draw_map(n: Node2D) -> void:
 		# lake's light, the rest a dim white.
 		var left_side := spot.x < 360.0 + off.x
 		var m := int(Game.marks[i])
-		for k in 3:
+		for k in (3 if focus_f < 1.0 else 0):
 			var x := spot.x + 108 + k * 38 if left_side else spot.x - 108 - (2 - k) * 38
 			var gp := Vector2(x, spot.y + 26)
 			var kind: String = ["lantern", "sun", "loop"][k]
 			var on := m & (1 << k) != 0
-			n.draw_circle(gp, 17.0, Color(0.03, 0.06, 0.08, (0.62 if on else 0.42) * (1.0 if open else 0.6)), true, -1.0, true)
-			Game.draw_icon(n, kind, gp, 24, Color(pal["light"]) if on else Color(1, 1, 1, 0.5 if open else 0.3))
-		if not open:
-			n.draw_circle(spot, 30.0, Color(0.03, 0.06, 0.08, 0.75), true, -1.0, true)
-			Game.draw_icon(n, "lock", spot, 30, Color(1, 1, 1, 0.85))
+			var ga := 1.0 - focus_f
+			n.draw_circle(gp, 17.0, Color(0.03, 0.06, 0.08, (0.62 if on else 0.42) * lerpf(0.6, 1.0, of) * ga), true, -1.0, true)
+			Game.draw_icon(n, kind, gp, 24, Color(Color(pal["light"]) if on else Color(1, 1, 1, lerpf(0.3, 0.5, of)), (1.0 if on else lerpf(0.3, 0.5, of)) * ga))
+		if of < 1.0:
+			# Locked; while a lake opens, its lock swells and fades away.
+			var lk := 1.0 + 0.6 * of
+			var la := (1.0 - of) * (1.0 - 0.7 * focus_f)
+			n.draw_circle(spot, 30.0 * lk, Color(0.03, 0.06, 0.08, 0.75 * la), true, -1.0, true)
+			Game.draw_icon(n, "lock", spot, 30 * lk, Color(1, 1, 1, 0.85 * la))
 
 	# Cloud shadows over everything on the ground, fading out toward night.
 	var shade := (1.0 - smoothstep(0.55, 0.9, day_t)) * 0.13
@@ -608,20 +835,45 @@ func _draw_map(n: Node2D) -> void:
 			_draw_wings(n, flap, Color(b["c"], fly_a))
 			n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
+	var fl := focus if focus >= 0 else last_focus
+	if fl >= 0 and focus_f > 0.0 and not leaving_map:
+		var rk := fmod(clock / 2.2, 1.0)
+		var fc: Color = Game.lakes[fl]["pal"]["light"]
+		var ra := focus_ui.modulate.a if focus >= 0 and is_instance_valid(focus_ui) else focus_f
+		n.draw_arc(SPOTS[fl] + off, FOCUS_RING + rk * (FOCUS_RING_MAX - FOCUS_RING), 0.0, TAU, 64, Color(fc, 0.7 * (1.0 - rk) * ra), 2.0, true)
+
 	# Chapter-complete ripples.
 	for r in rings:
 		var rk := (clock - float(r["t"])) / 1.2
 		if rk >= 0.0 and rk <= 1.0:
 			n.draw_arc(r["p"], 40.0 + rk * 90.0, 0.0, TAU, 48, Color(r["c"], 0.9 * (1.0 - rk)), 4.0, true)
 
-	# The boat waits by the current lake.
-	var cs: Vector2 = SPOTS[current] + off
-	var side := 1.0 if cs.x < 360.0 + off.x else -1.0
-	var bp := cs + Vector2(side * 66.0, 62.0 + sin(clock * 1.7) * 3.0)
-	n.draw_set_transform(bp, -PI / 2 + sin(clock * 0.8) * 0.15, Vector2(1.1, 1.1))
+	# The boat waits by the current lake, or sails to the next one, leaving a small wake.
+	for k in range(1, trail.size()):
+		var age := (clock - float(trail[k]["t"])) / 1.2
+		n.draw_line(trail[k - 1]["p"], trail[k]["p"], Color(1, 1, 1, 0.45 * (1.0 - age)), 2.5 * (1.0 - age) + 0.5, true)
+	var bn := _boat_now()
+	var sailing: bool = bn[2]
+	var bp: Vector2 = bn[0] + (Vector2.ZERO if sailing else Vector2(0, sin(clock * 1.7) * 3.0))
+	var sway := 0.0 if sailing else sin(clock * 0.8) * 0.15
+	if boat3d:
+		_draw_boat(n, bp, sway)
+		return
+	n.draw_set_transform(bp, float(bn[1]) + sway, Vector2(1.1, 1.1))
 	n.draw_colored_polygon(PackedVector2Array(HULL), Color("efe6d6"))
 	n.draw_rect(Rect2(-9, -4.5, 11, 9), Color("c9bca5"))
 	n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+
+## The 3D boat's render (pointing up) at p, turned by rot, with its shadow like on the lakes.
+func _draw_boat(ci: CanvasItem, p: Vector2, rot: float) -> void:
+	var tex := boat3d.get_texture()
+	var half := tex.get_size() * 0.5
+	ci.draw_set_transform(p + Vector2(-6, 8), rot, Vector2.ONE * MAP_BOAT_SCALE)
+	ci.draw_texture(tex, -half, Color(0.02, 0.06, 0.08, 0.32))
+	ci.draw_set_transform(p, rot, Vector2.ONE * MAP_BOAT_SCALE)
+	ci.draw_texture(tex, -half)
+	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 
 func _draw_wings(n: Node2D, flap: float, col: Color) -> void:
@@ -856,7 +1108,7 @@ func _toast(text: String) -> void:
 	tw.tween_callback(plate.queue_free)
 
 
-## Settings: the same card as the lake card. Sound, music and vibration; credits; the developer options.
+## Settings: a card with sound, music and vibration; credits; the developer options.
 func _open_settings() -> void:
 	if settings != null:
 		return

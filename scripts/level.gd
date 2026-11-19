@@ -3,6 +3,7 @@ extends Node2D
 
 signal exit_requested
 signal level_requested(index: int)
+signal map_requested(level: Node, travel_to: int, reveal: int)
 
 const DrawNode = preload("res://scripts/draw_node.gd")
 const Boat3D = preload("res://scripts/boat3d.gd")
@@ -23,6 +24,9 @@ const NOTES := [1.0, 1.125, 1.25, 1.5, 1.6667, 2.0, 2.25, 2.5]
 const HULL := [Vector2(19, 0), Vector2(9, -7.5), Vector2(-13, -7.5), Vector2(-16, -4.5),
 	Vector2(-16, 4.5), Vector2(-13, 7.5), Vector2(9, 7.5)]
 const TURN_EASE := 0.2
+## How quickly the hull's travel follows where the bow points (higher = less sideways slide). The boat is
+## drawn between the two (_vis_heading), so it carves through a turn instead of skidding.
+const MOVE_FOLLOW := 8.5
 const BOOST_COUNT := 3
 const BOOST_WINDOW := 7.0
 const BOOST_TIME := 4.5
@@ -124,6 +128,19 @@ var history_t := 0.0
 var scrape_until := -10.0  # boat is rubbing the shore: slowed like in reeds
 var scrape_fx := 0.0
 var leaving := false  # a new lake or the map has been asked for; ignore further taps
+# Zooming between the map and this lake: in from the lake's picture when it starts, out to it when
+# leaving for the map. No HUD or input meanwhile; a fresh tap skips to the end.
+const ZOOM_IN := 0.8
+var zoom_from = null  # the map (map.gd), while this lake zooms in from it
+var zooming := false
+var zoom_in_t := -1.0
+var skip_armed := false  # a touch began during the zoom in; only its lift skips
+var zoom_k := 0.0  # 0 = full screen, 1 = the size of the lake's picture on the map
+var newly_unlocked := -1  # the lake this win opened, for the map to show
+var land_node: Polygon2D
+var tree_layer: Node2D
+var light_layer: CanvasLayer
+var ui_layer: CanvasLayer
 
 # Nodes
 var view_size := Vector2.ZERO
@@ -153,6 +170,97 @@ func _ready() -> void:
 	heading = s[2]
 	move_dir = heading
 	Sfx.start_ambience(float(lake["pitch"]))
+	if is_instance_valid(zoom_from):
+		zooming = true
+		zoom_in_t = 0.0
+		ui_layer.visible = false
+		zoom_from.tint_node.visible = false
+		set_zoom(1.0, zoom_from.thumb_origin(lake_index), zoom_from.thumb_scale(), zoom_from.tint_color)
+
+
+## Places the lake between full screen (e = 0) and its picture on the map (e = 1): the land and trees
+## fade away, the light layer follows, and near the end the whole lake fades into the map's picture.
+func set_zoom(e: float, origin: Vector2, thumb: float, tint: Color) -> void:
+	zoom_k = e
+	var s := lerpf(1.0, thumb, e)
+	world.scale = Vector2(s, s)
+	world.position = off.lerp(origin, e)
+	light_layer.scale = world.scale
+	light_layer.offset = world.position
+	var ground := 1.0 - smoothstep(0.0, 0.55, e)
+	# The ground stays fixed to the screen and only fades, so its square edge never shows.
+	land_node.scale = Vector2.ONE / s
+	land_node.position = (off - world.position) / s
+	land_node.modulate.a = ground
+	tree_layer.modulate.a = ground
+	light_node.modulate.a = 1.0 - smoothstep(0.4, 0.9, e)
+	world.modulate.a = 1.0 - smoothstep(0.8, 1.0, e)
+	modulate_node.color = _day_tint().lerp(tint, smoothstep(0.0, 0.5, e))
+	if e > 0.0:
+		ui_layer.visible = false
+
+
+## The victory or pause screen fading away at the start of a zoom out.
+func set_overlay_alpha(a: float) -> void:
+	if overlay != null and is_instance_valid(overlay):
+		overlay.modulate.a = a
+
+
+func _day_tint() -> Color:
+	return Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, dusk) * 0.92)
+
+
+func _end_zoom_in() -> void:
+	zoom_in_t = -1.0
+	zooming = false
+	zoom_k = 0.0
+	world.scale = Vector2.ONE
+	world.position = off
+	light_layer.scale = Vector2.ONE
+	light_layer.offset = off
+	land_node.modulate.a = 1.0
+	land_node.scale = Vector2.ONE
+	land_node.position = Vector2.ZERO
+	tree_layer.modulate.a = 1.0
+	light_node.modulate.a = 1.0
+	world.modulate.a = 1.0
+	if is_instance_valid(zoom_from):
+		zoom_from.queue_free()
+	zoom_from = null
+	ui_layer.visible = true
+	ui_root.modulate.a = 0.0
+	ui_root.create_tween().tween_property(ui_root, "modulate:a", 1.0, 0.25)
+
+
+## Leave for the map with the zoom out. next: from the victory screen, so the boat then sails on.
+func _zoom_to_map(next: bool) -> void:
+	if leaving:
+		return
+	leaving = true
+	get_tree().paused = false
+	Engine.time_scale = 1.0
+	state = "leaving"
+	zooming = true
+	touches.clear()
+	_set_hud_visible(false)
+	if overlay != null:
+		_ignore_mouse(overlay)
+	map_requested.emit(self, _next_lake() if next else -1, newly_unlocked)
+
+
+func _ignore_mouse(n: Node) -> void:
+	if n is Control:
+		(n as Control).mouse_filter = Control.MOUSE_FILTER_IGNORE
+	for c in n.get_children():
+		_ignore_mouse(c)
+
+
+## Where the boat goes after a win: the next open lake not yet lit, else simply the next lake.
+func _next_lake() -> int:
+	for j in range(lake_index + 1, Game.lake_count()):
+		if Game.is_unlocked(j) and not Game.lake_done(j):
+			return j
+	return lake_index + 1 if lake_index + 1 < Game.lake_count() else -1
 
 
 func _exit_tree() -> void:
@@ -272,6 +380,7 @@ func _build_nodes() -> void:
 	add_child(world)
 
 	var land := Polygon2D.new()
+	land_node = land
 	land.polygon = PackedVector2Array([-off, Vector2(view_size.x - off.x, -off.y),
 		view_size - off, Vector2(-off.x, view_size.y - off.y)])
 	var lm := ShaderMaterial.new()
@@ -313,13 +422,14 @@ func _build_nodes() -> void:
 		world.add_child(boat_sprite)
 
 	var tree_node := DrawNode.new()
+	tree_layer = tree_node
 	tree_node.draw_fn = _draw_trees
 	world.add_child(tree_node)
 
 	modulate_node = CanvasModulate.new()
 	add_child(modulate_node)
 
-	var light_layer := CanvasLayer.new()
+	light_layer = CanvasLayer.new()
 	light_layer.layer = 1
 	light_layer.offset = off
 	add_child(light_layer)
@@ -332,7 +442,7 @@ func _build_nodes() -> void:
 
 
 func _build_ui() -> void:
-	var ui_layer := CanvasLayer.new()
+	ui_layer = CanvasLayer.new()
 	ui_layer.layer = 5
 	add_child(ui_layer)
 	ui_root = Control.new()
@@ -365,9 +475,17 @@ func _build_ui() -> void:
 func _process(delta: float) -> void:
 	clock += delta
 	bump_cool -= delta
+	if zoom_in_t >= 0.0:
+		zoom_in_t += delta
+		var zk := clampf(zoom_in_t / ZOOM_IN, 0.0, 1.0)
+		if is_instance_valid(zoom_from) and zk < 1.0:
+			set_zoom(1.0 - zk * zk * (3.0 - 2.0 * zk), zoom_from.thumb_origin(lake_index), zoom_from.thumb_scale(), zoom_from.tint_color)
+			zoom_from.ui_root.modulate.a = 1.0 - smoothstep(0.0, 0.5, zk)
+		else:
+			_end_zoom_in()
 	match state:
 		"ready":
-			if _turn_input() != 0 or not touches.is_empty():
+			if not zooming and (_turn_input() != 0 or not touches.is_empty()):
 				state = "play"
 				Sfx.tap()
 				if not counted:
@@ -404,15 +522,18 @@ func _process(delta: float) -> void:
 	_run_events()
 	_update_effects(delta)
 	if boat3d:
+		var shown := 1.0 - smoothstep(0.0, 0.3, zoom_k)  # the map draws its own boat when zoomed out
 		boat_sprite.position = boat_pos
-		boat_sprite.modulate.a = 1.0 - 0.9 * boat3d.sunk()
+		boat_sprite.modulate.a = (1.0 - 0.9 * boat3d.sunk()) * shown
 		boat_shadow.position = boat_pos + Vector2(-12, 16)
-		boat_shadow.modulate.a = 0.32 * (1.0 - boat3d.sunk())
+		boat_shadow.modulate.a = 0.32 * (1.0 - boat3d.sunk()) * shown
 		# A gentle rock and pitch on top of the lean into turns, so it sits in the water.
 		var lean := -turn_vel / TURN_RATE * 0.2 + sin(clock * 1.3) * 0.035
 		var pitch := speed / SPEED * 0.05 + sin(clock * 1.9) * 0.03
-		boat3d.set_pose(heading, lean, pitch, 0.0)
-	if state in ["ready", "play"]:
+		boat3d.set_pose(_vis_heading(), lean, pitch, 0.0)
+	if state == "leaving":
+		pass  # the map has the sound now
+	elif state in ["ready", "play"]:
 		Sfx.set_mood(dusk, speed / SPEED, _in_reeds(boat_pos))
 	else:
 		Sfx.set_mood(dusk, 0.0, false)
@@ -420,7 +541,8 @@ func _process(delta: float) -> void:
 	var target_hint := 1.0 if state == "ready" and not counted else 0.0
 	hint_alpha = move_toward(hint_alpha, target_hint, delta * 2.4)
 
-	modulate_node.color = Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, dusk) * 0.92)
+	if not zooming:
+		modulate_node.color = _day_tint()
 	detail_node.queue_redraw()
 	for m in reed_mats:
 		m.set_shader_parameter("time", clock)
@@ -440,6 +562,13 @@ func _turn_input() -> int:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if zooming:
+		if zoom_in_t >= 0.0 and event is InputEventScreenTouch:
+			if event.pressed:
+				skip_armed = true
+			elif skip_armed:
+				zoom_in_t = ZOOM_IN  # skip to the end
+		return
 	if event is InputEventScreenTouch:
 		if event.pressed:
 			touches[event.index] = event.position.x
@@ -450,6 +579,8 @@ func _unhandled_input(event: InputEvent) -> void:
 
 
 func _notification(what: int) -> void:
+	if zooming:
+		return
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
 		if overlay != null and is_instance_valid(overlay):
 			if state in ["results", "over"]:
@@ -477,7 +608,7 @@ func _move_boat(delta: float, steering: bool) -> void:
 	if speed < 0.5:
 		return
 
-	move_dir = lerp_angle(move_dir, heading, 1.0 - exp(-4.5 * delta))
+	move_dir = lerp_angle(move_dir, heading, 1.0 - exp(-MOVE_FOLLOW * delta))
 	if state == "play":
 		var near := _shore_info(boat_pos)
 		if float(near[0]) < 7.0:
@@ -525,7 +656,7 @@ func _move_boat(delta: float, steering: bool) -> void:
 	np = _lantern_push(np, delta)
 	boat_pos = np
 
-	var stern := boat_pos - Vector2.from_angle(heading) * STERN
+	var stern := boat_pos - Vector2.from_angle(_vis_heading()) * STERN
 	if wp.is_empty() or wp[wp.size() - 1].distance_to(stern) >= WAKE_STEP:
 		_add_wake_point(stern, state == "play")
 
@@ -549,6 +680,11 @@ func _move_boat(delta: float, steering: bool) -> void:
 		if boosting:
 			for k in 2:
 				_part(stern + side * randf_range(-3, 3), -fwd * randf_range(40, 90) + side * randf_range(-25, 25), randf_range(0.4, 0.7), randf_range(2.0, 3.6), pal["light"], true)
+
+
+## Where the boat is drawn pointing: halfway between its travel and its bow, so turns read as a carve.
+func _vis_heading() -> float:
+	return lerp_angle(move_dir, heading, 0.5)
 
 
 func _free(p: Vector2) -> bool:
@@ -916,7 +1052,7 @@ func _update_effects(delta: float) -> void:
 	for e in embers:
 		if not e["launched"] and clock >= float(e["t0"]):
 			e["launched"] = true
-			e["from"] = boat_pos + Vector2.from_angle(heading) * BOW * 0.4
+			e["from"] = boat_pos + Vector2.from_angle(_vis_heading()) * BOW * 0.4
 			lamp_flare = clock
 			Sfx.ember()
 		if clock < float(e["t0"]) + EMBER_FLIGHT:
@@ -1348,11 +1484,11 @@ func _draw_details(n: Node2D) -> void:
 			else:
 				n.draw_circle(ep, 4.2 - s2 * 0.5, Color(1.0, 0.62, 0.24, 0.75 - s2 * 0.1), true, -1.0, true)
 	var hull := PackedVector2Array(HULL)
-	if boat3d:
+	if boat3d or zoom_k > 0.3:
 		return
-	n.draw_set_transform(boat_pos + Vector2(6, 10), heading, Vector2.ONE * 2.0)
+	n.draw_set_transform(boat_pos + Vector2(6, 10), _vis_heading(), Vector2.ONE * 2.0)
 	n.draw_colored_polygon(hull, shade)
-	n.draw_set_transform(boat_pos, heading, Vector2.ONE * 2.0)
+	n.draw_set_transform(boat_pos, _vis_heading(), Vector2.ONE * 2.0)
 	n.draw_colored_polygon(hull, Color("efe6d6"))
 	var rim := hull.duplicate()
 	rim.append(hull[0])
@@ -1370,7 +1506,7 @@ func _draw_light(n: Node2D) -> void:
 	var glow: Texture2D = Game.glow_tex
 	# The boat's lamp: a small warm light at the bow that flares when it sends an ember.
 	var flare := clampf(1.0 - (clock - lamp_flare) / 0.35, 0.0, 1.0)
-	var lamp := boat_pos + Vector2.from_angle(heading) * BOW * 0.7
+	var lamp := boat_pos + Vector2.from_angle(_vis_heading()) * BOW * 0.7
 	var lamp_r := 18.0 + 16.0 * flare
 	var afloat: float = (1.0 - boat3d.sunk()) if boat3d else 1.0
 	n.draw_texture_rect(glow, Rect2(lamp - Vector2(lamp_r, lamp_r), Vector2(lamp_r, lamp_r) * 2.0), false, Color(light, (0.35 + 0.2 * dusk + 0.5 * flare) * afloat))
@@ -1431,7 +1567,7 @@ func _draw_light(n: Node2D) -> void:
 		var rad := lerpf(float(r["r0"]), float(r["r1"]), 1.0 - pow(1.0 - k, 3.0))
 		n.draw_arc(r["p"], rad, 0.0, TAU, 48, Color(light, 0.5 * (1.0 - k)), 2.5, true)
 
-	var bow := boat_pos + Vector2.from_angle(heading) * 13.0
+	var bow := boat_pos + Vector2.from_angle(_vis_heading()) * 13.0
 	var lr := 44.0
 	n.draw_texture_rect(glow, Rect2(bow - Vector2(lr, lr), Vector2(lr, lr) * 2.0), false,
 		Color(light, (0.12 + 0.3 * dusk) * afloat))
@@ -1453,7 +1589,7 @@ func _draw_wake(n: Node2D) -> void:
 	for i in wt.size():
 		ages.append(clock - wt[i])
 		cuts.append(clampf(1.0 - (clock - wc[i]) / CUT_FADE, 0.0, 1.0))
-	pts.append(boat_pos - Vector2.from_angle(heading) * STERN)
+	pts.append(boat_pos - Vector2.from_angle(_vis_heading()) * STERN)
 	ages.append(0.0)
 	cuts.append(1.0)
 	var m := pts.size()
@@ -1715,7 +1851,7 @@ func _plate_box() -> StyleBoxFlat:
 # ---------------------------------------------------------------- screens
 
 func _pause() -> void:
-	if overlay != null or state in ["results", "crashed"]:
+	if overlay != null or zooming or state in ["results", "crashed", "leaving"]:
 		return
 	touches.clear()
 	get_tree().paused = true
@@ -1892,7 +2028,7 @@ func _retry() -> void:
 
 
 func _to_map() -> void:
-	_go(-1)
+	_zoom_to_map(false)
 
 
 ## Leaves this lake for another lake (or the map when i is -1), once only.
@@ -1917,6 +2053,8 @@ func _show_results() -> void:
 			got |= Game.MARK_TIME
 		if loops_used <= int(lake["par"]):
 			got |= Game.MARK_LOOPS
+	if got & Game.MARK_ALL and lake_index + 1 < Game.lake_count() and not Game.is_unlocked(lake_index + 1):
+		newly_unlocked = lake_index + 1
 	Game.record_result(lake_index, got)
 	var prev_best := float(Game.stats[lake_index]["best"])
 	if lit == total:
@@ -1946,7 +2084,7 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 	dim.gui_input.connect(func(e: InputEvent):
 		if e is InputEventScreenTouch and not e.pressed and can_continue[0]:
 			Sfx.tap()
-			_go(-1 if last else lake_index + 1))
+			_zoom_to_map(true))
 	overlay.add_child(dim)
 
 	var title := Label.new()

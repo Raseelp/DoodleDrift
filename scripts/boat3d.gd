@@ -5,14 +5,14 @@ extends SubViewport
 
 const SIZE := 448  # pixels; the camera sees 110 units, about 4 px per unit
 const VIEW := 110.0
-## The boat model: "Fishing Boat" by CharlieCatling (Sketchfab, Free Standard licence), used as it comes.
-## If the file is missing, the code-built rowboat is used instead.
-const MODEL_PATH := "res://models/fishing_boat.glb"
+## The boat model: "Fishing Boat" by CharlieCatling (Sketchfab, Free Standard licence), used as it comes
+## (Game.boat_scene). If the file is missing, the code-built rowboat is used instead.
 const MODEL_LEN := 60.0  # model length in render units
 const LENGTH_FROM := -20.0
 const LENGTH_TO := 24.0
 const CUT := 2.0  # where the hull breaks in a wreck
 
+var render_size := SIZE  # set before adding: a smaller render where the boat is drawn small
 var root: Node3D
 var front: Node3D
 var back: Node3D
@@ -30,7 +30,7 @@ var model_anim: AnimationPlayer
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS  # keeps sinking under the game over screen
-	size = Vector2i(SIZE, SIZE)
+	size = Vector2i(render_size, render_size)
 	transparent_bg = true
 	own_world_3d = true
 	render_target_update_mode = SubViewport.UPDATE_ALWAYS
@@ -68,9 +68,9 @@ func _build() -> void:
 	for c in root.get_children():
 		c.queue_free()
 	model = null
-	if ResourceLoader.exists(MODEL_PATH):
-		# The model's bow points to -Z and it is 8.6 units long: turn the bow to +X and scale it up.
-		model = (load(MODEL_PATH) as PackedScene).instantiate()
+	var scene := Game.boat_scene()
+	if scene:
+		model = scene.instantiate()
 		var pivot := Node3D.new()
 		pivot.rotation.y = -PI * 0.5  # the model's bow points to -Z; turn it to +X
 		pivot.add_child(model)
