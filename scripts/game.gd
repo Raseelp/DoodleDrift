@@ -30,6 +30,7 @@ var heading_font: FontVariation
 var glow_tex: GradientTexture2D
 
 var _water_cache := {}
+const HitButton = preload("res://scripts/hit_button.gd")
 
 
 func _ready() -> void:
@@ -69,7 +70,6 @@ func _build_lakes() -> void:
 			"water": [[90, 420], [200, 230], [380, 190], [560, 250], [650, 430], [660, 700],
 				[620, 960], [520, 1140], [340, 1200], [170, 1130], [80, 920], [60, 650]],
 			"lanterns": [[330, 600, 0], [430, 690, 0], [320, 790, 0]],
-			"constellation": {"name": "The Seed", "edges": [[0, 1], [1, 2], [2, 0]]},
 			"rocks": [], "reeds": [],
 			"start": [360, 1095, -PI / 2], "jetty": [362, 1215, 362, 1130],
 		},
@@ -88,7 +88,6 @@ func _build_lakes() -> void:
 				[600, 760], [640, 950], [560, 1140], [360, 1210], [170, 1150], [80, 960],
 				[130, 780], [210, 630], [90, 470]],
 			"lanterns": [[300, 380, 0], [440, 455, 0], [290, 905, 0], [445, 965, 0]],
-			"constellation": {"name": "The Hourglass", "edges": [[0, 1], [1, 3], [3, 2], [2, 0]]},
 			"rocks": [], "reeds": [],
 			"start": [365, 650, -PI / 2], "jetty": [],
 		},
@@ -106,7 +105,6 @@ func _build_lakes() -> void:
 			"water": [[70, 330], [220, 210], [500, 200], [650, 330], [670, 620], [640, 900],
 				[560, 1150], [330, 1210], [130, 1140], [60, 880], [90, 600]],
 			"lanterns": [[250, 400, 0], [470, 380, 0], [360, 680, 0], [255, 960, 0], [545, 700, 0]],
-			"constellation": {"name": "The Crossroads", "edges": [[0, 2], [1, 2], [2, 3], [2, 4]]},
 			"rocks": [[360, 520, 40], [215, 790, 32], [495, 850, 45], [385, 1035, 28]],
 			"reeds": [],
 			"start": [300, 1150, -PI / 2], "jetty": [292, 1224, 296, 1182],
@@ -126,7 +124,6 @@ func _build_lakes() -> void:
 				[330, 680], [340, 800], [500, 860], [640, 980], [600, 1160], [380, 1220],
 				[150, 1150], [70, 960], [110, 800], [150, 660], [80, 520], [70, 380]],
 			"lanterns": [[200, 330, 0], [515, 340, 0], [240, 1045, 0], [560, 990, 0], [420, 1090, 0]],
-			"constellation": {"name": "The Heron", "edges": [[0, 1], [1, 2], [2, 4], [4, 3]]},
 			"rocks": [],
 			"reeds": [[245, 690, 70], [520, 330, 60], [235, 1055, 70]],
 			"start": [390, 1150, -PI * 0.6], "jetty": [384, 1240, 388, 1184],
@@ -146,7 +143,6 @@ func _build_lakes() -> void:
 				[660, 980], [560, 1170], [340, 1220], [140, 1150], [60, 940], [100, 720], [60, 520]],
 			"lanterns": [[220, 380, 1], [480, 420, 1], [250, 1050, 2], [470, 1085, 2],
 				[350, 510, 0], [565, 650, 0]],
-			"constellation": {"name": "The Twins", "edges": [[0, 4], [4, 1], [4, 5], [5, 3], [3, 2], [2, 0]]},
 			"rocks": [[360, 640, 42], [200, 880, 30]],
 			"reeds": [[520, 880, 65]],
 			"start": [330, 780, PI], "jetty": [],
@@ -322,6 +318,7 @@ func set_dev(key: String, value: bool) -> void:
 
 func reset_progress() -> void:
 	unlocked = 1
+	chapter_seen = false
 	marks.fill(0)
 	_save()
 
@@ -362,9 +359,10 @@ func _load() -> void:
 		return
 	unlocked = clampi(int(cf.get_value("progress", "unlocked", 1)), 1, lakes.size())
 	chapter_seen = bool(cf.get_value("progress", "chapter_seen", false))
-	var saved: Array = cf.get_value("progress", "marks", [])
-	for i in mini(saved.size(), marks.size()):
-		marks[i] = int(saved[i])
+	var saved = cf.get_value("progress", "marks", [])
+	if saved is Array:
+		for i in mini(saved.size(), marks.size()):
+			marks[i] = int(saved[i])
 	sound_on = bool(cf.get_value("settings", "sound", true))
 	music_on = bool(cf.get_value("settings", "music", true))
 	vibration_on = bool(cf.get_value("settings", "vibration", true))
@@ -373,7 +371,9 @@ func _load() -> void:
 	day_mult = clampf(float(cf.get_value("dev", "day_mult", 1.0)), 0.5, 2.0)
 	day_fixed = clampi(int(cf.get_value("dev", "day_fixed", 0)), 0, 120)
 	boat_tilt = clampf(float(cf.get_value("dev", "boat_tilt", 35.0)), 0.0, 60.0)
-	var st: Array = cf.get_value("stats", "lakes", [])
+	var st = cf.get_value("stats", "lakes", [])
+	if not st is Array:
+		return
 	for i in mini(st.size(), stats.size()):
 		if st[i] is Dictionary:
 			stats[i].merge(st[i], true)
@@ -481,8 +481,10 @@ func draw_icon(ci: CanvasItem, kind: String, c: Vector2, s: float, col: Color) -
 
 
 ## A solid square game button with a darker bottom edge that it presses down into, holding one white icon.
+## Buttons smaller than 96 px get an invisible touch margin so they are about 48 dp to a finger.
 func square_button(tex: Texture2D, side: float, icon_w: int) -> Button:
-	var b := Button.new()
+	var b: Button = HitButton.new()
+	b.hit_pad = maxf(0.0, (96.0 - side) * 0.5)
 	b.icon = tex
 	b.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	b.add_theme_constant_override("icon_max_width", icon_w)

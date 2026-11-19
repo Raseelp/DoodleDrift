@@ -111,7 +111,6 @@ var splashes: Array = []
 var floaters: Array = []
 var duck_timer := 6.0
 var fish_timer := 3.0
-var const_t := -1.0
 var crash_kind := ""
 var crash_pos := Vector2.ZERO
 var duration := 30.0  # seconds of daylight, from Game.lake_duration
@@ -124,6 +123,7 @@ var history: Array = []  # recent safe boat positions, for patching after a cras
 var history_t := 0.0
 var scrape_until := -10.0  # boat is rubbing the shore: slowed like in reeds
 var scrape_fx := 0.0
+var leaving := false  # a new lake or the map has been asked for; ignore further taps
 
 # Nodes
 var view_size := Vector2.ZERO
@@ -417,7 +417,7 @@ func _process(delta: float) -> void:
 	else:
 		Sfx.set_mood(dusk, 0.0, false)
 
-	var target_hint := 1.0 if state == "ready" else 0.0
+	var target_hint := 1.0 if state == "ready" and not counted else 0.0
 	hint_alpha = move_toward(hint_alpha, target_hint, delta * 2.4)
 
 	modulate_node.color = Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, dusk) * 0.92)
@@ -453,7 +453,7 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
 		if overlay != null and is_instance_valid(overlay):
 			if state in ["results", "over"]:
-				exit_requested.emit()
+				_to_map()
 			else:
 				_resume()
 		else:
@@ -860,11 +860,7 @@ func _on_loop(poly: PackedVector2Array) -> void:
 
 	if _lit_count() == lanterns.size():
 		events.append({"at": last_t + 0.55, "kind": "chord"})
-		var wait := last_t - clock + 2.8
-		if Game.dev_on("constellations"):
-			events.append({"at": last_t + 0.7, "kind": "constellation"})
-			wait += 2.6
-		_end("complete", wait)
+		_end("complete", last_t - clock + 2.8)
 
 
 func _partner(i: int) -> int:
@@ -901,8 +897,6 @@ func _run_events() -> void:
 			"chord":
 				Sfx.chord(float(lake["pitch"]))
 				Game.vibrate(60)
-			"constellation":
-				const_t = clock
 	events = keep
 
 
@@ -1265,6 +1259,8 @@ func _draw_details(n: Node2D) -> void:
 		if r["light"]:
 			continue
 		var k := (clock - float(r["t"])) / float(r["life"])
+		if k < 0.0:
+			continue
 		var rad := lerpf(float(r["r0"]), float(r["r1"]), 1.0 - pow(1.0 - k, 2.0))
 		n.draw_arc(r["p"], rad, 0.0, TAU, 28, Color(1, 1, 1, 0.22 * (1.0 - k)), 1.6, true)
 
@@ -1376,7 +1372,8 @@ func _draw_light(n: Node2D) -> void:
 	var flare := clampf(1.0 - (clock - lamp_flare) / 0.35, 0.0, 1.0)
 	var lamp := boat_pos + Vector2.from_angle(heading) * BOW * 0.7
 	var lamp_r := 18.0 + 16.0 * flare
-	n.draw_texture_rect(glow, Rect2(lamp - Vector2(lamp_r, lamp_r), Vector2(lamp_r, lamp_r) * 2.0), false, Color(light, 0.35 + 0.2 * dusk + 0.5 * flare))
+	var afloat: float = (1.0 - boat3d.sunk()) if boat3d else 1.0
+	n.draw_texture_rect(glow, Rect2(lamp - Vector2(lamp_r, lamp_r), Vector2(lamp_r, lamp_r) * 2.0), false, Color(light, (0.35 + 0.2 * dusk + 0.5 * flare) * afloat))
 	for e in embers:
 		if not e["launched"]:
 			continue
@@ -1429,26 +1426,15 @@ func _draw_light(n: Node2D) -> void:
 		if not r["light"]:
 			continue
 		var k := (clock - float(r["t"])) / float(r["life"])
+		if k < 0.0:
+			continue
 		var rad := lerpf(float(r["r0"]), float(r["r1"]), 1.0 - pow(1.0 - k, 3.0))
 		n.draw_arc(r["p"], rad, 0.0, TAU, 48, Color(light, 0.5 * (1.0 - k)), 2.5, true)
-
-	if const_t >= 0.0:
-		var edges: Array = lake["constellation"]["edges"]
-		for e_i in edges.size():
-			var e: Array = edges[e_i]
-			var k := clampf((clock - const_t - e_i * 0.28) / 0.55, 0.0, 1.0)
-			if k <= 0.0:
-				continue
-			var a: Vector2 = lanterns[e[0]]["p"]
-			var b: Vector2 = lanterns[e[1]]["p"]
-			var end := a.lerp(b, k)
-			n.draw_line(a, end, Color(light, 0.14), 12.0, true)
-			n.draw_line(a, end, Color(light, 0.85), 2.5, true)
 
 	var bow := boat_pos + Vector2.from_angle(heading) * 13.0
 	var lr := 44.0
 	n.draw_texture_rect(glow, Rect2(bow - Vector2(lr, lr), Vector2(lr, lr) * 2.0), false,
-		Color(light, 0.12 + 0.3 * dusk))
+		Color(light, (0.12 + 0.3 * dusk) * afloat))
 
 	if String(lake["motes"]) == "fireflies":
 		var fc: Color = pal["mote"]
@@ -1791,10 +1777,9 @@ func _pause() -> void:
 	for l in lanterns:
 		if l["lit"] and clock >= float(l["lit_t"]):
 			lit_now += 1
-	var late := dusk > 0.75 or day_taken
 	var par := int(lake["par"])
 	var goals := [["lantern", "%d/%d" % [lit_now, lanterns.size()]],
-		["sun", "late" if late else "%d s" % int((0.75 - dusk) * duration)],
+		["sun", "%d s" % ceili((1.0 - dusk) * duration)],
 		["loop", "%d/%d" % [loops_used, par]]]
 	var g_row := HBoxContainer.new()
 	g_row.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -1814,7 +1799,7 @@ func _pause() -> void:
 		var isz := 40.0 * float(Game.ICON_OPTICAL.get(String(g[0]), 1.0))
 		ic.custom_minimum_size = Vector2(isz, isz)
 		ic.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		ic.modulate = Color(1, 1, 1, 0.35) if (g[0] == "sun" and late) else (Color("ff9a8a") if (g[0] == "loop" and loops_used > par) else light)
+		ic.modulate = light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk)) if g[0] == "sun" else (Color("ff9a8a") if (g[0] == "loop" and loops_used > par) else light)
 		item.add_child(ic)
 		var t := Label.new()
 		t.text = String(g[1])
@@ -1903,13 +1888,23 @@ func _set_hud_visible(on: bool) -> void:
 
 
 func _retry() -> void:
-	get_tree().paused = false
-	level_requested.emit(lake_index)
+	_go(lake_index)
 
 
 func _to_map() -> void:
+	_go(-1)
+
+
+## Leaves this lake for another lake (or the map when i is -1), once only.
+func _go(i: int) -> void:
+	if leaving:
+		return
+	leaving = true
 	get_tree().paused = false
-	exit_requested.emit()
+	if i < 0:
+		exit_requested.emit()
+	else:
+		level_requested.emit(i)
 
 
 func _show_results() -> void:
@@ -1951,10 +1946,7 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 	dim.gui_input.connect(func(e: InputEvent):
 		if e is InputEventScreenTouch and not e.pressed and can_continue[0]:
 			Sfx.tap()
-			if last:
-				_to_map()
-			else:
-				level_requested.emit(lake_index + 1))
+			_go(-1 if last else lake_index + 1))
 	overlay.add_child(dim)
 
 	var title := Label.new()

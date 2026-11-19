@@ -299,6 +299,8 @@ func sunk() -> float:
 
 
 func _process(delta: float) -> void:
+	var live := not get_tree().paused or (wrecking and sunk() < 1.0)
+	render_target_update_mode = SubViewport.UPDATE_ALWAYS if live else SubViewport.UPDATE_DISABLED
 	if not wrecking:
 		return
 	wreck_t += delta

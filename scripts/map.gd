@@ -1080,7 +1080,7 @@ func _show_chapter_card() -> void:
 	tw.tween_property(tap, "modulate:a", 0.8, 0.4)
 	tw.tween_callback(func():
 		dim.gui_input.connect(func(e: InputEvent):
-			if e is InputEventScreenTouch and not e.pressed:
+			if e is InputEventScreenTouch and not e.pressed and celebrating:
 				Sfx.tap()
 				Game.mark_chapter_seen()
 				celebrating = false
