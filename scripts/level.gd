@@ -141,10 +141,9 @@ var boost_until := -10.0
 var light_times: Array = []
 var chain := 0
 var last_loop_t := -10.0
-var ducks: Array = []
+var families: Array = []  # mallard hens and their ducklings (ducks.gd)
 var splashes: Array = []
 var floaters: Array = []
-var duck_timer := 6.0
 var fish_timer := 3.0
 var crash_kind := ""
 var crash_pos := Vector2.ZERO
@@ -535,6 +534,24 @@ func _build_geometry() -> void:
 			pal["wood"], water, avoid, Game.is_night(lake_index))
 	if lake.has("rig") and jetty.size() == 2:
 		_park_rig()
+	# Duck families, each starting somewhere of its own, clear of the boat and the lanterns.
+	var drng := RandomNumberGenerator.new()
+	drng.seed = 5003 * (lake_index + 1)
+	var bank := Game.offset_largest(water, -40.0)
+	var start := Vector2(lake["start"][0], lake["start"][1])
+	for fi in int(lake.get("ducks", 0)):
+		for attempt in 60:
+			var q := Vector2(drng.randf_range(60, 660), drng.randf_range(220, 1180))
+			var clear := Geometry2D.is_point_in_polygon(q, bank) and q.distance_to(start) > 220.0 and not _hits_rock(q)
+			for l in lanterns:
+				if q.distance_to(l["p"]) < 70.0:
+					clear = false
+			for f in families:
+				if q.distance_to(f.hen["p"]) < 200.0:
+					clear = false
+			if clear:
+				families.append(DuckFamily.make(self, q, drng.randi_range(3, 5), drng.randi()))
+				break
 
 	_place_trees(rng)
 
@@ -1378,15 +1395,12 @@ func _update_effects(delta: float) -> void:
 				Sfx.set_progress(float(_lit_count()) / lanterns.size())
 				ripples.append({"p": l["p"], "t": clock, "life": 1.2, "r0": 8.0, "r1": 30.0, "light": false})
 	if life and state in ["ready", "play"]:
-		duck_timer -= delta
-		if duck_timer <= 0.0:
-			duck_timer = randf_range(11.0, 18.0)
-			_spawn_ducks()
 		fish_timer -= delta
 		if fish_timer <= 0.0:
 			fish_timer = randf_range(2.5, 6.0)
 			_spawn_fish()
-	_update_ducks()
+	for f in families:
+		f.update(delta)
 	_update_shards(delta)
 	var fk: Array = []
 	for f in floaters:
@@ -1468,75 +1482,6 @@ func _spawn_fish() -> void:
 			ripples.append({"p": p, "t": clock + 0.25, "life": 1.4, "r0": 3.0, "r1": 18.0, "light": false})
 			Sfx.plop()
 			return
-
-
-func _spawn_ducks() -> void:
-	for attempt in 40:
-		var a := Vector2(randf_range(60, 660), randf_range(220, 1180))
-		var b := Vector2(randf_range(60, 660), randf_range(220, 1180))
-		if a.distance_to(b) < 260.0:
-			continue
-		var ok := true
-		for k in 21:
-			var p := a.lerp(b, k / 20.0)
-			if not Geometry2D.is_point_in_polygon(p, inner) or _hits_rock(p) or _in_reeds(p):
-				ok = false
-				break
-		if not ok or Geometry2D.get_closest_point_to_segment(boat_pos, a, b).distance_to(boat_pos) < 70.0:
-			continue
-		ducks.append({"a": a, "b": b, "t0": clock, "dur": a.distance_to(b) / 34.0, "n": randi_range(1, 3), "rip": 0.0})
-		return
-
-
-func _duck_pos(d: Dictionary, back: float) -> Vector2:
-	var a: Vector2 = d["a"]
-	var b: Vector2 = d["b"]
-	var k := clampf((clock - float(d["t0"])) / float(d["dur"]), 0.0, 1.0)
-	return a.lerp(b, k) - (b - a).normalized() * back
-
-
-func _update_ducks() -> void:
-	var keep: Array = []
-	for d in ducks:
-		if clock - float(d["t0"]) > float(d["dur"]):
-			continue
-		if d.has("hit"):
-			if clock - float(d["hit"]) < 1.4:
-				keep.append(d)
-			continue
-		keep.append(d)
-		var head := _duck_pos(d, 0.0)
-		var struck := false
-		for i in int(d["n"]):
-			if state == "play" and _duck_pos(d, i * 20.0).distance_to(boat_pos) < 26.0:
-				struck = true
-		if struck:
-			d["hit"] = clock
-			d["hp"] = head
-			d["hit_dir"] = (head - boat_pos).normalized()
-			for k in 22:
-				var fc := Color("f2ece0") if k % 3 != 0 else Color("8b7a62")
-				_part(head + Vector2(randf_range(-8, 8), randf_range(-8, 8)), Vector2.from_angle(randf() * TAU) * randf_range(30, 110), randf_range(0.6, 1.3), randf_range(1.5, 3.0), fc, false)
-			ripples.append({"p": head, "t": clock, "life": 1.4, "r0": 4.0, "r1": 34.0, "light": false})
-			speed *= 0.9
-			Sfx.quack()
-			Game.vibrate(30)
-			continue
-		if clock - float(d["rip"]) > 0.6:
-			d["rip"] = clock
-			for i in int(d["n"]):
-				ripples.append({"p": _duck_pos(d, 6.0 + i * 18.0), "t": clock, "life": 1.3, "r0": 3.0, "r1": 16.0, "light": false})
-		# Ducks cut the wake: the part behind the cut can no longer close a loop, so it snaps off.
-		var cut := -1
-		for i in wp.size():
-			if wp[i].distance_to(head) < 13.0 and wc[i] > 1e8:
-				cut = i
-		if cut >= 0 and state == "play":
-			# One snap sound and splash per crossing; while the duck is still on the line it only trims.
-			var loud: bool = clock - float(d.get("snap", -9.0)) > 0.8
-			_snap_trail(cut, head, loud)
-			d["snap"] = clock
-	ducks = keep
 
 
 ## The trail up to `cut` snaps where the duck crossed: it leaves the live wake at once and becomes
@@ -1730,29 +1675,9 @@ func _draw_details(n: Node2D) -> void:
 			var dp: Vector2 = sp["p"] + dir * (6.0 + k * 16.0) + Vector2(0, k * k * 14.0)
 			n.draw_circle(dp, 2.2 * (1.0 - k), Color(1, 1, 1, 0.7 * (1.0 - k)), true, -1.0, true)
 
-	for d in ducks:
-		var dir: Vector2 = (d["b"] - d["a"]).normalized()
-		var age := clock - float(d["t0"])
-		var fade := clampf(minf(age, float(d["dur"]) - age) / 1.2, 0.0, 1.0)
-		for i in int(d["n"]):
-			var sz := 1.0 if i == 0 else 0.7
-			var p := _duck_pos(d, i * 20.0)
-			var spin := 0.0
-			if d.has("hit"):
-				var hk := (clock - float(d["hit"])) / 1.4
-				p = Vector2(d["hp"]) + Vector2(d["hit_dir"]) * (hk * 34.0 + i * 12.0)
-				spin = hk * 10.0
-				fade *= 1.0 - hk
-				sz *= 1.0 - hk * 0.6
-			n.draw_set_transform(p + Vector2(3, 4), dir.angle() + spin, Vector2(1.5, 1.0) * sz)
-			n.draw_circle(Vector2.ZERO, 7.0, Color(shade, shade.a * fade), true, -1.0, true)
-			n.draw_set_transform(p, dir.angle() + spin, Vector2(1.5, 1.0) * sz)
-			n.draw_circle(Vector2.ZERO, 7.0, Color(Color("d9cbb0"), fade), true, -1.0, true)
-			n.draw_set_transform(p, dir.angle() + spin, Vector2(sz, sz))
-			n.draw_circle(Vector2(-3, 0), 4.0, Color(Color("b8a88c"), fade), true, -1.0, true)
-			n.draw_circle(Vector2(9, 0), 4.2, Color(Color("3f6b52"), fade), true, -1.0, true)
-			n.draw_circle(Vector2(13.5, 0), 1.8, Color(Color("e0a040"), fade), true, -1.0, true)
-		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	# Duck families (ducks.gd).
+	for f in families:
+		f.draw(n, shade)
 
 	var pair_col: Color = pal["pair"]
 	for i in lanterns.size():

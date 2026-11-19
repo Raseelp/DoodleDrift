@@ -56,7 +56,7 @@ func _generate() -> void:
 		"pad": _make_pad(), "shimmer": _make_shimmer(), "bells": _make_bells(),
 		"hull": _make_hull(), "reeds": _make_reeds(),
 		"bird": _make_bird(), "frog": _make_frog(), "owl": _make_owl(), "quack": _make_quack(),
-		"stamp": _make_stamp(), "snap": _make_snap(),
+		"stamp": _make_stamp(), "snap": _make_snap(), "peep": _make_peep(),
 	}
 	call_deferred("_on_generated", out)
 
@@ -113,6 +113,23 @@ func crash() -> void:
 func plop() -> void:
 	_play("tap", randf_range(0.28, 0.36), -14.0)
 	_play("whoosh", 2.2, -20.0)
+
+
+## A duckling left behind: a thin high "peep-peep".
+func peep() -> void:
+	_play("peep", randf_range(0.92, 1.12), -17.0)
+
+
+## A mallard hen gathering her brood: two soft, low quacks.
+func duck_call() -> void:
+	for k in 2:
+		get_tree().create_timer(k * 0.22).timeout.connect(func(): _play("quack", randf_range(0.8, 0.88), -15.0 - k * 2.0))
+
+
+## A mallard hen's alarm: three quick, sharp quacks.
+func quack_alarm() -> void:
+	for k in 3:
+		get_tree().create_timer(k * 0.16).timeout.connect(func(): _play("quack", randf_range(1.12, 1.25), -11.0 - k * 1.5))
 
 
 func quack() -> void:
@@ -449,6 +466,19 @@ func _make_reeds() -> AudioStreamWAV:
 		prev = w
 		s[i] = hp * (0.4 + 0.6 * pow(absf(sin(TAU * t * 3.0 + sin(TAU * t))), 3.0))
 	return _to_wav(s, RATE_HI, true)
+
+
+func _make_peep() -> AudioStreamWAV:
+	var s := _buf(0.24, RATE_HI)
+	var ph := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var k := fmod(t, 0.12) / 0.08  # two short chirps
+		var on := 1.0 if k < 1.0 else 0.0
+		var f := 3300.0 + 900.0 * clampf(k, 0.0, 1.0)
+		ph += TAU * f / RATE_HI
+		s[i] = sin(ph) * on * sin(PI * clampf(k, 0.0, 1.0)) * 0.5
+	return _to_wav(s, RATE_HI, false)
 
 
 func _make_bird() -> AudioStreamWAV:
