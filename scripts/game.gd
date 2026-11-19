@@ -12,6 +12,10 @@ const MARK_LOOPS := 4
 var lakes: Array = []
 var unlocked := 1
 var chapter_seen := false  # the "still lakes are bright again" moment has played
+# Where the pickup is parked on the map (-1: by the first open lake not yet lit), and a lake a win has
+# just opened, which it drives to the next time the map is on screen (-1: none).
+var rig_lake := -1
+var rig_pending := -1
 var marks: Array = []
 var stats: Array = []  # per lake: tries, wins, fails, crashes, revives, best, last fails
 var sound_on := true
@@ -28,6 +32,7 @@ var ui_theme: Theme
 var title_font: FontVariation
 var heading_font: FontVariation
 var glow_tex: GradientTexture2D
+var beam_tex: ImageTexture  # a headlight beam: apex at the left middle, pointing right
 
 var _water_cache := {}
 const HitButton = preload("res://scripts/hit_button.gd")
@@ -35,12 +40,23 @@ const HitButton = preload("res://scripts/hit_button.gd")
 ## doesn't stop to load it again.
 const BOAT_MODEL := "res://models/fishing_boat.glb"
 var _boat_scene: PackedScene
+const PICKUP_MODEL := "res://models/pickup_low.glb"
+const TRAILER_MODEL := "res://models/trailer_low.glb"
+var _scenes := {}  # the pickup and trailer, loaded once like the boat
+## The storm lantern pictures (scripts/lantern_art.gd), rendered once shortly after start-up.
+## anchor: where the float meets the water in the picture; glass: the flame. Null until ready.
+const LANTERN_SCALE := 0.34  # the lantern pictures on a lake, in lake units: about 46 px tall
+var lantern_unlit: Texture2D
+var lantern_lit: Texture2D
+var lantern_anchor := Vector2.ZERO
+var lantern_glass := Vector2.ZERO
 
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
-	if ResourceLoader.exists(BOAT_MODEL):
-		ResourceLoader.load_threaded_request(BOAT_MODEL)
+	for path in [BOAT_MODEL, PICKUP_MODEL, TRAILER_MODEL]:
+		if ResourceLoader.exists(path):
+			ResourceLoader.load_threaded_request(path)
 	_build_lakes()
 	marks.resize(lakes.size())
 	marks.fill(0)
@@ -49,6 +65,18 @@ func _ready() -> void:
 	_load()
 	_build_theme()
 	glow_tex = _make_glow()
+	beam_tex = _make_beam()
+	_make_lantern_art.call_deferred()
+
+
+func _make_lantern_art() -> void:
+	var art: SubViewport = load("res://scripts/lantern_art.gd").new()
+	art.done.connect(func(unlit: ImageTexture, lit: ImageTexture, anchor: Vector2, glass: Vector2):
+		lantern_unlit = unlit
+		lantern_lit = lit
+		lantern_anchor = anchor
+		lantern_glass = glass)
+	add_child(art)
 
 
 # ---------------------------------------------------------------- lakes
@@ -77,7 +105,7 @@ func _build_lakes() -> void:
 				[620, 960], [520, 1140], [340, 1200], [170, 1130], [80, 920], [60, 650]],
 			"lanterns": [[330, 600, 0], [430, 690, 0], [320, 790, 0]],
 			"rocks": [], "reeds": [],
-			"start": [360, 1095, -PI / 2], "jetty": [362, 1215, 362, 1130],
+			"start": [360, 1098, -PI / 2], "jetty": [362, 1218, 362, 1128, ""], "rig": -1,
 		},
 		{
 			"name": "Two Coves",
@@ -95,7 +123,7 @@ func _build_lakes() -> void:
 				[130, 780], [210, 630], [90, 470]],
 			"lanterns": [[300, 380, 0], [440, 455, 0], [290, 905, 0], [445, 965, 0]],
 			"rocks": [], "reeds": [],
-			"start": [365, 650, -PI / 2], "jetty": [],
+			"start": [470, 612, PI], "jetty": [592, 612, 500, 612, "L"], "rig": 1,
 		},
 		{
 			"name": "Stones",
@@ -113,7 +141,7 @@ func _build_lakes() -> void:
 			"lanterns": [[250, 400, 0], [470, 380, 0], [360, 680, 0], [255, 960, 0], [545, 700, 0]],
 			"rocks": [[360, 520, 40], [215, 790, 32], [495, 850, 45], [385, 1035, 28]],
 			"reeds": [],
-			"start": [300, 1150, -PI / 2], "jetty": [292, 1224, 296, 1182],
+			"start": [300, 1150, -PI / 2], "jetty": [292, 1226, 296, 1182, ""], "rig": 1,
 		},
 		{
 			"name": "Reed Bend",
@@ -132,7 +160,7 @@ func _build_lakes() -> void:
 			"lanterns": [[200, 330, 0], [515, 340, 0], [240, 1045, 0], [560, 990, 0], [420, 1090, 0]],
 			"rocks": [],
 			"reeds": [[245, 690, 70], [520, 330, 60], [235, 1055, 70]],
-			"start": [390, 1150, -PI * 0.6], "jetty": [384, 1240, 388, 1184],
+			"start": [390, 1150, -PI * 0.6], "jetty": [384, 1242, 388, 1184, "T"], "rig": -1, "dusk_start": 0.5,
 		},
 		{
 			"name": "Twin Lights",
@@ -151,7 +179,7 @@ func _build_lakes() -> void:
 				[350, 510, 0], [565, 650, 0]],
 			"rocks": [[360, 640, 42], [200, 880, 30]],
 			"reeds": [[520, 880, 65]],
-			"start": [330, 780, PI], "jetty": [],
+			"start": [172, 730, 0.0], "jetty": [58, 730, 142, 730, ""], "rig": 1, "night": true,
 		},
 	]
 
@@ -161,6 +189,23 @@ func boat_scene() -> PackedScene:
 	if _boat_scene == null and ResourceLoader.exists(BOAT_MODEL):
 		_boat_scene = ResourceLoader.load_threaded_get(BOAT_MODEL) as PackedScene
 	return _boat_scene
+
+
+## The pickup or trailer model (waits for its background load the first time).
+func model_scene(path: String) -> PackedScene:
+	if not _scenes.has(path) and ResourceLoader.exists(path):
+		_scenes[path] = ResourceLoader.load_threaded_get(path) as PackedScene
+	return _scenes.get(path)
+
+
+## Night lakes run on the boat's headlight battery from the start: their time goal is "Battery to spare".
+func is_night(i: int) -> bool:
+	return bool(lakes[i].get("night", false))
+
+
+## The time goal's icon and name for a lake.
+func time_goal(i: int) -> Array:
+	return ["battery", "Battery to spare"] if is_night(i) else ["sun", "Before dusk"]
 
 
 func lake_count() -> int:
@@ -332,7 +377,26 @@ func set_dev(key: String, value: bool) -> void:
 func reset_progress() -> void:
 	unlocked = 1
 	chapter_seen = false
+	rig_lake = -1
+	rig_pending = -1
 	marks.fill(0)
+	_save()
+
+
+## The pickup is now parked by lake i (it drove there, or a lake was played).
+func set_rig(i: int) -> void:
+	if rig_pending == i:
+		rig_pending = -1
+	if rig_lake == i:
+		_save()
+		return
+	rig_lake = i
+	_save()
+
+
+## A win opened lake i: the pickup drives there the next time the map is on screen.
+func set_rig_pending(i: int) -> void:
+	rig_pending = i
 	_save()
 
 
@@ -372,6 +436,8 @@ func _load() -> void:
 		return
 	unlocked = clampi(int(cf.get_value("progress", "unlocked", 1)), 1, lakes.size())
 	chapter_seen = bool(cf.get_value("progress", "chapter_seen", false))
+	rig_lake = clampi(int(cf.get_value("progress", "rig", -1)), -1, lakes.size() - 1)
+	rig_pending = clampi(int(cf.get_value("progress", "rig_pending", -1)), -1, lakes.size() - 1)
 	var saved = cf.get_value("progress", "marks", [])
 	if saved is Array:
 		for i in mini(saved.size(), marks.size()):
@@ -396,6 +462,8 @@ func _save() -> void:
 	var cf := ConfigFile.new()
 	cf.set_value("progress", "unlocked", unlocked)
 	cf.set_value("progress", "chapter_seen", chapter_seen)
+	cf.set_value("progress", "rig", rig_lake)
+	cf.set_value("progress", "rig_pending", rig_pending)
 	cf.set_value("progress", "marks", marks)
 	cf.set_value("settings", "sound", sound_on)
 	cf.set_value("settings", "music", music_on)
@@ -460,6 +528,31 @@ func _pill(bg: Color, border: Color) -> StyleBoxFlat:
 	return s
 
 
+func _make_beam() -> ImageTexture:
+	const W := 256
+	const H := 128
+	var img := Image.create(W, H, false, Image.FORMAT_RGBA8)
+	for x in W:
+		var u := float(x) / (W - 1)
+		var spread := 0.2 + 0.8 * u  # the beam widens as it goes
+		var fall := pow(1.0 - u, 1.5) * smoothstep(0.0, 0.05, u)  # fades with distance
+		for y in H:
+			var v := absf((float(y) - (H - 1) * 0.5) / ((H - 1) * 0.5))
+			var edge := 1.0 - smoothstep(0.45, 1.0, v / spread)  # soft edges
+			var hot := exp(-pow((u - 0.08) / 0.09, 2.0) - pow(v / 0.18, 2.0)) * 0.55  # bright just ahead of the lamp
+			var a := clampf(edge * fall + hot, 0.0, 1.0)
+			img.set_pixel(x, y, Color(1, 1, 1, a))
+	img.generate_mipmaps()
+	return ImageTexture.create_from_image(img)
+
+
+## Draws a headlight beam from `from` pointing along `angle`, `length` long and `width` wide at its end.
+func draw_beam(ci: CanvasItem, from: Vector2, angle: float, length: float, width: float, col: Color) -> void:
+	ci.draw_set_transform(from, angle, Vector2(length / 256.0, width / 128.0))
+	ci.draw_texture(beam_tex, Vector2(0, -64), col)
+	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+
 func _make_glow() -> GradientTexture2D:
 	var g := Gradient.new()
 	g.offsets = PackedFloat32Array([0.0, 0.18, 0.45, 0.75, 1.0])
@@ -485,6 +578,19 @@ func icon(kind: String) -> Texture2D:
 	if not _icons.has(kind):
 		_icons[kind] = load("res://icons/%s.svg" % kind)
 	return _icons[kind]
+
+
+## The battery icon showing how much charge is left (priorblue's set: empty, 25, 50, 75, full).
+func battery_icon(charge: float) -> String:
+	if charge <= 0.05:
+		return "battery_0"
+	if charge <= 0.3:
+		return "battery_25"
+	if charge <= 0.55:
+		return "battery_50"
+	if charge <= 0.8:
+		return "battery_75"
+	return "battery"
 
 
 ## Draws an icon centred on c, about s pixels across, tinted col.

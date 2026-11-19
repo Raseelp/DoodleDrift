@@ -29,8 +29,8 @@ var settings: Control
 var celebrating := false
 # Arriving from a lake (after a win, or Menu): the lake zooms out into its picture, a lake this win
 # opened unlocks, and the boat sails to the next lake, which the map then zooms in on. A fresh tap skips to the end.
-const A_FADE := 0.3
-const A_ZOOM := 0.9
+const A_HAND := 0.75  # the lake has faded into its picture here (level.gd LEAVE_HAND)
+const A_ZOOM := 1.0  # then the camera pulls back from the lake to the whole map
 const A_GAP := 0.15
 const A_UNLOCK := 0.7
 var arrive_level = null  # the lake (level.gd) zooming out over the map; freed when it lands
@@ -38,18 +38,29 @@ var arrive_from := -1
 var travel_to := -1  # the lake the boat sails to and then zooms in on (-1: none)
 var reveal := -1  # the lake this win opened
 var arrive_t := -1.0  # seconds into the arrival, -1 when not arriving
-var arr_e := 1.0  # how far the lake has zoomed out
+var arrive_cam: Array = []  # the camera close in on the lake the arrival starts from
+var still_lake := -1  # a lake the camera dives into or out of: its picture stops bobbing
+var still_amp := 1.0  # its bobbing comes back gently afterwards
+var enter_from: Array = []  # the camera when setting off
+var still_lit: Array = []  # during a dive in or out, which of that lake's lanterns are lit on the lake itself
 var unlock_played := false
 var skip_armed := false  # a new touch began after the arrival started; only its lift skips
-var trip := PackedVector2Array()  # the boat's route to the next lake
 var trip_len := 0.0
-var trail: Array = []  # recent boat positions on the trip, for a small wake
+var trail: Array = []  # where the pickup's back wheels have been on the trip: tyre tracks in the dirt
+# The road the pickup drives: the dotted path, bending round each lake instead of through it. Every lake
+# has a parking spot on it, a little before the lake with the pickup's nose towards it.
+var road := PackedVector2Array()
+var road_len := PackedFloat32Array()
+var park_s: Array = []  # each lake's parking spot, as a distance along the road
+const KEEP_OUT := Vector2(62, 88)  # the road keeps this far from a lake's middle (half width, half height)
 var tint_node: CanvasModulate
 var tint_color := Color.WHITE
-const Boat3D = preload("res://scripts/boat3d.gd")
-const MAP_BOAT_RENDER := 112  # render size: about 1.5x the drawn size, so it shrinks cleanly
-const MAP_BOAT_SCALE := 0.16 * 448.0 / MAP_BOAT_RENDER  # about 38 px long, the flat boat's size
-var boat3d: SubViewport  # the same 3D boat as on the lakes, drawn by the map
+const Rig3D = preload("res://scripts/rig3d.gd")
+const RIG_RENDER := 200  # the rig's render size; it sees 26 m, so 7.7 px a metre
+const RIG_SCALE := 0.74  # drawn at about 5.7 map px a metre: the whole rig is about 125 px long
+const PICKUP_M := 8.7  # the drawn pickup's length (rig3d.gd scales it up)
+const PX_PER_M := RIG_SCALE * RIG_RENDER / 26.0
+var boat3d: SubViewport  # the pickup, trailer and boat (rig3d.gd), drawn on the map
 var rings: Array = []  # gold ripples spreading from lakes during the chapter-complete moment
 
 # Time of day on the map follows the chapter: bright morning with no lake lit, golden afternoon,
@@ -61,8 +72,26 @@ const DAY_STOPS := [
 	{"t": 0.75, "base": "6f6a5c", "dark": "5f5a50", "ink": "f4efe6", "tint": "d9c9d6"},
 	{"t": 1.0, "base": "23313a", "dark": "1c2830", "ink": "f1f3f2", "tint": "b8bfd8"},
 ]
-var day_t := 0.0  # 0 morning .. 1 night
+var day_t := 0.0  # 0 morning .. 1 night: follows where the pickup is on the road (_day_target)
+var night_f := 0.0  # 1 once the chapter is complete: the last lake's stretch of road turns to night
 var ink := Color.WHITE  # text colour that reads on today's ground
+var land_mat: ShaderMaterial
+var ink_set := Color(0, 0, 0, 0)  # the ink the labels were last given
+# The pickup driving between lakes on the map (outside an arrival): it only ever moves while on screen.
+# Each trip is a route the tow hitch follows: the road, or, when the lake is back the way it came, a loop
+# off the track to turn round (a driver steering for the road behind, never sharper than TURN_R), then the
+# road. The pickup's nose looks ahead along the route and the trailer's wheels follow the same path behind.
+const TURN_R := 52.0  # the rig's tightest turn on the map, px (about 9 m)
+const LOOK := 46.0  # how far ahead along the road the driver aims
+var drive_to := -1  # the lake it is driving to (-1: parked by `current`)
+var drive_start := 0.0
+var drive_time := 1.0
+var drive_m0 := 0.0  # its speed at the start, in the ease's units (0 = from a standstill)
+var route := PackedVector2Array()
+var route_len := PackedFloat32Array()
+var route_sv := PackedFloat32Array()  # the road distance each route point stands for (for the time of day)
+var route_d0 := 0.0  # where on the route the hitch sets off
+var route_d1 := 0.0  # and where it stops, by the lake
 var clouds: Array = []
 var butterflies: Array = []
 var map_labels: Array = []
@@ -82,6 +111,12 @@ func _ready() -> void:
 		if Game.is_unlocked(i) and not Game.lake_done(i):
 			current = i
 			break
+	# The pickup stays where it was left; it only moves on screen.
+	if Game.rig_lake >= 0 and Game.is_unlocked(Game.rig_lake):
+		current = Game.rig_lake
+	if arrive_from >= 0:
+		current = arrive_from
+	night_f = 1.0 if Game.chapter_done() and Game.chapter_seen else 0.0
 
 	for i in Game.lake_count():
 		var poly := Game.water_poly(i)
@@ -95,14 +130,11 @@ func _ready() -> void:
 	for s in SPOTS:
 		spots.append(s + off)
 	path_pts = _open_curve(spots, 16)
+	_build_road()
 
-	var done := 0
-	for i in Game.lake_count():
-		if Game.lake_done(i):
-			done += 1
-	day_t = clampf(float(done) / Game.lake_count(), 0.0, 1.0) if not has_meta("day_t") else float(get_meta("day_t"))
+	day_t = _day_target() if not has_meta("day_t") else float(get_meta("day_t"))
 	var stop := _day_stop(day_t)
-	ink = Color("1f3324") if day_t < 0.62 else Color("f1f3f2")
+	ink = _ink_for(day_t)
 
 	var rng := RandomNumberGenerator.new()
 	rng.seed = 404
@@ -118,6 +150,7 @@ func _ready() -> void:
 	m.set_shader_parameter("base", stop["base"])
 	m.set_shader_parameter("dark", stop["dark"])
 	bg.material = m
+	land_mat = m
 	add_child(bg)
 	var tint := CanvasModulate.new()
 	tint.color = stop["tint"]
@@ -155,6 +188,14 @@ func _ready() -> void:
 		for t in trees:
 			if tp.distance_to(t["p"]) < (tr + float(t["r"])) * 0.75:
 				clear = false
+		for k in range(0, road.size(), 4):
+			if clear and tp.distance_to(road[k]) < tr + 22.0:
+				clear = false
+		# The whole parked rig too: at the first lake its trailer and boat reach past the road's start.
+		for ps in park_s:
+			for dm in range(-15, 11, 2):
+				if clear and tp.distance_to(_road_at(float(ps) + dm * PX_PER_M)) < tr + 26.0:
+					clear = false
 		if clear:
 			trees.append({"p": tp, "r": tr, "ph": rng.randf() * TAU})
 	trees.sort_custom(func(a, b): return a["p"].y < b["p"].y)
@@ -176,10 +217,9 @@ func _ready() -> void:
 	add_child(glow_node)
 
 	if Game.dev_on("boat3d"):
-		boat3d = Boat3D.new()
-		boat3d.render_size = MAP_BOAT_RENDER
+		boat3d = Rig3D.new()
+		boat3d.render_px = RIG_RENDER
 		add_child(boat3d)
-		boat3d.set_pose(-PI * 0.5, 0.0, 0.0, 0.0)
 	_build_ui()
 	Sfx.start_ambience(0.84, false)
 	Sfx.set_mood(day_t, 0.0, false)
@@ -187,46 +227,175 @@ func _ready() -> void:
 		_start_arrival()
 	elif Game.chapter_done() and not Game.chapter_seen:
 		_celebrate.call_deferred()
+	else:
+		_drive_pending.call_deferred()
 
 
 func _start_arrival() -> void:
 	arrive_t = 0.0
-	arr_e = 0.0
 	ui_root.modulate.a = 0.0
+	still_lake = arrive_from
+	still_amp = 0.0
+	still_lit = []
+	for l in arrive_level.lanterns:
+		still_lit.append(bool(l["lit"]))
+	arrive_cam = _full_cam(arrive_from)
+	position = arrive_cam[0]
+	scale = Vector2.ONE * float(arrive_cam[1])
 	if reveal >= 0:
 		map_labels[2 + reveal].modulate.a = 0.4
 	if travel_to >= 0:
-		var a := arrive_from
-		var b := travel_to
-		trip = PackedVector2Array([_rest(a)])
-		if b > a:
-			trip.append_array(path_pts.slice(a * 16 + 3, b * 16 - 2))
-		trip.append(_rest(b))
-		trip_len = 0.0
-		for k in range(1, trip.size()):
-			trip_len += trip[k - 1].distance_to(trip[k])
+		trip_len = absf(float(park_s[travel_to]) - float(park_s[arrive_from]))
 	_arrive_step()
 
 
-## Where the boat waits by a lake.
-func _rest(i: int) -> Vector2:
-	var cs: Vector2 = SPOTS[i] + off
-	var side := 1.0 if cs.x < 360.0 + off.x else -1.0
-	return cs + Vector2(side * 66.0, 62.0)
+## The road: a parking spot before the first lake, then the dotted path, with every stretch that would
+## cross a lake replaced by an arc round it.
+func _build_road() -> void:
+	var raw := PackedVector2Array()
+	var s0: Vector2 = SPOTS[0] + off
+	var s1: Vector2 = SPOTS[1] + off
+	var back := (s0 - s1).normalized() * s0.distance_to(s1)
+	for k in range(8, 0, -1):
+		raw.append(s0 + back * (float(k) / 16.0))
+	raw.append_array(path_pts)
+	var park_raw: Array = [0]
+	for i in range(1, Game.lake_count()):
+		park_raw.append(8 + i * 16 - 8)  # halfway along the road before lake i, clear of its picture
+	road = PackedVector2Array()
+	park_s.clear()
+	var i := 0
+	while i < raw.size():
+		var inside := _lake_at(raw[i])
+		if inside < 0 or road.is_empty():
+			if park_raw.has(i):
+				park_s.append(i)  # marks the index for now
+			road.append(raw[i])
+			i += 1
+			continue
+		# Entering lake `inside`: skip to where the path leaves it and go round instead.
+		var c: Vector2 = SPOTS[inside] + off
+		var j := i
+		while j < raw.size() and _lake_at(raw[j]) == inside:
+			j += 1
+		var a0 := (road[road.size() - 1] - c).angle()
+		var a1 := ((raw[j] if j < raw.size() else raw[raw.size() - 1]) - c).angle()
+		var da := wrapf(a1 - a0, -PI, PI)
+		var steps := maxi(3, int(absf(da) / 0.18))
+		for k in range(1, steps):
+			var a := a0 + da * float(k) / steps
+			road.append(c + Vector2(cos(a) * KEEP_OUT.x * 1.05, sin(a) * KEEP_OUT.y * 1.05))
+		i = j
+	road = _smooth_road(road)
+	road_len = PackedFloat32Array([0.0])
+	for k in range(1, road.size()):
+		road_len.append(road_len[k - 1] + road[k - 1].distance_to(road[k]))
+	var marks := park_s.duplicate()
+	park_s.clear()
+	for idx in marks:
+		var p: Vector2 = raw[int(idx)]
+		var best := 0
+		for k in road.size():
+			if road[k].distance_squared_to(p) < road[best].distance_squared_to(p):
+				best = k
+		park_s.append(road_len[best])
 
 
-## Top-left of a lake's picture on screen (the lake drawn at thumb_scale() from here), with the
-## map's zoom applied.
-func thumb_origin(i: int) -> Vector2:
-	return position + (SPOTS[i] + off - LAKE_CENTER * THUMB + Vector2(0, sin(clock * 0.9 + i) * 2.0)) * scale.x
+## Rounds the road's corners (where it bends round a lake) into curves a pickup could drive: points every
+## 4 px, each pulled towards its neighbours a few times; the two ends stay put.
+func _smooth_road(pts: PackedVector2Array) -> PackedVector2Array:
+	var even := PackedVector2Array([pts[0]])
+	var carry := 0.0
+	for k in range(1, pts.size()):
+		var a := pts[k - 1]
+		var b := pts[k]
+		var seg := a.distance_to(b)
+		var t := 4.0 - carry
+		while t <= seg:
+			even.append(a.lerp(b, t / seg))
+			t += 4.0
+		carry = seg - (t - 4.0)
+	even.append(pts[pts.size() - 1])
+	for pass_i in 80:
+		var nxt := even.duplicate()
+		for k in range(1, even.size() - 1):
+			nxt[k] = (even[k - 1] + even[k] * 2.0 + even[k + 1]) * 0.25
+		even = nxt
+	return even
 
 
-func thumb_scale() -> float:
-	return THUMB * scale.x
+## Which lake a point on the map is inside the keep-out of, or -1.
+func _lake_at(p: Vector2) -> int:
+	for k in Game.lake_count():
+		var d: Vector2 = (p - (SPOTS[k] + off)) / KEEP_OUT
+		if d.length_squared() < 1.0:
+			return k
+	return -1
+
+
+## A point the given distance along the road (continuing straight past either end).
+func _road_at(s: float) -> Vector2:
+	if s <= 0.0:
+		return road[0] + (road[0] - road[1]).normalized() * -s
+	var n := road.size()
+	if s >= road_len[n - 1]:
+		return road[n - 1] + (road[n - 1] - road[n - 2]).normalized() * (s - road_len[n - 1])
+	var lo := 0
+	var hi := n - 1
+	while hi - lo > 1:
+		var mid := (lo + hi) >> 1
+		if road_len[mid] < s:
+			lo = mid
+		else:
+			hi = mid
+	return road[lo].lerp(road[hi], (s - road_len[lo]) / maxf(0.001, road_len[hi] - road_len[lo]))
+
+
+## The rig at a distance s along the road, facing on along it: [hitch, pickup heading, trailer swing].
+func _rig_at(s: float) -> Array:
+	var hitch := _road_at(s)
+	var nose := _road_at(s + 5.0 * PX_PER_M)
+	var axle := _road_at(s - 9.5 * PX_PER_M)
+	var heading := (nose - hitch).angle()
+	return [hitch, heading, wrapf((hitch - axle).angle() - heading, -PI, PI)]
+
+
+## The camera (map offset and zoom) that makes lake i's picture exactly fill the screen the way the
+## lake itself does: the moment the map hands over to the lake, or takes over from it.
+func _full_cam(i: int) -> Array:
+	var z := 1.0 / THUMB
+	return [off - (SPOTS[i] + off - LAKE_CENTER * THUMB) * z, z]
+
+
+## Moves the camera between two views, zooming smoothly about lake i (even speed in and out).
+func _cam_between(a: Array, b: Array, e: float, i: int) -> void:
+	var c: Vector2 = SPOTS[i] + off
+	var s0: Vector2 = Vector2(a[0]) + c * float(a[1])
+	var s1: Vector2 = Vector2(b[0]) + c * float(b[1])
+	var z := exp(lerpf(log(float(a[1])), log(float(b[1])), e))
+	scale = Vector2(z, z)
+	position = s0.lerp(s1, e) - c * z
+
+
+## Setting off: the lake (level.gd) drives the camera dive with set_enter_cam.
+func begin_enter(i: int) -> void:
+	if cam_tween:
+		cam_tween.kill()
+	still_lake = i
+	still_amp = 0.0
+	enter_from = [position, scale.x]
+	still_lit = []
+	for l in Game.lakes[i]["lanterns"]:
+		still_lit.append(false)  # a new try starts with every lantern dark
+
+
+func set_enter_cam(e: float) -> void:
+	if still_lake >= 0:
+		_cam_between(enter_from, _full_cam(still_lake), e, still_lake)
 
 
 func _t_zoomed() -> float:
-	return A_FADE + A_ZOOM
+	return A_HAND + A_ZOOM
 
 
 func _t_unlock() -> float:
@@ -238,7 +407,7 @@ func _t_trip() -> float:
 
 
 func _trip_time() -> float:
-	return clampf(trip_len / 200.0, 1.0, 2.4) if travel_to >= 0 else 0.0
+	return clampf(trip_len / 170.0, 1.2, 2.8) if travel_to >= 0 else 0.0
 
 
 func _t_end() -> float:
@@ -248,13 +417,11 @@ func _t_end() -> float:
 func _arrive_step() -> void:
 	var t := arrive_t
 	if is_instance_valid(arrive_level):
-		arrive_level.set_overlay_alpha(1.0 - clampf(t / A_FADE, 0.0, 1.0))
-		var k := clampf((t - A_FADE) / A_ZOOM, 0.0, 1.0)
-		arr_e = k * k * (3.0 - 2.0 * k)
-		arrive_level.set_zoom(arr_e, thumb_origin(arrive_from), thumb_scale(), tint_color)
-		ui_root.modulate.a = smoothstep(0.5, 1.0, arr_e)
-		if t >= _t_zoomed():
+		arrive_level.leave_step(t, tint_color)
+		if t >= A_HAND:
 			_land_level()
+	_cam_between(arrive_cam, [Vector2.ZERO, 1.0], smoothstep(A_HAND, A_HAND + A_ZOOM, t), arrive_from)
+	ui_root.modulate.a = smoothstep(A_HAND + A_ZOOM * 0.5, A_HAND + A_ZOOM, t)
 	if reveal >= 0:
 		if not unlock_played and t >= _t_unlock():
 			unlock_played = true
@@ -272,9 +439,7 @@ func _land_level() -> void:
 	if is_instance_valid(arrive_level):
 		arrive_level.queue_free()
 	arrive_level = null
-	arr_e = 1.0
 	tint_node.visible = true
-	ui_root.modulate.a = 1.0
 
 
 func _finish_arrival() -> void:
@@ -282,13 +447,20 @@ func _finish_arrival() -> void:
 	if reveal >= 0:
 		map_labels[2 + reveal].modulate.a = 1.0
 	arrive_t = -1.0
-	trail.clear()
-	if travel_to >= 0:
-		current = travel_to
+	position = Vector2.ZERO
+	scale = Vector2.ONE
+	ui_root.modulate.a = 1.0
+	var calm := create_tween()
+	calm.tween_property(self, "still_amp", 1.0, 1.0)
+	calm.tween_callback(func(): still_lake = -1)
+	current = travel_to if travel_to >= 0 else arrive_from
+	Game.set_rig(current)
 	if Game.chapter_done() and not Game.chapter_seen:
 		_celebrate()
 	elif travel_to >= 0:
 		_focus(travel_to)
+	else:
+		_drive_pending()
 
 
 ## 0 = still locked, 1 = open; the lake this win opened goes from one to the other during the arrival.
@@ -302,26 +474,357 @@ func _open_f(i: int) -> float:
 	return 1.0 if Game.is_unlocked(i) else 0.0
 
 
-## The boat now: [position, heading, sailing]. It waits by a lake, or follows the trip during an arrival.
-func _boat_now() -> Array:
-	if arrive_t >= 0.0 and travel_to >= 0 and trip.size() >= 2:
+## How far along its trip the rig is, 0..1, eased (it pulls away and slows to a stop); -1 when not moving.
+func _drive_u() -> float:
+	if arrive_t >= 0.0 and travel_to >= 0:
 		var u := clampf((arrive_t - _t_trip()) / _trip_time(), 0.0, 1.0)
-		if u <= 0.0:
-			return [_rest(arrive_from), -PI * 0.5, false]
-		var want := u * u * (3.0 - 2.0 * u) * trip_len
-		var p := trip[trip.size() - 1]
-		var dir := Vector2.UP
-		for k in range(1, trip.size()):
-			var seg := trip[k - 1].distance_to(trip[k])
-			if want <= seg or k == trip.size() - 1:
-				var f := clampf(want / maxf(seg, 0.001), 0.0, 1.0)
-				p = trip[k - 1].lerp(trip[k], f)
-				dir = (trip[k] - trip[k - 1]).normalized()
-				break
-			want -= seg
-		var w := minf(smoothstep(0.0, 0.15, u), 1.0 - smoothstep(0.85, 1.0, u))
-		return [p, lerp_angle(-PI * 0.5, dir.angle(), w), u < 1.0]
-	return [_rest(current), -PI * 0.5, false]
+		return u * u * (3.0 - 2.0 * u)
+	if arrive_t < 0.0 and drive_to >= 0:
+		return _ease(clampf((clock - drive_start) / drive_time, 0.0, 1.0))
+	return -1.0
+
+
+## Pulls away (or carries on at the speed it had, m0) and slows to a stop by the lake.
+func _ease(u: float) -> float:
+	return (u * u * u - 2.0 * u * u + u) * drive_m0 + (3.0 * u * u - 2.0 * u * u * u)
+
+
+func _ease_slope(u: float) -> float:
+	return (3.0 * u * u - 4.0 * u + 1.0) * drive_m0 + (6.0 * u - 6.0 * u * u)
+
+
+## Where the hitch is on its route now.
+func _route_d() -> float:
+	if drive_to >= 0:
+		return lerpf(route_d0, route_d1, _drive_u())
+	return route_d1
+
+
+## A point on the route d along it (carrying straight on past either end).
+func _route_at(d: float) -> Vector2:
+	var n := route.size()
+	if d <= 0.0:
+		return route[0] + (route[0] - route[1]).normalized() * -d
+	if d >= route_len[n - 1]:
+		return route[n - 1] + (route[n - 1] - route[n - 2]).normalized() * (d - route_len[n - 1])
+	var k := route_len.bsearch(d)
+	k = clampi(k, 1, n - 1)
+	return route[k - 1].lerp(route[k], (d - route_len[k - 1]) / maxf(0.001, route_len[k] - route_len[k - 1]))
+
+
+func _route_s(d: float) -> float:
+	var n := route.size()
+	var k := clampi(route_len.bsearch(clampf(d, 0.0, route_len[n - 1])), 1, n - 1)
+	return lerpf(route_sv[k - 1], route_sv[k], clampf((d - route_len[k - 1]) / maxf(0.001, route_len[k] - route_len[k - 1]), 0.0, 1.0))
+
+
+## The rig's distance along the road now (on a turning loop: the road beside it).
+func _rig_s() -> float:
+	if park_s.is_empty():
+		return 0.0
+	if arrive_t >= 0.0:
+		if travel_to >= 0:
+			return lerpf(float(park_s[arrive_from]), float(park_s[travel_to]), _drive_u())
+		return float(park_s[arrive_from])
+	if not route.is_empty():
+		return _route_s(_route_d())
+	return float(park_s[current])
+
+
+## The rig now: [hitch, heading, driving, trailer swing]. Parked by a lake, or on the road.
+func _boat_now() -> Array:
+	var u := _drive_u()
+	if arrive_t >= 0.0 or route.is_empty():
+		var r := _rig_at(_rig_s())
+		return [r[0], r[1], u > 0.0 and u < 1.0, r[2]]
+	var d := _route_d()
+	var hitch := _route_at(d)
+	var heading := (_route_at(d + 5.0 * PX_PER_M) - hitch).angle()
+	var axle := _route_at(d - 9.5 * PX_PER_M)
+	return [hitch, heading, u > 0.0 and u < 1.0, wrapf((hitch - axle).angle() - heading, -PI, PI)]
+
+
+## Drives the pickup to lake i from wherever it is, turning round off the track if the lake is behind it.
+func _drive_to(i: int) -> void:
+	if park_s.is_empty() or arrive_t >= 0.0 or i == drive_to:
+		return
+	var target := float(park_s[i])
+	var cur_s := _rig_s()
+	if drive_to < 0 and absf(target - cur_s) < 1.0:
+		current = i
+		Game.set_rig(i)
+		return
+	# Its speed now, to carry on smoothly if it is already moving.
+	var v0 := 0.0
+	if drive_to >= 0:
+		var u := clampf((clock - drive_start) / drive_time, 0.0, 1.0)
+		v0 = (route_d1 - route_d0) * _ease_slope(u) / drive_time
+	var bn := _boat_now()
+	var p: Vector2 = bn[0]
+	var h: float = bn[1]
+	var d_now := _route_d() if not route.is_empty() else 0.0
+	var pts := PackedVector2Array()
+	var sv := PackedFloat32Array()
+	# The path behind the hitch, so the trailer stays where it is.
+	for k in range(14, 0, -1):
+		var back := k * PX_PER_M
+		if route.is_empty():
+			pts.append(_road_at(cur_s - back))
+			sv.append(cur_s - back)
+		else:
+			pts.append(_route_at(d_now - back))
+			sv.append(_route_s(d_now - back))
+	pts.append(p)
+	sv.append(cur_s)
+	var start_i := pts.size() - 1
+	# It carries on along its line for a few metres before it can turn (where its nose already is).
+	for k in range(1, 13):
+		var a := k * 0.5 * PX_PER_M
+		if route.is_empty():
+			pts.append(_road_at(cur_s + a))
+			sv.append(cur_s + a)
+		else:
+			pts.append(_route_at(d_now + a))
+			sv.append(_route_s(d_now + a))
+	p = pts[pts.size() - 1]
+	h = (p - pts[pts.size() - 2]).angle()
+	cur_s = sv[sv.size() - 1]
+	# Steer for the road towards the lake (turning round in a loop if that is behind), keeping clear of the
+	# lakes: if the natural way round would cut across one, swing round the other way instead.
+	var sgn := 1.0 if target > cur_s else -1.0
+	var plan := _steer(p, h, cur_s, sgn, target, 0.0)
+	if float(plan[3]) < 1.0:
+		for force in [1.0, -1.0]:
+			var other := _steer(p, h, cur_s, sgn, target, force)
+			if float(other[3]) > float(plan[3]):
+				plan = other
+	pts.append_array(plan[0])
+	sv.append_array(plan[1])
+	# Then the road to the lake, and a little past it for the pickup's nose.
+	var rs: float = plan[2]
+	while sgn * (target - rs) > 0.0:
+		pts.append(_road_at(rs))
+		sv.append(rs)
+		rs += sgn * 4.0
+	pts.append(_road_at(target))
+	sv.append(target)
+	var end_i := pts.size() - 1
+	for k in range(1, 6):
+		pts.append(_road_at(target + sgn * k * 3.0 * PX_PER_M))
+		sv.append(target)
+	route = pts
+	route_sv = sv
+	route_len = PackedFloat32Array([0.0])
+	for k in range(1, route.size()):
+		route_len.append(route_len[k - 1] + route[k - 1].distance_to(route[k]))
+	route_d0 = route_len[start_i]
+	route_d1 = route_len[end_i]
+	var dist := route_d1 - route_d0
+	drive_time = clampf(dist / 170.0, 1.2, 4.5)
+	drive_m0 = clampf(v0 * drive_time / maxf(1.0, dist), 0.0, 2.5)
+	drive_to = i
+	drive_start = clock
+
+
+## The driver's way from p (facing h) onto the road heading towards `target`: aiming a little ahead along
+## the road, never turning tighter than TURN_R (a loop when the road is behind), then easing onto it.
+## force: which way to swing round until lined up with the road (0: the natural way). [points, road distances, where it joins the road,
+## how close it came to a lake (1 = the edge of its keep-out)].
+func _steer(p: Vector2, h: float, s0: float, sgn: float, target: float, force: float) -> Array:
+	var pts := PackedVector2Array()
+	var sv := PackedFloat32Array()
+	var sn := s0
+	var hh := h
+	var pp := p
+	var side := force
+	var forcing := force != 0.0
+	var turned := 0.0
+	var worst := INF
+	for step in 300:
+		sn = _near_s(pp, sn)
+		var rp := _road_at(sn)
+		var tang := (_road_at(sn + sgn * 4.0) - rp).angle()
+		if pp.distance_to(rp) < 24.0 and absf(angle_difference(hh, tang)) < 0.45:
+			break
+		var aim := _road_at(sn + sgn * LOOK)
+		var alpha := angle_difference(hh, (aim - pp).angle())
+		var k: float
+		if forcing and absf(alpha) > 0.5 and turned < PI * 1.6:
+			k = force / TURN_R  # swinging round the long way, clear of a lake
+		elif absf(alpha) > PI * 0.5:
+			if side == 0.0:
+				side = _open_side(pp, hh)  # turning round: on the side with room, away from the lakes
+			k = side / TURN_R
+		else:
+			k = clampf(2.0 * sin(alpha) / LOOK, -1.0 / TURN_R, 1.0 / TURN_R)
+		if absf(alpha) <= 0.5:
+			forcing = false
+		# Never across a lake: heading towards one and close, it veers away as hard as it can.
+		var lc := _nearest_lake(pp)
+		var fwd := Vector2.from_angle(hh)
+		if _lake_room(pp) < 1.12 and fwd.dot(lc - pp) > 0.0:
+			k = -signf(fwd.cross(lc - pp)) / TURN_R
+		hh += k * 3.0
+		turned += absf(k * 3.0)
+		pp += Vector2.from_angle(hh) * 3.0
+		pts.append(pp)
+		sv.append(sn)
+		worst = minf(worst, _lake_room(pp))
+	# Ease onto the road a little further on, along a smooth curve that leaves at its heading and arrives
+	# along the road.
+	var js := sn + sgn * 34.0
+	for k in 10:
+		if (_road_at(js) - pp).dot(Vector2.from_angle(hh)) > 14.0:
+			break
+		js += sgn * 8.0  # join ahead of the pickup, never behind it
+	if sgn * (target - js) < 0.0:
+		js = target
+	var q := _road_at(js)
+	var qt := (_road_at(js + sgn * 4.0) - q).normalized()
+	var reach := minf(16.0, pp.distance_to(q) * 0.4)
+	var c1 := pp + Vector2.from_angle(hh) * reach
+	var c2 := q - qt * reach
+	for k in range(1, 9):
+		var t := k / 8.0
+		var a := pp.lerp(c1, t).lerp(c1.lerp(c2, t), t)
+		var b := c1.lerp(c2, t).lerp(c2.lerp(q, t), t)
+		var bp := a.lerp(b, t)
+		pts.append(bp)
+		sv.append(0.0)
+		worst = minf(worst, _lake_room(bp))
+	# Off the road the time of day moves evenly from where it left the road to where it joins it again.
+	var total := 0.0
+	var prev := p
+	for q2 in pts:
+		total += prev.distance_to(q2)
+		prev = q2
+	var run := 0.0
+	prev = p
+	for k in pts.size():
+		run += prev.distance_to(pts[k])
+		prev = pts[k]
+		sv[k] = lerpf(s0, js, run / maxf(1.0, total))
+	return [pts, sv, js + sgn * 4.0, worst]
+
+
+func _nearest_lake(p: Vector2) -> Vector2:
+	var best := Vector2.ZERO
+	var bd := INF
+	for k in Game.lake_count():
+		var c: Vector2 = SPOTS[k] + off
+		var d := ((p - c) / KEEP_OUT).length()
+		if d < bd:
+			bd = d
+			best = c
+	return best
+
+
+## How far p is from the nearest lake, in keep-outs (under 1: inside one).
+func _lake_room(p: Vector2) -> float:
+	var r := INF
+	for k in Game.lake_count():
+		r = minf(r, ((p - (SPOTS[k] + off)) / KEEP_OUT).length())
+	return r
+
+
+## The nearest point of the road to p, searched near a guess (distance along the road).
+func _near_s(p: Vector2, guess: float) -> float:
+	var best := guess
+	var bd := INF
+	for k in range(-30, 31):
+		var s := guess + k * 2.0
+		var d := p.distance_squared_to(_road_at(s))
+		if d < bd:
+			bd = d
+			best = s
+	return best
+
+
+## Which way to swing round when the road back is straight behind: away from the nearest lake, and on screen.
+func _open_side(p: Vector2, h: float) -> float:
+	var best := 1.0
+	var score := -INF
+	for sd in [1.0, -1.0]:
+		var c: Vector2 = p + Vector2.from_angle(h + sd * PI * 0.5) * TURN_R
+		var room := INF
+		for k in Game.lake_count():
+			room = minf(room, c.distance_to(SPOTS[k] + off))
+		if c.x < TURN_R or c.x > view_size.x - TURN_R or c.y < TURN_R or c.y > view_size.y - TURN_R:
+			room -= 200.0
+		if room > score:
+			score = room
+			best = sd
+	return best
+
+
+## A lake a win opened while the map was away: drive there now that the map is on screen.
+func _drive_pending() -> void:
+	var p := Game.rig_pending
+	if p >= 0 and Game.is_unlocked(p) and p != current and focus < 0 and not leaving_map:
+		_drive_to(p)
+	Game.rig_pending = -1
+
+
+## The time of day where the rig is: each lake has its own (the first is morning, each later one later
+## in the day, the last at dusk, or night once the chapter is complete), blended along the road between.
+func _day_target() -> float:
+	if park_s.is_empty():
+		return 0.0
+	var s := _rig_s()
+	var n := Game.lake_count()
+	if s <= float(park_s[0]):
+		return _day_key(0)
+	for i in range(1, n):
+		var s1 := float(park_s[i])
+		if s <= s1:
+			var s0 := float(park_s[i - 1])
+			return lerpf(_day_key(i - 1), _day_key(i), (s - s0) / maxf(1.0, s1 - s0))
+	return _day_key(n - 1)
+
+
+func _day_key(i: int) -> float:
+	var n := Game.lake_count()
+	var k := float(i) / n
+	return lerpf(k, 1.0, night_f) if i == n - 1 else k
+
+
+## Text colour for a time of day: dark on the bright ground, light once dusk falls (blended, not switched).
+func _ink_for(t: float) -> Color:
+	return Color("1f3324").lerp(Color("f1f3f2"), smoothstep(0.56, 0.68, t))
+
+
+## In daylight a faint light drop shadow under the text, after dusk a dark one.
+func _shadow_for(t: float) -> Color:
+	return Color(1, 1, 1, 0.22).lerp(Color(0, 0, 0, 0.32), smoothstep(0.56, 0.68, t))
+
+
+## Puts the current time of day on the ground, the light, the sounds and the text.
+func _apply_day() -> void:
+	var stop := _day_stop(day_t)
+	land_mat.set_shader_parameter("base", stop["base"])
+	land_mat.set_shader_parameter("dark", stop["dark"])
+	tint_color = stop["tint"]
+	tint_node.color = tint_color
+	if not is_instance_valid(arrive_level):
+		Sfx.set_mood(day_t, 0.0, false)  # while a lake is handing over, it keeps its own mood
+	ink = _ink_for(day_t)
+	if absf(ink.r - ink_set.r) + absf(ink.g - ink_set.g) + absf(ink.b - ink_set.b) < 0.01:
+		return
+	ink_set = ink
+	var shadow := _shadow_for(day_t)
+	for lb in map_labels:
+		lb.add_theme_color_override("font_color", ink)
+		lb.add_theme_color_override("font_shadow_color", shadow)
+	if is_instance_valid(focus_ui):
+		_ink_labels(focus_ui, shadow)
+
+
+func _ink_labels(n: Node, shadow: Color) -> void:
+	if n is Label and n.has_meta("ink_a"):
+		n.add_theme_color_override("font_color", Color(ink, float(n.get_meta("ink_a"))))
+		n.add_theme_color_override("font_shadow_color", shadow)
+	for c in n.get_children():
+		_ink_labels(c, shadow)
 
 
 func _build_ui() -> void:
@@ -407,8 +910,8 @@ func _build_ui() -> void:
 	# Labels take the day's ink colour; in daylight the dark drop shadow becomes a faint light one.
 	for lb in map_labels:
 		lb.add_theme_color_override("font_color", ink)
-		if day_t < 0.62:
-			lb.add_theme_color_override("font_shadow_color", Color(1, 1, 1, 0.22))
+		lb.add_theme_color_override("font_shadow_color", _shadow_for(day_t))
+	ink_set = ink
 
 
 ## Colours for a time of day, blended between the two nearest stops.
@@ -431,12 +934,22 @@ func _process(delta: float) -> void:
 	if arrive_t >= 0.0:
 		arrive_t += delta
 		_arrive_step()
+	if drive_to >= 0 and arrive_t < 0.0 and clock - drive_start >= drive_time:
+		current = drive_to
+		drive_to = -1
+		Game.set_rig(current)
+	if not has_meta("day_t"):
+		day_t = _day_target()
+		_apply_day()
 	var bn := _boat_now()
 	if boat3d:
-		boat3d.set_pose(float(bn[1]), 0.0, 0.0, 0.0)
-	if bn[2] and (trail.is_empty() or Vector2(trail[-1]["p"]).distance_to(bn[0]) > 6.0):
-		trail.append({"p": bn[0], "t": clock})
-	while not trail.is_empty() and clock - float(trail[0]["t"]) > 1.2:
+		boat3d.set_pose(float(bn[1]), float(bn[3]))
+	if bn[2]:
+		# The pickup's back axle, a metre and a half ahead of the hitch.
+		var axle: Vector2 = Vector2(bn[0]) + Vector2.from_angle(float(bn[1])) * 1.5 * PX_PER_M
+		if trail.is_empty() or Vector2(trail[-1]["p"]).distance_to(axle) > 3.0:
+			trail.append({"p": axle, "a": float(bn[1]), "t": clock})
+	while not trail.is_empty() and clock - float(trail[0]["t"]) > 5.0:
 		trail.remove_at(0)
 	for c in clouds:
 		c["p"] = Vector2(c["p"]) + Vector2(float(c["v"]), float(c["v"]) * 0.25) * delta
@@ -573,6 +1086,8 @@ func _move_cam(pos: Vector2, z: float, f: float) -> void:
 func _focus(i: int) -> void:
 	focus = i
 	last_focus = i
+	Game.rig_pending = -1  # the player chose where to go
+	_drive_to(i)
 	var cam := _focus_cam(i)
 	_move_cam(cam[0], cam[1], 1.0)
 	var fade := create_tween()
@@ -612,7 +1127,7 @@ func _build_focus_ui(i: int) -> Control:
 	var total: int = lake["lanterns"].size()
 	var par := int(lake["par"])
 	var inner_w := minf(560.0, view_size.x - 96.0)
-	var shadow := Color(1, 1, 1, 0.22) if day_t < 0.62 else Color(0, 0, 0, 0.32)
+	var shadow := _shadow_for(day_t)
 	var root := Control.new()
 	root.size = view_size
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -629,6 +1144,7 @@ func _build_focus_ui(i: int) -> Control:
 			l.add_theme_font_override("font", font)
 		l.add_theme_font_size_override("font_size", size)
 		l.add_theme_color_override("font_color", Color(ink, a))
+		l.set_meta("ink_a", a)
 		l.add_theme_color_override("font_shadow_color", shadow)
 		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		l.custom_minimum_size = Vector2(inner_w, 0)
@@ -647,7 +1163,7 @@ func _build_focus_ui(i: int) -> Control:
 
 	# Goals: the map's dark discs, bigger, each over its label.
 	var goals := [["lantern", "All %d lanterns" % total, Game.MARK_ALL],
-		["sun", "Before dusk", Game.MARK_TIME],
+		[Game.time_goal(i)[0], Game.time_goal(i)[1], Game.MARK_TIME],
 		["loop", "Max %d loop%s" % [par, "" if par == 1 else "s"], Game.MARK_LOOPS]]
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 0)
@@ -674,6 +1190,7 @@ func _build_focus_ui(i: int) -> Control:
 		gl.text = String(goals[k][1])
 		gl.add_theme_font_size_override("font_size", 20)
 		gl.add_theme_color_override("font_color", Color(ink, 0.9 if on else 0.72))
+		gl.set_meta("ink_a", 0.9 if on else 0.72)
 		gl.add_theme_color_override("font_shadow_color", shadow)
 		gl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		cell.add_child(gl)
@@ -769,13 +1286,11 @@ func _draw_map(n: Node2D) -> void:
 		var pal: Dictionary = lake["pal"]
 		var of := _open_f(i)
 		var alpha := lerpf(0.3, 1.0, of)
-		if i == arrive_from and is_instance_valid(arrive_level):
-			alpha *= smoothstep(0.8, 1.0, arr_e)
 		if i != (focus if focus >= 0 else last_focus):
 			alpha *= 1.0 - 0.7 * focus_f
 		var spot: Vector2 = SPOTS[i] + off
 		var origin := spot - LAKE_CENTER * THUMB
-		var bob := sin(clock * 0.9 + i) * 2.0
+		var bob := sin(clock * 0.9 + i) * 2.0 * (still_amp if i == still_lake else 1.0)
 		origin.y += bob
 		var th: Dictionary = thumbs[i]
 		n.draw_set_transform(origin + Vector2(6, 9), 0.0, Vector2(THUMB, THUMB))
@@ -788,10 +1303,27 @@ func _draw_map(n: Node2D) -> void:
 			n.draw_colored_polygon(p, Color(pal["mid"], alpha))
 		for p in th["deep"]:
 			n.draw_colored_polygon(p, Color(pal["deep"], alpha))
+		# Lanterns: small storm lanterns, at exactly the size and place of the lake's own lanterns, so the
+		# camera can dive straight into them (dots until the lantern pictures are ready at start-up).
 		var done := Game.lake_done(i)
-		for l in lake["lanterns"]:
-			var c := Color(pal["light"], alpha) if done else Color(pal["light"].darkened(0.45), alpha)
-			n.draw_circle(Vector2(l[0], l[1]), 34.0, c)
+		var mini := 1.0 if Game.lantern_lit else 0.0
+		var lamp: Texture2D = Game.lantern_lit if done else Game.lantern_unlit
+		for li in lake["lanterns"].size():
+			var l: Array = lake["lanterns"][li]
+			var lp := Vector2(l[0], l[1])
+			if mini < 1.0:
+				var c := Color(pal["light"], alpha) if done else Color(pal["light"].darkened(0.45), alpha)
+				c.a *= 1.0 - mini
+				n.draw_circle(lp, 34.0, c)
+			if mini > 0.0:
+				# While diving in or out of this lake, its lanterns match the lake's own, then ease back.
+				var r := Rect2(lp - Game.lantern_anchor * Game.LANTERN_SCALE, lamp.get_size() * Game.LANTERN_SCALE)
+				var tex := lamp
+				if i == still_lake and li < still_lit.size():
+					tex = Game.lantern_lit if still_lit[li] else Game.lantern_unlit
+				n.draw_texture_rect(tex, r, false, Color(1, 1, 1, alpha * mini))
+				if tex != lamp and i == still_lake and still_amp > 0.0:
+					n.draw_texture_rect(lamp, r, false, Color(1, 1, 1, alpha * mini * still_amp))
 		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 		# Goals under the name, as the same icons used everywhere else. Each sits on a small dark disc,
@@ -802,9 +1334,9 @@ func _draw_map(n: Node2D) -> void:
 		for k in (3 if focus_f < 1.0 else 0):
 			var x := spot.x + 108 + k * 38 if left_side else spot.x - 108 - (2 - k) * 38
 			var gp := Vector2(x, spot.y + 26)
-			var kind: String = ["lantern", "sun", "loop"][k]
+			var kind: String = ["lantern", Game.time_goal(i)[0], "loop"][k]
 			var on := m & (1 << k) != 0
-			var ga := 1.0 - focus_f
+			var ga := (1.0 - focus_f) * clampf(3.0 - scale.x, 0.0, 1.0)  # hidden while the camera is close in
 			n.draw_circle(gp, 17.0, Color(0.03, 0.06, 0.08, (0.62 if on else 0.42) * lerpf(0.6, 1.0, of) * ga), true, -1.0, true)
 			Game.draw_icon(n, kind, gp, 24, Color(Color(pal["light"]) if on else Color(1, 1, 1, lerpf(0.3, 0.5, of)), (1.0 if on else lerpf(0.3, 0.5, of)) * ga))
 		if of < 1.0:
@@ -848,31 +1380,34 @@ func _draw_map(n: Node2D) -> void:
 		if rk >= 0.0 and rk <= 1.0:
 			n.draw_arc(r["p"], 40.0 + rk * 90.0, 0.0, TAU, 48, Color(r["c"], 0.9 * (1.0 - rk)), 4.0, true)
 
-	# The boat waits by the current lake, or sails to the next one, leaving a small wake.
+	# The pickup parked by the current lake, or towing the boat to the next one, leaving tyre tracks.
+	var half_track := 0.85 * PX_PER_M
 	for k in range(1, trail.size()):
-		var age := (clock - float(trail[k]["t"])) / 1.2
-		n.draw_line(trail[k - 1]["p"], trail[k]["p"], Color(1, 1, 1, 0.45 * (1.0 - age)), 2.5 * (1.0 - age) + 0.5, true)
+		var age := (clock - float(trail[k]["t"])) / 5.0
+		var col := Color(0.32, 0.24, 0.14, 0.32 * (1.0 - age))
+		var sd0 := Vector2.from_angle(float(trail[k - 1]["a"])).orthogonal() * half_track
+		var sd1 := Vector2.from_angle(float(trail[k]["a"])).orthogonal() * half_track
+		for side in [-1.0, 1.0]:
+			n.draw_line(Vector2(trail[k - 1]["p"]) + sd0 * side, Vector2(trail[k]["p"]) + sd1 * side, col, 1.4, true)
 	var bn := _boat_now()
-	var sailing: bool = bn[2]
-	var bp: Vector2 = bn[0] + (Vector2.ZERO if sailing else Vector2(0, sin(clock * 1.7) * 3.0))
-	var sway := 0.0 if sailing else sin(clock * 0.8) * 0.15
+	var bp: Vector2 = bn[0]
 	if boat3d:
-		_draw_boat(n, bp, sway)
+		_draw_boat(n, bp, 0.0)
 		return
-	n.draw_set_transform(bp, float(bn[1]) + sway, Vector2(1.1, 1.1))
+	n.draw_set_transform(bp, float(bn[1]), Vector2(1.1, 1.1))
 	n.draw_colored_polygon(PackedVector2Array(HULL), Color("efe6d6"))
 	n.draw_rect(Rect2(-9, -4.5, 11, 9), Color("c9bca5"))
 	n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 
-## The 3D boat's render (pointing up) at p, turned by rot, with its shadow like on the lakes.
-func _draw_boat(ci: CanvasItem, p: Vector2, rot: float) -> void:
+## The rig's render with its hitch at p, and its shadow on the ground.
+func _draw_boat(ci: CanvasItem, p: Vector2, _rot: float) -> void:
 	var tex := boat3d.get_texture()
-	var half := tex.get_size() * 0.5
-	ci.draw_set_transform(p + Vector2(-6, 8), rot, Vector2.ONE * MAP_BOAT_SCALE)
-	ci.draw_texture(tex, -half, Color(0.02, 0.06, 0.08, 0.32))
-	ci.draw_set_transform(p, rot, Vector2.ONE * MAP_BOAT_SCALE)
-	ci.draw_texture(tex, -half)
+	var at: Vector2 = -boat3d.anchor()
+	ci.draw_set_transform(p + Vector2(-4, 5), 0.0, Vector2.ONE * RIG_SCALE)
+	ci.draw_texture(tex, at, Color(0.05, 0.08, 0.05, 0.3))
+	ci.draw_set_transform(p, 0.0, Vector2.ONE * RIG_SCALE)
+	ci.draw_texture(tex, at)
 	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 
@@ -885,6 +1420,22 @@ func _draw_wings(n: Node2D, flap: float, col: Color) -> void:
 
 func _draw_glow(n: Node2D) -> void:
 	var glow: Texture2D = Game.glow_tex
+	# The pickup's headlights from dusk: two warm beams on the road ahead and a glow.
+	var beams := smoothstep(0.5, 0.85, day_t)
+	if boat3d and beams > 0.0:
+		var hl: Array = boat3d.headlamps()
+		if not hl.is_empty():
+			var bn := _boat_now()
+			var at: Vector2 = Vector2(bn[0]) - boat3d.anchor() * RIG_SCALE
+			var ang: float = hl[2]
+			var warm := Color(1.0, 0.9, 0.68)
+			for k in 2:
+				var o: Vector2 = at + Vector2(hl[k]) * RIG_SCALE
+				Game.draw_beam(n, o, ang, 80.0, 66.0, Color(warm, 0.55 * beams))
+				n.draw_texture_rect(glow, Rect2(o - Vector2(5, 5), Vector2(10, 10)), false, Color(1, 0.97, 0.88, 0.9 * beams))
+			# Where the two beams meet the ground ahead: a soft pool of light.
+			var mid: Vector2 = at + (Vector2(hl[0]) + Vector2(hl[1])) * 0.5 * RIG_SCALE + Vector2.from_angle(ang) * 34.0
+			n.draw_texture_rect(glow, Rect2(mid - Vector2(34, 34), Vector2(68, 68)), false, Color(warm, 0.22 * beams))
 	# The sun: high in the top right in the morning, sinking toward the right edge and warming to
 	# orange through the afternoon, gone at night.
 	var sun_a := 1.0 - smoothstep(0.7, 0.95, day_t)
@@ -1209,7 +1760,7 @@ func _open_settings() -> void:
 	col.add_child(kicker.call("CREDITS"))
 	gap.call(8)
 	var credits := Label.new()
-	credits.text = "Boat: \"Fishing Boat\" by CharlieCatling, Sketchfab\nIcons by Lorc and Delapouite, game-icons.net (CC BY 3.0)\nPause, play and restart icons: Phosphor Icons (MIT)\nMade with the Godot Engine"
+	credits.text = "Boat: \"Fishing Boat\" by CharlieCatling, Sketchfab\nPickup: \"Low Poly Car - Chevrolet C10 Pickup 1963\" by ROH3D (CC BY 4.0)\nTrailer: \"Boat Trailer\" by BoatUS Foundation (CC BY 4.0)\nIcons by Lorc, Delapouite and priorblue, game-icons.net (CC BY 3.0)\nPause, play and restart icons: Phosphor Icons (MIT)\nMade with the Godot Engine"
 	credits.add_theme_font_size_override("font_size", 21)
 	credits.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	credits.custom_minimum_size = Vector2(inner_w, 0)
@@ -1258,6 +1809,7 @@ func _close_settings() -> void:
 ## then "THE STILL LAKES ARE BRIGHT AGAIN" over the map. Tap to carry on.
 func _celebrate() -> void:
 	celebrating = true
+	create_tween().tween_property(self, "night_f", 1.0, 3.0).set_trans(Tween.TRANS_SINE)
 	var notes := [1.0, 1.125, 1.25, 1.5, 1.6667]
 	var tw := create_tween()
 	tw.tween_interval(0.6)

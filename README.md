@@ -16,6 +16,8 @@ A calm one-finger boat game for Android. Steer across still lakes and close loop
 
 ## Credits
 
-- Icons by Lorc and Delapouite from [game-icons.net](https://game-icons.net), licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
+- Icons by Lorc, Delapouite and priorblue from [game-icons.net](https://game-icons.net), licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
 - Pause, play and restart icons from [Phosphor Icons](https://phosphoricons.com) (MIT).
 - Boat: ["Fishing Boat"](https://sketchfab.com/3d-models/fishing-boat-a3f138089e164200b34bfb1bebb978c2) by CharlieCatling on Sketchfab, Sketchfab Free Standard licence.
+- Pickup: ["Low Poly Car - Chevrolet C10 Pickup 1963"](https://sketchfab.com/3d-models/low-poly-car-chevrolet-c10-pickup-1963-679354c151984747bb74310ec5af8995) by ROH3D, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- Boat trailer: ["Boat Trailer"](https://sketchfab.com/3d-models/none-594ef36c27924dcaa677781c756fbc7c) by BoatUS Foundation, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

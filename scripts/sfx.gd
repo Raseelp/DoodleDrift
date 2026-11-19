@@ -1,6 +1,6 @@
 extends Node
 ## All sound is synthesised in code at start-up (no audio files), on a background thread.
-## Lake soundscape: birds by day, crickets and frogs at dusk, an owl at night, water against the hull,
+## Lake soundscape: birds by day, frogs at dusk, an owl at night, water against the hull,
 ## reeds rustling. Music in three layers that fade in as lanterns light.
 
 const RATE_HI := 22050
@@ -15,7 +15,6 @@ var _next := 0
 var _layers: Array[AudioStreamPlayer] = []
 var _hull: AudioStreamPlayer
 var _reeds: AudioStreamPlayer
-var _crickets: AudioStreamPlayer
 var _ambience_pitch := -1.0
 var _active := false
 var _progress := 0.0
@@ -39,8 +38,7 @@ func _ready() -> void:
 		_layers.append(l)
 	_hull = AudioStreamPlayer.new()
 	_reeds = AudioStreamPlayer.new()
-	_crickets = AudioStreamPlayer.new()
-	for p in [_hull, _reeds, _crickets]:
+	for p in [_hull, _reeds]:
 		p.volume_db = -60.0
 		add_child(p)
 	_thread = Thread.new()
@@ -56,7 +54,7 @@ func _generate() -> void:
 	var out := {
 		"chime": _make_chime(), "whoosh": _make_whoosh(), "bump": _make_bump(), "tap": _make_tap(),
 		"pad": _make_pad(), "shimmer": _make_shimmer(), "bells": _make_bells(),
-		"hull": _make_hull(), "reeds": _make_reeds(), "crickets": _make_crickets(),
+		"hull": _make_hull(), "reeds": _make_reeds(),
 		"bird": _make_bird(), "frog": _make_frog(), "owl": _make_owl(), "quack": _make_quack(),
 		"stamp": _make_stamp(), "snap": _make_snap(),
 	}
@@ -73,7 +71,6 @@ func _on_generated(out: Dictionary) -> void:
 	_layers[2].stream = S["bells"]
 	_hull.stream = S["hull"]
 	_reeds.stream = S["reeds"]
-	_crickets.stream = S["crickets"]
 	if _ambience_pitch > 0.0:
 		var p := _ambience_pitch
 		_ambience_pitch = -1.0
@@ -199,7 +196,7 @@ func set_progress(f: float) -> void:
 func apply_settings() -> void:
 	if not _ready_flag:
 		return
-	for p in _layers + [_hull, _reeds, _crickets]:
+	for p in _layers + [_hull, _reeds]:
 		if not p.playing and p.stream != null:
 			p.play()
 
@@ -219,7 +216,6 @@ func _process(delta: float) -> void:
 	_hull.volume_db = move_toward(_hull.volume_db, (-30.0 + 16.0 * _speed) if sound and _on_lake else -60.0, delta * 20.0)
 	_hull.pitch_scale = 0.85 + _speed * 0.3
 	_reeds.volume_db = move_toward(_reeds.volume_db, -10.0 if sound and _in_reeds else -60.0, delta * 40.0)
-	_crickets.volume_db = move_toward(_crickets.volume_db, (-40.0 + 22.0 * smoothstep(0.4, 0.9, _dusk)) if sound else -60.0, delta * 10.0)
 	if not sound:
 		return
 	_critter_t -= delta
@@ -452,17 +448,6 @@ func _make_reeds() -> AudioStreamWAV:
 		var hp := w - prev
 		prev = w
 		s[i] = hp * (0.4 + 0.6 * pow(absf(sin(TAU * t * 3.0 + sin(TAU * t))), 3.0))
-	return _to_wav(s, RATE_HI, true)
-
-
-func _make_crickets() -> AudioStreamWAV:
-	var secs := 2.0
-	var s := _buf(secs, RATE_HI)
-	for i in s.size():
-		var t := float(i) / RATE_HI
-		var chirp := 1.0 if fmod(t, 0.5) < 0.18 else 0.0
-		var pulse := 0.5 + 0.5 * sin(TAU * 30.0 * t)
-		s[i] = sin(TAU * 4400.0 * t) * chirp * pulse * 0.6 + sin(TAU * 4700.0 * (t + 0.21)) * (1.0 if fmod(t + 0.21, 0.66) < 0.14 else 0.0) * 0.3
 	return _to_wav(s, RATE_HI, true)
 
 

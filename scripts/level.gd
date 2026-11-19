@@ -8,15 +8,19 @@ signal map_requested(level: Node, travel_to: int, reveal: int)
 const DrawNode = preload("res://scripts/draw_node.gd")
 const Boat3D = preload("res://scripts/boat3d.gd")
 const WaterShader = preload("res://scripts/water.gdshader")
+const WaterGlintShader = preload("res://scripts/water_glint.gdshader")
 const LandShader = preload("res://scripts/land.gdshader")
 
 const SPEED := 150.0
 const REED_SPEED := 76.0
 const TURN_RATE := 2.5
 const WAKE_LIFE := 9.0
+const BEAM_LEN := 200.0  # the boat's headlight beam on the water
+const BEAM_WIDE := 200.0
 const CUT_FADE := 1.5
 const WAKE_STEP := 7.0
 const BOAT_RADIUS := 22.0  # the boat is about 2x its first size
+const JETTY_PAD := 20.0  # the boat's centre keeps this far from a jetty's deck (its moored spot is 30 off the end)
 const STERN := 32.0  # distance from the boat's centre to its stern, where the wake starts
 const BOW := 34.0
 const MIN_LOOP_AREA := 2600.0
@@ -34,10 +38,16 @@ const BOOST_MULT := 1.4
 const CHAIN_WINDOW := 4.5
 const CHAIN_BONUS := 3.0
 const FADE_TIME := 28.0
+const CATCH_TIME := 0.55  # the flame catching after the ember lands
 const DRIFT := Vector2(18, 12)
 const LANTERN_SOFT := 42.0  # the boat starts being eased away from a lantern here
 const LANTERN_HARD := 32.0  # and stops here: the hull just touching the lantern
-const DAY_BONUS := 0.25  # extra daylight from the ad, as a share of the lake's whole day
+const DAY_BONUS := 0.25  # the ad's headlight time: this share of the lake's whole time, plus 5 s
+# The headlight battery. On a day lake the sun runs first; when it sets with lanterns still dark the
+# headlight comes on by itself with a small free reserve. On a night lake it is on from the start and the
+# battery is the lake's whole time. When it runs flat the light dies (Lights out); an ad buys more.
+const RESERVE := 6.0
+const WARN := 3.5  # the last seconds: the light stutters, the bar blinks, the motor hum drops
 const MAX_REVIVES := 2
 const EMBER_FLIGHT := 0.55  # seconds an ember takes to arc from the boat to a lantern
 const EMBER_GAP := 0.4  # seconds between embers when one loop lights several lanterns
@@ -49,6 +59,8 @@ const CRASH_LINES := {
 		"Even herons misjudge the stones.", "Bump. The lake forgives you."],
 	"shore": ["The shore came up to meet you.", "Your bow found the sand.\nEasy does it.",
 		"You reached the edge of the lake.", "Beached, but only a little."],
+	"jetty": ["The jetty didn't move. You did.", "A knock on the planks.\nThe lanterns will wait.",
+		"Wood meets bow. Wood wins.", "Moored a little too hard."],
 }
 
 var lake_index := 0
@@ -71,6 +83,22 @@ var geo_static := false
 var trees: Array = []
 var lanterns: Array = []
 var jetty: Array = []
+var jet: Jetty = null  # the jetty, built from a seed: each lake's is different
+# The pickup parked on the bank beside the jetty, nose towards it, its empty trailer behind (the boat
+# is out on the lake). Rendered once from the same rig as the map's (rig3d.gd).
+const LAKE_PX_PER_M := 7.1  # the boat model is about 70 px long for its 9.85 m
+const RIG_RENDER := 384
+const RIG_VIEW_M := 26.0
+const PICKUP_M := 8.7  # the drawn pickup's length (rig3d.gd scales it up), and the trailer's
+const TRAILER_M := 11.8
+var rig_hitch := Vector2.ZERO  # where the trailer meets the pickup
+var rig_bend := 0.0  # the trailer swung round behind the pickup
+var rig_tracks: Array = []  # tyre tracks on the grass, each a polyline
+var rig_steps: Array = []  # footprints: [position, direction]
+var rig_ok := false  # a parking spot was found (nowhere fits: no rig rather than one in the water)
+var rig_dir := 0.0  # the way the pickup faces: along the bank, towards the jetty
+var rig_tex: Texture2D
+var rig_anchor := Vector2.ZERO
 
 # State
 var state := "ready"
@@ -89,6 +117,9 @@ var loop_base := 0
 var loops_used := 0
 var flashes: Array = []
 var ripples: Array = []
+var spores: Array = []  # specks drifting through the headlight beam
+var spore_clock := 0.0
+var glint_mat: ShaderMaterial  # the headlight caught by the water's ripple lines
 var motes: Array = []
 var events: Array = []
 var ripple_timer := 0.0
@@ -128,16 +159,17 @@ var history_t := 0.0
 var scrape_until := -10.0  # boat is rubbing the shore: slowed like in reeds
 var scrape_fx := 0.0
 var leaving := false  # a new lake or the map has been asked for; ignore further taps
+var night := false
+var dusk_start := 0.0  # how far into the evening the lake starts (tint only)
+var battery := -1.0  # seconds of headlight left; -1 while the sun is still up
+var battery_max := 1.0
 # Zooming between the map and this lake: in from the lake's picture when it starts, out to it when
 # leaving for the map. No HUD or input meanwhile; a fresh tap skips to the end.
-const ZOOM_IN := 0.8
 var zoom_from = null  # the map (map.gd), while this lake zooms in from it
 var zooming := false
 var zoom_in_t := -1.0
 var skip_armed := false  # a touch began during the zoom in; only its lift skips
-var zoom_k := 0.0  # 0 = full screen, 1 = the size of the lake's picture on the map
 var newly_unlocked := -1  # the lake this win opened, for the map to show
-var land_node: Polygon2D
 var tree_layer: Node2D
 var light_layer: CanvasLayer
 var ui_layer: CanvasLayer
@@ -170,34 +202,56 @@ func _ready() -> void:
 	heading = s[2]
 	move_dir = heading
 	Sfx.start_ambience(float(lake["pitch"]))
+	night = Game.is_night(lake_index)
+	dusk_start = float(lake.get("dusk_start", 0.0))
+	Game.set_rig(lake_index)  # the pickup is parked by this lake now
+	if night:
+		battery = duration
+		battery_max = duration
+	if rig_ok and Game.dev_on("boat3d"):
+		_render_parked_rig()
 	if is_instance_valid(zoom_from):
 		zooming = true
 		zoom_in_t = 0.0
 		ui_layer.visible = false
 		zoom_from.tint_node.visible = false
-		set_zoom(1.0, zoom_from.thumb_origin(lake_index), zoom_from.thumb_scale(), zoom_from.tint_color)
+		zoom_from.begin_enter(lake_index)
+		_set_shown(0.0, zoom_from.tint_color)
+		_set_growth(0.0)
 
 
-## Places the lake between full screen (e = 0) and its picture on the map (e = 1): the land and trees
-## fade away, the light layer follows, and near the end the whole lake fades into the map's picture.
-func set_zoom(e: float, origin: Vector2, thumb: float, tint: Color) -> void:
-	zoom_k = e
-	var s := lerpf(1.0, thumb, e)
-	world.scale = Vector2(s, s)
-	world.position = off.lerp(origin, e)
-	light_layer.scale = world.scale
-	light_layer.offset = world.position
-	var ground := 1.0 - smoothstep(0.0, 0.55, e)
-	# The ground stays fixed to the screen and only fades, so its square edge never shows.
-	land_node.scale = Vector2.ONE / s
-	land_node.position = (off - world.position) / s
-	land_node.modulate.a = ground
-	tree_layer.modulate.a = ground
-	light_node.modulate.a = 1.0 - smoothstep(0.4, 0.9, e)
-	world.modulate.a = 1.0 - smoothstep(0.8, 1.0, e)
-	modulate_node.color = _day_tint().lerp(tint, smoothstep(0.0, 0.5, e))
-	if e > 0.0:
-		ui_layer.visible = false
+# ---------------------------------------------------------------- between the map and this lake
+# Setting off: the map's camera dives in on the lake's picture until it is this screen's size (map.gd),
+# then this lake fades in over it and its trees grow up, the ones by the water first. Leaving runs it
+# backwards: the trees shrink away, the lake fades into the map's picture and the camera pulls back.
+const ENTER_CAM := 0.6  # the map's camera diving in
+const ENTER_SHOW := 0.25  # this lake fading in over the map's picture
+const GROW_TIME := 0.65  # all the trees growing
+const LEAVE_HAND := 0.75  # leaving: when the map has taken over
+
+var growth := 1.0  # 0 = no trees yet, 1 = all grown
+
+
+func _set_shown(k: float, tint: Color) -> void:
+	world.modulate.a = k
+	light_node.modulate.a = k
+	modulate_node.color = tint.lerp(_day_tint(), k)
+
+
+func _set_growth(g: float) -> void:
+	growth = g
+	tree_layer.queue_redraw()
+
+
+## A tree's size while they grow: it pops up with a little overshoot, starting later the farther it is
+## from the water (each tree's "d").
+func _tree_size(t: Dictionary) -> float:
+	if growth >= 1.0:
+		return 1.0
+	var k := clampf((growth - float(t["d"])) / 0.5, 0.0, 1.0)
+	if k <= 0.0:
+		return 0.0
+	return 1.0 + 2.4 * pow(k - 1.0, 3.0) + 1.4 * pow(k - 1.0, 2.0)
 
 
 ## The victory or pause screen fading away at the start of a zoom out.
@@ -206,30 +260,164 @@ func set_overlay_alpha(a: float) -> void:
 		overlay.modulate.a = a
 
 
+## The map drives this while the lake hands back to it; t is seconds since leaving.
+func leave_step(t: float, tint: Color) -> void:
+	set_overlay_alpha(1.0 - clampf(t / 0.3, 0.0, 1.0))
+	_set_growth(1.0 - clampf((t - 0.05) / 0.5, 0.0, 1.0))
+	_set_shown(1.0 - smoothstep(0.45, LEAVE_HAND, t), tint)
+
+
 func _day_tint() -> Color:
-	return Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, dusk) * 0.92)
+	var t := 1.0 if night else dusk_start + (1.0 - dusk_start) * dusk
+	var c := Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, t) * 0.92)
+	return c.darkened(0.3) if night else c
+
+
+## How bright the headlight is, 0..1: off while the sun is up, stuttering in the last seconds and as it dies.
+func _headlight() -> float:
+	if state == "dying":
+		var on := 1.0 if sin(clock * 41.0) * sin(clock * 23.0) > 0.0 else 0.2
+		return on * clampf(end_timer, 0.0, 1.0)
+	if battery < 0.0 or state in ["over", "crashed"]:
+		return 0.0
+	if battery < WARN and state == "play":
+		var v := 0.55 + 0.45 * battery / WARN
+		if sin(clock * 31.0) * sin(clock * 17.3) > 0.35:
+			v *= 0.3
+		return v
+	return 1.0
 
 
 func _end_zoom_in() -> void:
 	zoom_in_t = -1.0
 	zooming = false
-	zoom_k = 0.0
-	world.scale = Vector2.ONE
-	world.position = off
-	light_layer.scale = Vector2.ONE
-	light_layer.offset = off
-	land_node.modulate.a = 1.0
-	land_node.scale = Vector2.ONE
-	land_node.position = Vector2.ZERO
-	tree_layer.modulate.a = 1.0
-	light_node.modulate.a = 1.0
-	world.modulate.a = 1.0
+	_set_shown(1.0, Color.WHITE)
+	_set_growth(1.0)
 	if is_instance_valid(zoom_from):
 		zoom_from.queue_free()
 	zoom_from = null
 	ui_layer.visible = true
 	ui_root.modulate.a = 0.0
 	ui_root.create_tween().tween_property(ui_root, "modulate:a", 1.0, 0.25)
+
+
+## Parks the pickup on the bank beside the jetty, nose towards it: as close behind the jetty's shore end as
+## it fits with the whole pickup and trailer on dry land and on screen, on the lake's preferred side first.
+func _park_rig() -> void:
+	var d: Vector2 = (Vector2(jetty[1]) - Vector2(jetty[0])).normalized()
+	var bank := Game.offset_largest(water, 16.0)
+	# Parked the way people really leave a rig by a lake, not squared up: the pickup a little askew and
+	# the trailer swung round behind it. Each lake has its own angles (seeded), and they are dropped
+	# step by step until the whole rig fits on dry land.
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 811 * (lake_index + 1)
+	var bend := rng.randf_range(0.32, 0.55) * (1.0 if rng.randf() < 0.5 else -1.0)
+	var skew := rng.randf_range(-0.22, 0.22)
+	var tries := [[skew, bend], [skew, -bend], [skew * 0.5, bend * 0.6], [skew * 0.5, -bend * 0.6], [0.0, 0.0]]
+	for tb in tries:
+		for sign in [float(lake["rig"]), -float(lake["rig"])]:
+			var s: Vector2 = d.orthogonal() * float(sign)
+			for back in range(10, 130, 4):
+				var hitch: Vector2 = Vector2(jetty[0]) - d * back + s * (PICKUP_M * LAKE_PX_PER_M + 22.0)
+				var dir := (-s).angle() + float(tb[0])
+				if _rig_fits(hitch, dir, float(tb[1]), bank):
+					rig_hitch = hitch
+					rig_dir = dir
+					rig_bend = float(tb[1])
+					rig_ok = true
+					_leftovers(rng)
+					return
+
+
+## Whether the pickup (ahead of the hitch) and the trailer (behind it, swung by `bend`) are all on land
+## and on screen even on the shortest phones.
+func _rig_fits(hitch: Vector2, dir: float, bend: float, bank: PackedVector2Array) -> bool:
+	var fwd := Vector2.from_angle(dir)
+	var back := -Vector2.from_angle(dir + bend)
+	for part in [[fwd, PICKUP_M], [back, TRAILER_M]]:
+		var pd: Vector2 = part[0]
+		var across := pd.orthogonal()
+		for k in 9:
+			var q: Vector2 = hitch + pd * float(part[1]) * LAKE_PX_PER_M * (k / 8.0)
+			for w in [-13.0, 13.0]:
+				var e: Vector2 = q + across * w
+				if Geometry2D.is_point_in_polygon(e, bank) or e.x < 16.0 or e.y < 16.0 \
+						or e.x > Game.LAKE_SIZE.x - 16.0 or e.y > Game.LAKE_SIZE.y - 16.0:
+					return false
+	return true
+
+
+## Signs that someone drove in and walked down to the jetty: tyre tracks curving in behind the trailer
+## and the pickup, and footprints from the driver's door to the jetty.
+func _leftovers(rng: RandomNumberGenerator) -> void:
+	var fwd := Vector2.from_angle(rig_dir)
+	var tdir := -Vector2.from_angle(rig_dir + rig_bend)  # from the hitch back along the trailer
+	var turn := signf(rig_bend) * 0.035  # the curve they came in on, carried on behind
+	# The trailer's wheels, and the pickup's back wheels (which ran in through the hitch, then the trailer's path).
+	var trailer_axle := rig_hitch + tdir * TRAILER_M * LAKE_PX_PER_M * 0.72
+	var rear := rig_hitch + fwd * PICKUP_M * LAKE_PX_PER_M * 0.22
+	var paths: Array = []
+	var tp := PackedVector2Array([trailer_axle])
+	var tpd := tdir
+	for k in 26:
+		tpd = tpd.rotated(turn)
+		tp.append(tp[tp.size() - 1] + tpd * 6.0)
+	paths.append([tp, 11.0])
+	var pp := PackedVector2Array([rear, rig_hitch])
+	var steps := int(TRAILER_M * LAKE_PX_PER_M / 6.0)
+	for k in steps:
+		pp.append(rig_hitch + tdir * 6.0 * (k + 1))
+	var ppd := tdir
+	for k in 26:
+		ppd = ppd.rotated(turn)
+		pp.append(pp[pp.size() - 1] + ppd * 6.0)
+	paths.append([pp, 12.5])
+	for path in paths:
+		var pts: PackedVector2Array = path[0]
+		for side in [-1.0, 1.0]:
+			var line := PackedVector2Array()
+			for k in pts.size():
+				var dd := (pts[mini(k + 1, pts.size() - 1)] - pts[maxi(k - 1, 0)]).normalized()
+				var q: Vector2 = pts[k] + dd.orthogonal() * float(path[1]) * side
+				if Geometry2D.is_point_in_polygon(q, water):
+					break
+				line.append(q)
+			if line.size() > 1:
+				rig_tracks.append(line)
+	# Footprints from the driver's door to the start of the jetty.
+	var door := rig_hitch + fwd * PICKUP_M * LAKE_PX_PER_M * 0.55
+	var to: Vector2 = Vector2(jetty[0])
+	door += fwd.orthogonal() * (16.0 if fwd.orthogonal().dot(to - door) > 0.0 else -16.0)
+	var walk := door.distance_to(to)
+	var wd := (to - door).normalized()
+	var k := 0
+	var dist := 6.0
+	while dist < walk - 6.0:
+		var fp := door + wd * dist + wd.orthogonal() * (2.6 if k % 2 == 0 else -2.6) + Vector2(rng.randf_range(-0.6, 0.6), rng.randf_range(-0.6, 0.6))
+		if not Geometry2D.is_point_in_polygon(fp, water):
+			rig_steps.append([fp, wd.angle()])
+		dist += 8.0
+		k += 1
+
+
+## Renders the parked pickup and empty trailer once, keeps the picture and lets the 3D scene go.
+func _render_parked_rig() -> void:
+	var r: SubViewport = load("res://scripts/rig3d.gd").new()
+	r.render_px = RIG_RENDER
+	r.view_m = RIG_VIEW_M
+	r.show_boat = false
+	add_child(r)
+	r.set_pose(rig_dir, rig_bend)
+	r.render_target_update_mode = SubViewport.UPDATE_ONCE
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	if not is_instance_valid(r):
+		return
+	var img := r.get_texture().get_image()
+	img.generate_mipmaps()
+	rig_tex = ImageTexture.create_from_image(img)
+	rig_anchor = r.anchor()
+	r.queue_free()
 
 
 ## Leave for the map with the zoom out. next: from the victory screen, so the boat then sails on.
@@ -334,8 +522,19 @@ func _build_geometry() -> void:
 		idx += 1
 
 	var j: Array = lake["jetty"]
-	if j.size() == 4:
+	if j.size() >= 4:
 		jetty = [Vector2(j[0], j[1]), Vector2(j[2], j[3])]
+		var avoid: Array = [[Vector2(lake["start"][0], lake["start"][1]), 22.0]]
+		for l in lanterns:
+			avoid.append([l["p"], 44.0])
+		for r in rocks:
+			avoid.append([r["c"], float(r["r"]) + 12.0])
+		for r in reeds:
+			avoid.append([r["c"], float(r["r"]) + 8.0])
+		jet = Jetty.build(jetty[0], jetty[1], String(j[4]) if j.size() > 4 else "", 977 * (lake_index + 1),
+			pal["wood"], water, avoid, Game.is_night(lake_index))
+	if lake.has("rig") and jetty.size() == 2:
+		_park_rig()
 
 	_place_trees(rng)
 
@@ -360,6 +559,19 @@ func _place_trees(rng: RandomNumberGenerator) -> void:
 			var cp := Geometry2D.get_closest_point_to_segment(p, jetty[0], jetty[1])
 			if p.distance_to(cp) < r + 30.0:
 				continue
+		if rig_ok:
+			var near_rig := false
+			var ends := [rig_hitch + Vector2.from_angle(rig_dir) * PICKUP_M * LAKE_PX_PER_M,
+				rig_hitch - Vector2.from_angle(rig_dir + rig_bend) * TRAILER_M * LAKE_PX_PER_M]
+			for e in ends:
+				if p.distance_to(Geometry2D.get_closest_point_to_segment(p, rig_hitch, e)) < r + 20.0:
+					near_rig = true
+			for line in rig_tracks:
+				for k in range(0, line.size(), 3):
+					if p.distance_to(line[k]) < r + 6.0:
+						near_rig = true
+			if near_rig:
+				continue
 		var ok := true
 		for t in trees:
 			if p.distance_to(t["p"]) < (r + float(t["r"])) * 0.62:
@@ -372,6 +584,18 @@ func _place_trees(rng: RandomNumberGenerator) -> void:
 			parts.append([Vector2.from_angle(rng.randf() * TAU) * r * 0.55, r * rng.randf_range(0.5, 0.75)])
 		trees.append({"p": p, "r": r, "parts": parts})
 	trees.sort_custom(func(a, b): return a["p"].y < b["p"].y)
+	var mid := Vector2.ZERO
+	for q in water:
+		mid += q
+	mid /= maxf(1.0, water.size())
+	var near := INF
+	var far := 0.0
+	for t in trees:
+		var d := Vector2(t["p"]).distance_to(mid)
+		near = minf(near, d)
+		far = maxf(far, d)
+	for t in trees:
+		t["d"] = 0.5 * clampf((Vector2(t["p"]).distance_to(mid) - near) / maxf(1.0, far - near), 0.0, 1.0)
 
 
 func _build_nodes() -> void:
@@ -380,7 +604,6 @@ func _build_nodes() -> void:
 	add_child(world)
 
 	var land := Polygon2D.new()
-	land_node = land
 	land.polygon = PackedVector2Array([-off, Vector2(view_size.x - off.x, -off.y),
 		view_size - off, Vector2(-off.x, view_size.y - off.y)])
 	var lm := ShaderMaterial.new()
@@ -408,6 +631,11 @@ func _build_nodes() -> void:
 	detail_node = DrawNode.new()
 	detail_node.draw_fn = _draw_details
 	world.add_child(detail_node)
+	if jet:
+		var jn := DrawNode.new()  # drawn once: the jetty never changes
+		var jshade := Color(0.04, 0.07, 0.08, 0.38)  # neutral, so it reads as shadow on water and grass alike
+		jn.draw_fn = func(n: Node2D) -> void: jet.draw(n, jshade)
+		world.add_child(jn)
 	if Game.dev_on("boat3d"):
 		boat3d = Boat3D.new()
 		add_child(boat3d)
@@ -433,12 +661,22 @@ func _build_nodes() -> void:
 	light_layer.layer = 1
 	light_layer.offset = off
 	add_child(light_layer)
+	# The water's ripple lines lit where the headlight falls on them (water only, so never on land).
+	var glint := Polygon2D.new()
+	glint.polygon = water
+	glint_mat = ShaderMaterial.new()
+	glint_mat.shader = WaterGlintShader
+	glint_mat.set_shader_parameter("len", BEAM_LEN)
+	glint_mat.set_shader_parameter("wide", BEAM_WIDE)
+	glint_mat.set_shader_parameter("col", Color(1.0, 0.95, 0.84))
+	glint.material = glint_mat
 	light_node = DrawNode.new()
 	var add := CanvasItemMaterial.new()
 	add.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
 	light_node.material = add
 	light_node.draw_fn = _draw_light
 	light_layer.add_child(light_node)
+	light_node.add_child(glint)  # fades in and out with the rest of the light
 
 
 func _build_ui() -> void:
@@ -477,11 +715,17 @@ func _process(delta: float) -> void:
 	bump_cool -= delta
 	if zoom_in_t >= 0.0:
 		zoom_in_t += delta
-		var zk := clampf(zoom_in_t / ZOOM_IN, 0.0, 1.0)
-		if is_instance_valid(zoom_from) and zk < 1.0:
-			set_zoom(1.0 - zk * zk * (3.0 - 2.0 * zk), zoom_from.thumb_origin(lake_index), zoom_from.thumb_scale(), zoom_from.tint_color)
-			zoom_from.ui_root.modulate.a = 1.0 - smoothstep(0.0, 0.5, zk)
-		else:
+		var t := zoom_in_t
+		if is_instance_valid(zoom_from):
+			var ck := clampf(t / ENTER_CAM, 0.0, 1.0)
+			zoom_from.set_enter_cam(ck * ck * (3.0 - 2.0 * ck))
+			zoom_from.ui_root.modulate.a = 1.0 - smoothstep(0.0, 0.35, t)
+			_set_shown(smoothstep(ENTER_CAM - 0.05, ENTER_CAM + ENTER_SHOW, t), zoom_from.tint_color)
+			if t >= ENTER_CAM + ENTER_SHOW:
+				zoom_from.queue_free()
+				zoom_from = null
+		_set_growth(clampf((t - ENTER_CAM) / GROW_TIME, 0.0, 1.0))
+		if t >= ENTER_CAM + GROW_TIME:
 			_end_zoom_in()
 	match state:
 		"ready":
@@ -495,6 +739,14 @@ func _process(delta: float) -> void:
 			elapsed += delta
 			dusk = clampf(elapsed / duration, 0.0, 1.0)
 			run_time += delta
+			if battery >= 0.0:
+				battery = maxf(0.0, battery - delta)
+			elif dusk >= 1.0 and _lit_count() < lanterns.size():
+				# Sunset: the headlight comes on by itself, a few seconds of reserve.
+				battery = RESERVE
+				battery_max = RESERVE
+				_float("Headlight on", boat_pos - Vector2(0, 40))
+				Sfx.tap()
 			_move_boat(delta, true)
 			history_t -= delta
 			if history_t <= 0.0 and state == "play":
@@ -502,7 +754,15 @@ func _process(delta: float) -> void:
 				history.append(boat_pos)
 				if history.size() > 12:
 					history.remove_at(0)
-			if dusk >= 1.0 and state == "play" and _lit_count() < lanterns.size():
+			if battery == 0.0 and state == "play" and _lit_count() < lanterns.size():
+				state = "dying"  # the light flickers out, then Lights out
+				end_timer = 1.0
+				touches.clear()
+				Sfx.fade_out()
+		"dying":
+			_move_boat(delta, false)
+			end_timer -= delta
+			if end_timer <= 0.0:
 				_show_game_over("dark")
 		"complete", "dark":
 			_move_boat(delta, false)
@@ -522,19 +782,20 @@ func _process(delta: float) -> void:
 	_run_events()
 	_update_effects(delta)
 	if boat3d:
-		var shown := 1.0 - smoothstep(0.0, 0.3, zoom_k)  # the map draws its own boat when zoomed out
+		var shown := 1.0
 		boat_sprite.position = boat_pos
 		boat_sprite.modulate.a = (1.0 - 0.9 * boat3d.sunk()) * shown
 		boat_shadow.position = boat_pos + Vector2(-12, 16)
 		boat_shadow.modulate.a = 0.32 * (1.0 - boat3d.sunk()) * shown
 		# A gentle rock and pitch on top of the lean into turns, so it sits in the water.
-		var lean := -turn_vel / TURN_RATE * 0.2 + sin(clock * 1.3) * 0.035
+		var lean := -turn_vel / TURN_RATE * 0.36 + sin(clock * 1.3) * 0.035  # leans well into turns, so its depth shows
 		var pitch := speed / SPEED * 0.05 + sin(clock * 1.9) * 0.03
 		boat3d.set_pose(_vis_heading(), lean, pitch, 0.0)
 	if state == "leaving":
 		pass  # the map has the sound now
 	elif state in ["ready", "play"]:
-		Sfx.set_mood(dusk, speed / SPEED, _in_reeds(boat_pos))
+		var hum := 0.45 if battery >= 0.0 and battery < WARN else 1.0  # the motor drops as the battery goes
+		Sfx.set_mood(dusk, speed / SPEED * hum, _in_reeds(boat_pos))
 	else:
 		Sfx.set_mood(dusk, 0.0, false)
 
@@ -567,7 +828,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			if event.pressed:
 				skip_armed = true
 			elif skip_armed:
-				zoom_in_t = ZOOM_IN  # skip to the end
+				zoom_in_t = ENTER_CAM + GROW_TIME  # skip to the end
 		return
 	if event is InputEventScreenTouch:
 		if event.pressed:
@@ -618,10 +879,14 @@ func _move_boat(delta: float, steering: bool) -> void:
 	if not _free(np):
 		var moved := false
 		var hit_rock := _hits_rock(np)
-		var shore: Array = [] if hit_rock else _shore_info(boat_pos)
-		# Head-on into the shore breaks the boat; a glancing touch only slows it.
+		var jn: Array = jet.nearest(np) if jet else [INF, Vector2.ZERO]
+		var hit_jetty := not hit_rock and float(jn[0]) < JETTY_PAD
+		var shore: Array = [] if hit_rock or hit_jetty else _shore_info(boat_pos)
+		# Head-on into the shore or a jetty breaks the boat; a glancing touch only slows it.
 		var head_on := false
-		if not hit_rock:
+		if hit_jetty:
+			head_on = Vector2.from_angle(move_dir).dot(-Vector2(jn[1])) > 0.7 and speed > 70.0
+		elif not hit_rock:
 			head_on = Vector2.from_angle(move_dir).dot(-Vector2(shore[1])) > 0.7 and speed > 70.0
 		var pref := 1.0 if _turn_input() >= 0 else -1.0
 		var bend := 0
@@ -639,12 +904,12 @@ func _move_boat(delta: float, steering: bool) -> void:
 			if moved:
 				break
 		if state == "play" and Game.dev_on("crash") and (hit_rock or head_on or not moved):
-			_crash("rock" if hit_rock else "shore")
+			_crash("rock" if hit_rock else "jetty" if hit_jetty else "shore")
 			return
 		if not moved:
 			heading += PI * 0.5
 			return
-		if hit_rock:
+		if hit_rock or hit_jetty:
 			speed *= 0.86
 		else:
 			_scrape(shore)
@@ -689,6 +954,8 @@ func _vis_heading() -> float:
 
 func _free(p: Vector2) -> bool:
 	if not Geometry2D.is_point_in_polygon(p, inner):
+		return false
+	if jet and float(jet.nearest(p)[0]) < JETTY_PAD:
 		return false
 	for r in rocks:
 		if p.distance_to(r["c"]) < float(r["r"]) + BOAT_RADIUS:
@@ -913,7 +1180,9 @@ func _add_wake_point(p: Vector2, detect: bool) -> void:
 			var poly := PackedVector2Array([hit_x])
 			for k in range(hit_j + 1, n):
 				poly.append(wp[k])
-			loop_base = n
+			# Crossing its own trail cuts it there, like a duck does: the older tail snaps off, and the
+			# fresh loop stays live, so it can close the next loop.
+			_snap_trail(hit_j, hit_x, false)
 			_on_loop(poly)
 	wp.append(p)
 	wt.append(clock)
@@ -1006,6 +1275,36 @@ func _partner(i: int) -> int:
 	return i
 
 
+## Where a lantern's float sits on the water now (it bobs a little).
+func _lantern_pos(l: Dictionary) -> Vector2:
+	return Vector2(l["p"]) + Vector2(0, sin(clock * 1.6 + float(l["bob"])) * 1.6)
+
+
+## Where its flame is: inside the glass, above the float.
+func _glass_pos(l: Dictionary) -> Vector2:
+	var p := _lantern_pos(l)
+	if Game.lantern_lit:
+		return p + (Game.lantern_glass - Game.lantern_anchor) * Game.LANTERN_SCALE
+	return p
+
+
+## How lit a lantern looks, 0..1: the flame catches over CATCH_TIME, and fades when it goes out.
+func _lantern_on(l: Dictionary) -> float:
+	if l["lit"]:
+		var since := clock - float(l["lit_t"])
+		return smoothstep(0.0, CATCH_TIME, since) if since >= 0.0 else 0.0
+	return 1.0 - smoothstep(0.0, 0.6, clock - float(l.get("out_t", -10.0)))
+
+
+## A slightly uneven flicker for a lantern's light; it sputters in the last seconds before it goes out.
+func _flicker(l: Dictionary, warn: bool) -> float:
+	var b := float(l["bob"])
+	var f := 1.0 + 0.05 * sin(clock * 13.0 + b) + 0.04 * sin(clock * 7.3 + b * 2.0)
+	if warn and sin(clock * 23.0 + b) * sin(clock * 9.7) > 0.35:
+		f *= 0.55
+	return f
+
+
 func _lit_count() -> int:
 	var c := 0
 	for l in lanterns:
@@ -1028,7 +1327,7 @@ func _run_events() -> void:
 				Game.vibrate(22)
 				ripples.append({"p": l["p"], "t": clock, "life": 1.8, "r0": 10.0, "r1": 90.0, "light": true})
 				for k in 16:
-					_part(l["p"], Vector2.from_angle(randf() * TAU) * randf_range(40, 120), randf_range(0.5, 1.1), randf_range(1.6, 3.2), pal["light"], true)
+					_part(_glass_pos(l), Vector2.from_angle(randf() * TAU) * randf_range(40, 120), randf_range(0.5, 1.1), randf_range(1.6, 3.2), pal["light"], true)
 				Sfx.set_progress(float(_lit_count()) / lanterns.size())
 			"chord":
 				Sfx.chord(float(lake["pitch"]))
@@ -1058,7 +1357,7 @@ func _update_effects(delta: float) -> void:
 		if clock < float(e["t0"]) + EMBER_FLIGHT:
 			keep_e.append(e)
 		else:
-			var lp: Vector2 = lanterns[e["i"]]["p"]
+			var lp: Vector2 = _glass_pos(lanterns[e["i"]])
 			for k in 6:
 				_part(lp, Vector2.from_angle(randf() * TAU) * randf_range(20, 70), randf_range(0.3, 0.6), randf_range(1.6, 2.6), Color("fff1c8"), true)
 	embers = keep_e
@@ -1071,6 +1370,10 @@ func _update_effects(delta: float) -> void:
 			if clock - float(l["lit_t"]) > FADE_TIME:
 				l["lit"] = false
 				l["lit_t"] = 1e9
+				l["out_t"] = clock
+				var top := _glass_pos(l) + Vector2(0, -16)
+				for k in 8:
+					_part(top + Vector2(randf_range(-2, 2), 0), Vector2(randf_range(-6, 6), randf_range(-40, -18)), randf_range(0.9, 1.5), randf_range(2.0, 3.4), Color(0.86, 0.88, 0.88, 0.5), false)
 				Sfx.fade_out()
 				Sfx.set_progress(float(_lit_count()) / lanterns.size())
 				ripples.append({"p": l["p"], "t": clock, "life": 1.2, "r0": 8.0, "r1": 30.0, "light": false})
@@ -1352,34 +1655,54 @@ func _aa_poly(n: Node2D, poly: PackedVector2Array, col: Color) -> void:
 func _draw_trees(n: Node2D) -> void:
 	var shadow: Color = pal["shadow"]
 	shadow.a = 0.5
+	var sizes := PackedFloat32Array()
 	for t in trees:
+		sizes.append(_tree_size(t))
+	for i in trees.size():
+		var g := sizes[i]
+		if g <= 0.0:
+			continue
+		var t: Dictionary = trees[i]
 		for part in t["parts"]:
-			n.draw_circle(t["p"] + part[0] + Vector2(8, 10), part[1], shadow, true, -1.0, true)
-	for t in trees:
+			n.draw_circle(t["p"] + (part[0] + Vector2(8, 10)) * g, part[1] * g, shadow, true, -1.0, true)
+	for i in trees.size():
+		var g := sizes[i]
+		if g <= 0.0:
+			continue
+		var t: Dictionary = trees[i]
 		for part in t["parts"]:
-			n.draw_circle(t["p"] + part[0], part[1], pal["tree"], true, -1.0, true)
+			n.draw_circle(t["p"] + part[0] * g, part[1] * g, pal["tree"], true, -1.0, true)
 		for part in t["parts"]:
-			var r: float = part[1]
-			n.draw_circle(t["p"] + part[0] + Vector2(-r * 0.22, -r * 0.24), r * 0.62, pal["tree_hi"], true, -1.0, true)
+			var r: float = part[1] * g
+			n.draw_circle(t["p"] + part[0] * g + Vector2(-r * 0.22, -r * 0.24), r * 0.62, pal["tree_hi"], true, -1.0, true)
 
 
 func _draw_details(n: Node2D) -> void:
 	var shade: Color = pal["deep"].darkened(0.45)
 	shade.a = 0.55
 
-	if jetty.size() == 2:
-		var a: Vector2 = jetty[0]
-		var b: Vector2 = jetty[1]
-		n.draw_line(a + Vector2(5, 7), b + Vector2(5, 7), shade, 24.0)
-		n.draw_line(a, b, pal["wood"], 22.0)
-		var dir := (b - a).normalized()
-		var side := dir.orthogonal() * 11.0
-		var len := a.distance_to(b)
-		var d := 6.0
-		while d < len:
-			var p := a + dir * d
-			n.draw_line(p - side, p + side, pal["wood"].darkened(0.3), 2.0)
-			d += 10.0
+	# Tyre tracks and footprints first, under the rig: someone drove in and walked to the jetty.
+	for tr in rig_tracks:
+		var line: PackedVector2Array = tr
+		for k in range(1, line.size()):
+			var fade := 1.0 - float(k) / line.size()
+			n.draw_line(line[k - 1], line[k], Color(0.2, 0.16, 0.1, 0.2 * fade + 0.04), 2.6, true)
+	for st in rig_steps:
+		n.draw_set_transform(st[0], float(st[1]), Vector2(1.0, 0.62))
+		n.draw_circle(Vector2.ZERO, 2.3, Color(0.2, 0.16, 0.1, 0.22), true, -1.0, true)
+	n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	# The pickup parked beside the jetty with its empty trailer.
+	if rig_tex:
+		var sc := LAKE_PX_PER_M / (RIG_RENDER / RIG_VIEW_M)
+		var hitch := rig_hitch
+		n.draw_set_transform(hitch + Vector2(-5, 6), 0.0, Vector2.ONE * sc)
+		n.draw_texture(rig_tex, -rig_anchor, Color(shade, 0.5))
+		n.draw_set_transform(hitch, 0.0, Vector2.ONE * sc)
+		n.draw_texture(rig_tex, -rig_anchor)
+		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+	if jet:
+		jet.draw_water(n, clock)  # the water moving round the pilings, under the deck
 
 	for r in rocks:
 		var sh := PackedVector2Array()
@@ -1440,23 +1763,32 @@ func _draw_details(n: Node2D) -> void:
 		if j > i and not lanterns[j]["lit"]:
 			n.draw_dashed_line(l["p"], lanterns[j]["p"], Color(pair_col, 0.3), 2.0, 9.0)
 
+	# Storm lanterns standing on their floats (a 3D render, see lantern_art.gd), unlit with the lit
+	# picture over it as the flame catches. Rings for twins and refusals lie flat on the water.
 	for l in lanterns:
-		var p: Vector2 = l["p"] + Vector2(0, sin(clock * 1.6 + float(l["bob"])) * 1.6)
-		var lit_now: bool = l["lit"] and clock >= float(l["lit_t"])
-		n.draw_circle(p + Vector2(3, 4), 11.0, shade, true, -1.0, true)
-		if lit_now:
-			n.draw_circle(p, 10.0, pal["light"].lightened(0.25), true, -1.0, true)
-			n.draw_circle(p, 5.0, Color(1, 1, 1, 0.95), true, -1.0, true)
+		var p := _lantern_pos(l)
+		var on := _lantern_on(l)
+		if Game.lantern_lit:
+			n.draw_set_transform(p + Vector2(7, 2), 0.0, Vector2(1.0, 0.36))
+			n.draw_circle(Vector2.ZERO, 18.0, Color(shade, 0.4), true, -1.0, true)
+			n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+			var sz := Game.lantern_unlit.get_size() * Game.LANTERN_SCALE
+			var tl := p - Game.lantern_anchor * Game.LANTERN_SCALE
+			n.draw_texture_rect(Game.lantern_unlit, Rect2(tl, sz), false)
+			if on > 0.0:
+				n.draw_texture_rect(Game.lantern_lit, Rect2(tl, sz), false, Color(1, 1, 1, on))
 		else:
-			n.draw_circle(p, 10.0, pal["light"].darkened(0.6), true, -1.0, true)
-			n.draw_arc(p, 9.0, 0.0, TAU, 28, pal["light"].darkened(0.15), 2.0, true)
-			n.draw_circle(p, 4.0, pal["light"].darkened(0.3), true, -1.0, true)
+			n.draw_circle(p + Vector2(3, 4), 11.0, shade, true, -1.0, true)
+			n.draw_circle(p, 10.0, pal["light"].darkened(0.6).lerp(pal["light"].lightened(0.25), on), true, -1.0, true)
+		var lit_now: bool = l["lit"] and clock >= float(l["lit_t"])
+		n.draw_set_transform(p, 0.0, Vector2(1.0, 0.38))
 		if int(l["pair"]) != 0 and not lit_now:
-			n.draw_arc(p, 15.0, 0.0, TAU, 32, Color(pair_col, 0.8), 2.0, true)
+			n.draw_arc(Vector2.ZERO, 23.0, 0.0, TAU, 40, Color(pair_col, 0.85), 2.5, true)
 		var since := clock - float(l["reject_t"])
 		if since < 0.9:
 			var k := since / 0.9
-			n.draw_arc(p, 18.0 + k * 16.0, 0.0, TAU, 32, Color(pair_col, 0.9 * (1.0 - k)), 3.0, true)
+			n.draw_arc(Vector2.ZERO, 22.0 + k * 18.0, 0.0, TAU, 40, Color(pair_col, 0.9 * (1.0 - k)), 3.0, true)
+		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 	var petal: Color = pal["mote"]
 	if String(lake["motes"]) != "fireflies":
@@ -1473,7 +1805,7 @@ func _draw_details(n: Node2D) -> void:
 			continue
 		var ek := clampf((clock - float(e["t0"])) / EMBER_FLIGHT, 0.0, 1.0)
 		var ea: Vector2 = e["from"]
-		var eb: Vector2 = lanterns[e["i"]]["p"]
+		var eb: Vector2 = _glass_pos(lanterns[e["i"]])
 		var emid := (ea + eb) * 0.5 + Vector2(0, -minf(140.0, 60.0 + ea.distance_to(eb) * 0.35))
 		for s2 in range(6, -1, -1):
 			var kk := maxf(0.0, ek - s2 * 0.04)
@@ -1484,7 +1816,7 @@ func _draw_details(n: Node2D) -> void:
 			else:
 				n.draw_circle(ep, 4.2 - s2 * 0.5, Color(1.0, 0.62, 0.24, 0.75 - s2 * 0.1), true, -1.0, true)
 	var hull := PackedVector2Array(HULL)
-	if boat3d or zoom_k > 0.3:
+	if boat3d:
 		return
 	n.draw_set_transform(boat_pos + Vector2(6, 10), _vis_heading(), Vector2.ONE * 2.0)
 	n.draw_colored_polygon(hull, shade)
@@ -1515,7 +1847,7 @@ func _draw_light(n: Node2D) -> void:
 			continue
 		var k := clampf((clock - float(e["t0"])) / EMBER_FLIGHT, 0.0, 1.0)
 		var a: Vector2 = e["from"]
-		var b: Vector2 = lanterns[e["i"]]["p"]
+		var b: Vector2 = _glass_pos(lanterns[e["i"]])
 		var mid := (a + b) * 0.5 + Vector2(0, -minf(140.0, 60.0 + a.distance_to(b) * 0.35))
 		for s in range(7, -1, -1):
 			var kk := maxf(0.0, k - s * 0.04)
@@ -1537,26 +1869,42 @@ func _draw_light(n: Node2D) -> void:
 		RenderingServer.canvas_item_add_triangle_array(n.get_canvas_item(), tris, poly, cols)
 
 	for l in lanterns:
-		var p: Vector2 = l["p"]
-		if l["lit"] and clock >= float(l["lit_t"]):
-			var since := clock - float(l["lit_t"])
-			var pulse := 1.0 + 0.07 * sin(clock * 2.2 + float(l["bob"]))
-			if Game.dev_on("fading") and state == "play":
-				var left := clampf(1.0 - since / FADE_TIME, 0.0, 1.0)
-				pulse *= 0.45 + 0.55 * left
-				n.draw_arc(p, 15.0, -PI * 0.5, -PI * 0.5 + TAU * left, 32, Color(light, 0.8), 2.5, true)
+		var p := _lantern_pos(l)
+		var gp := _glass_pos(l)
+		var on := _lantern_on(l)
+		if on > 0.0:
+			var lit_now: bool = l["lit"] and clock >= float(l["lit_t"])
+			var since := clock - float(l["lit_t"]) if lit_now else 99.0
+			var left := 1.0
+			var fading: bool = lit_now and Game.dev_on("fading") and state == "play"
+			if fading:
+				left = clampf(1.0 - since / FADE_TIME, 0.0, 1.0)
+			var fl := _flicker(l, fading and left < 0.2)
+			var pulse := (1.0 + 0.06 * sin(clock * 2.2 + float(l["bob"]))) * fl * (0.7 + 0.3 * left)
 			var burst := maxf(0.0, 1.0 - since / 0.7)
-			var r := 110.0 * pulse + burst * 80.0
-			n.draw_texture_rect(glow, Rect2(p - Vector2(r, r), Vector2(r, r) * 2.0), false,
-				Color(light, (0.85 + burst * 0.3) * power))
-			var r2 := 42.0 * pulse
-			n.draw_texture_rect(glow, Rect2(p - Vector2(r2, r2), Vector2(r2, r2) * 2.0), false,
-				Color(light, 0.75 * power))
-			n.draw_texture_rect(glow, Rect2(p - Vector2(16, 16), Vector2(32, 32)), false, Color(1, 1, 1, 0.7))
+			# A wide soft light round it, kept low in the middle so the lantern still shows inside its glow,
+			# and a small bright core where the glass is.
+			var r := 120.0 * pulse + burst * 70.0
+			n.draw_texture_rect(glow, Rect2(gp - Vector2(r, r), Vector2(r, r) * 2.0), false,
+				Color(light, (0.42 + burst * 0.3) * power * on))
+			var r2 := 30.0 * pulse
+			n.draw_texture_rect(glow, Rect2(gp - Vector2(r2, r2), Vector2(r2, r2) * 2.0), false,
+				Color(light, 0.28 * power * on))
+			n.draw_texture_rect(glow, Rect2(gp - Vector2(7, 9), Vector2(14, 18)), false, Color(1, 0.9, 0.7, 0.35 * on * fl))
+			# Its reflection: a soft warm streak on the water under the float.
+			n.draw_set_transform(p + Vector2(0, 12), 0.0, Vector2(0.4, 1.3))
+			n.draw_texture_rect(glow, Rect2(-Vector2(24, 24), Vector2(48, 48)), false, Color(light, 0.38 * on * fl))
+			n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+			# The flame catching: a quick flash in the glass as the ember lands.
+			if since < 0.18:
+				var fk := since / 0.18
+				n.draw_texture_rect(glow, Rect2(gp - Vector2(20, 20) * (1.0 + fk), Vector2(40, 40) * (1.0 + fk)), false, Color(1, 1, 1, 0.9 * (1.0 - fk)))
+			if fading:
+				_draw_burn_ring(n, p, left, light)
 		else:
-			var r := 26.0
-			n.draw_texture_rect(glow, Rect2(p - Vector2(r, r), Vector2(r, r) * 2.0), false,
-				Color(light, 0.16 + 0.08 * sin(clock * 2.0 + float(l["bob"]))))
+			var r := 22.0
+			n.draw_texture_rect(glow, Rect2(gp - Vector2(r, r), Vector2(r, r) * 2.0), false,
+				Color(light, (0.2 if night else 0.08) + 0.05 * sin(clock * 2.0 + float(l["bob"]))))  # findable in the dark
 
 	for r in ripples:
 		if not r["light"]:
@@ -1567,6 +1915,18 @@ func _draw_light(n: Node2D) -> void:
 		var rad := lerpf(float(r["r0"]), float(r["r1"]), 1.0 - pow(1.0 - k, 3.0))
 		n.draw_arc(r["p"], rad, 0.0, TAU, 48, Color(light, 0.5 * (1.0 - k)), 2.5, true)
 
+	var hl := _headlight()
+	if glint_mat:
+		var vh := _vis_heading()
+		glint_mat.set_shader_parameter("power", 1.3 * hl)
+		glint_mat.set_shader_parameter("apex", boat_pos + Vector2.from_angle(vh) * BOW * 0.75)
+		glint_mat.set_shader_parameter("dir", Vector2.from_angle(vh))
+	if hl > 0.0:
+		_draw_headlight(n, hl)
+	if jet and jet.lamp != null:
+		var jl: Vector2 = jet.lamp
+		var jr := 30.0 + 4.0 * sin(clock * 3.0)
+		n.draw_texture_rect(glow, Rect2(jl - Vector2(jr, jr), Vector2(jr, jr) * 2.0), false, Color(light, 0.5 * power))
 	var bow := boat_pos + Vector2.from_angle(_vis_heading()) * 13.0
 	var lr := 44.0
 	n.draw_texture_rect(glow, Rect2(bow - Vector2(lr, lr), Vector2(lr, lr) * 2.0), false,
@@ -1580,6 +1940,90 @@ func _draw_light(n: Node2D) -> void:
 			var pos: Vector2 = m["p"]
 			n.draw_texture_rect(glow, Rect2(pos - Vector2(fr, fr), Vector2(fr, fr) * 2.0), false,
 				Color(fc, tw * (0.3 + 0.6 * dusk)))
+
+
+## The boat's headlight on the water: a soft beam, brightest just ahead of the bow and fading with distance.
+## The water's ripple lines catch it (water_glint.gdshader), so do the live ripple rings, and now and then
+## a spore drifts through it and lights up.
+func _draw_headlight(n: Node2D, hl: float) -> void:
+	var vh := _vis_heading()
+	var fwd := Vector2.from_angle(vh)
+	var apex := boat_pos + fwd * BOW * 0.75
+	var warm := Color(1.0, 0.95, 0.84)
+	Game.draw_beam(n, apex, vh, BEAM_LEN, BEAM_WIDE, Color(warm, 0.5 * hl))
+	n.draw_texture_rect(Game.glow_tex, Rect2(apex + fwd * 60.0 - Vector2(55, 55), Vector2(110, 110)), false, Color(warm, 0.12 * hl))
+	# The rings the boat, ducks and lanterns send out catch the light where they cross the beam on the water.
+	for r in ripples:
+		if r["light"]:
+			continue
+		var k := (clock - float(r["t"])) / float(r["life"])
+		if k < 0.0 or k >= 1.0:
+			continue
+		var c: Vector2 = r["p"]
+		var rad := lerpf(float(r["r0"]), float(r["r1"]), 1.0 - pow(1.0 - k, 2.0))
+		const SEG := 20
+		for i in SEG:
+			var a0 := TAU * i / SEG
+			var q := c + Vector2.from_angle(a0 + PI / SEG) * rad
+			var bw := _beam_at(q, apex, fwd)
+			if bw < 0.03 or not Geometry2D.is_point_in_polygon(q, water):
+				continue
+			# Only the side of the ring facing the lamp throws the light back, broken up as the water moves.
+			var facing := pow(maxf(0.0, Vector2.from_angle(a0 + PI / SEG).dot((apex - c).normalized())), 2.0)
+			var sparkle := 0.35 + 0.65 * absf(sin(clock * 7.0 + i * 2.3 + c.x * 0.1))
+			var ra := bw * facing * sparkle * (1.0 - k) * hl * 1.1
+			if ra > 0.02:
+				n.draw_arc(c, rad, a0, a0 + TAU / SEG, 3, Color(warm, minf(1.0, ra)), 1.3, true)
+	# Spores: rare, at random places in the beam, drifting slowly; lit only while the beam is on them.
+	var dt := clampf(clock - spore_clock, 0.0, 0.1)
+	spore_clock = clock
+	if spores.size() < 4 and randf() < dt * 0.8:
+		var u := randf_range(0.15, 0.85)
+		spores.append({"p": apex + fwd * (u * BEAM_LEN) + fwd.orthogonal() * randf_range(-0.4, 0.4) * BEAM_WIDE * (0.2 + 0.8 * u),
+			"v": Vector2.from_angle(randf() * TAU) * randf_range(4.0, 11.0), "t": clock,
+			"life": randf_range(2.5, 4.5), "s": randf_range(2.0, 3.6)})
+	var keep: Array = []
+	for sp in spores:
+		var age := (clock - float(sp["t"])) / float(sp["life"])
+		if age >= 1.0:
+			continue
+		sp["v"] = Vector2(sp["v"]).rotated(randf_range(-1.2, 1.2) * dt)
+		sp["p"] = Vector2(sp["p"]) + Vector2(sp["v"]) * dt
+		var a := _beam_at(sp["p"], apex, fwd) * sin(age * PI) * hl
+		if a > 0.02:
+			var sz: float = sp["s"]
+			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(sp["p"]) - Vector2(sz, sz) * 2.0, Vector2(sz, sz) * 4.0), false, Color(warm, 0.9 * a))
+			n.draw_circle(sp["p"], 0.8, Color(1, 1, 1, minf(1.0, 1.4 * a)))
+		keep.append(sp)
+	spores = keep
+
+
+## How much of the headlight beam reaches p (0..1), matching the beam picture.
+func _beam_at(p: Vector2, apex: Vector2, fwd: Vector2) -> float:
+	var d := p - apex
+	var u := d.dot(fwd) / BEAM_LEN
+	if u <= 0.0 or u >= 1.0:
+		return 0.0
+	var v := absf(d.dot(fwd.orthogonal())) / (BEAM_WIDE * 0.5)
+	return (1.0 - smoothstep(0.45, 1.0, v / (0.2 + 0.8 * u))) * pow(1.0 - u, 1.2) * smoothstep(0.0, 0.08, u)
+
+
+## How long a lit lantern has left (fading lanterns): a thin line of light on the water round its float,
+## like a reflection, draining clockwise. It warms to orange near the end and pulses gently in the last
+## seconds while the flame sputters.
+func _draw_burn_ring(n: Node2D, p: Vector2, left: float, light: Color) -> void:
+	var col := light.lerp(Color("ff7a45"), 1.0 - smoothstep(0.15, 0.4, left))
+	var a := 1.0
+	if left < 0.2:
+		a = 0.6 + 0.4 * (0.5 + 0.5 * sin(clock * 7.0))
+	var a0 := -PI * 0.5
+	var a1 := a0 + TAU * left
+	n.draw_set_transform(p, 0.0, Vector2(1.0, 0.36))
+	n.draw_arc(Vector2.ZERO, 27.0, 0.0, TAU, 64, Color(1, 1, 1, 0.1), 2.0, true)
+	if left > 0.0:
+		n.draw_arc(Vector2.ZERO, 27.0, a0, a1, 64, Color(col, 0.2 * a), 8.0, true)
+		n.draw_arc(Vector2.ZERO, 27.0, a0, a1, 64, Color(col, 0.95 * a), 2.4, true)
+	n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 
 func _draw_wake(n: Node2D) -> void:
@@ -1703,12 +2147,19 @@ func _draw_ui(n: Node2D) -> void:
 	Game.draw_icon(n, "loop", Vector2(lx - 8 - 17, cy), 34, loop_col)
 	n.draw_string(font, Vector2(lx, cy + 10), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 28, Color.WHITE if not over else loop_col)
 
-	# Seconds of light left, in the bar next to the loops: sun icon and number.
-	var secs := "%d s" % ceili((1.0 - dusk) * duration)
+	# Seconds of light left, in the bar next to the loops: the sun's, or the headlight battery's.
+	var batt := battery >= 0.0
+	var charge := clampf(battery / maxf(0.001, battery_max), 0.0, 1.0)
+	var warn := batt and battery < WARN and state == "play"
+	var blink := 0.45 + 0.55 * absf(sin(clock * 7.0)) if warn else 1.0
+	var secs := "%d s" % (ceili(battery) if batt else ceili((1.0 - dusk) * duration))
 	var sw := font.get_string_size(secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
 	var sun_x := lx - 8 - 34 - 32 - sw
 	var day_col := light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk))
-	Game.draw_icon(n, "sun", Vector2(sun_x - 8 - 17, cy), 34, day_col)
+	if batt:
+		day_col = Color("cfe6ff").lerp(Color("ff7a5a"), 1.0 - smoothstep(0.1, 0.3, charge))
+		day_col.a = blink
+	Game.draw_icon(n, Game.battery_icon(charge) if batt else "sun", Vector2(sun_x - 8 - 17, cy), 34, day_col)
 	n.draw_string(font, Vector2(sun_x, cy + 10), secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28, Color.WHITE)
 
 	# Daylight: a bar under the strip that fills to the right as the day passes, the sun riding its end.
@@ -1720,6 +2171,36 @@ func _draw_ui(n: Node2D) -> void:
 	var late := dusk > 0.75 or day_taken
 	n.draw_rect(Rect2(0, by, w, 10), HUD_PLATE)
 	n.draw_rect(Rect2(0, by, w, 10), Color(1, 1, 1, 0.14))
+	if batt:
+		# The battery: full from the left, draining back; on a night lake the SPARE mark is the time goal.
+		n.draw_rect(Rect2(0, by, w * charge, 10), day_col)
+		if night and not day_taken:
+			var spare_x := w * 0.25
+			var spare_a := 0.35 if late else 0.95
+			n.draw_rect(Rect2(spare_x - 2, by - 6, 4, 22), Color(1, 1, 1, spare_a))
+			var best_n := float(Game.stats[lake_index]["best"])
+			var spare_w := _tag_width(font, "SPARE")
+			var spare_l := spare_x - spare_w * 0.5
+			if best_n > 0.0:
+				var bx := (1.0 - clampf(best_n / maxf(1.0, duration), 0.0, 1.0)) * w
+				n.draw_colored_polygon(PackedVector2Array([Vector2(bx - 9, by - 14), Vector2(bx + 9, by - 14), Vector2(bx, by - 2)]), light)
+				n.draw_rect(Rect2(bx - 2, by - 2, 4, 16), light)
+				var btn := "BEST %d s" % roundi(best_n)
+				var bwn := _tag_width(font, btn)
+				var bl := bx - bwn * 0.5
+				if absf(bx - spare_x) < (bwn + spare_w) * 0.5 + 8.0:
+					var mid := (bx + spare_x) * 0.5
+					if bx <= spare_x:
+						bl = mid - 4.0 - bwn
+						spare_l = mid + 4.0
+					else:
+						spare_l = mid - 4.0 - spare_w
+						bl = mid + 4.0
+				_tag(n, font, bl, by + 22.0, btn, light)
+			_tag(n, font, spare_l, by + 22.0, "SPARE", Color(1, 1, 1, spare_a))
+		Game.draw_icon(n, Game.battery_icon(charge), Vector2(clampf(w * charge, 22.0, w - 22.0), by + 5), 36, day_col)
+		_draw_popups(n, font, by, light)
+		return
 	n.draw_rect(Rect2(0, by, w * day_f, 10), day_col)
 	var dusk_x := w * 0.75
 	var dusk_a := 0.35 if late else 0.95
@@ -1749,6 +2230,12 @@ func _draw_ui(n: Node2D) -> void:
 	var sx := clampf(w * day_f, 22.0, w - 22.0)
 	Game.draw_icon(n, "sun", Vector2(sx, by + 5), 36, day_col)
 
+	_draw_popups(n, font, by, light)
+
+
+## Pop-ups (chain, swift water, patched up…) under the bar, then the tutorial before setting off.
+func _draw_popups(n: Node2D, font: Font, by: float, light: Color) -> void:
+	var w := view_size.x
 	# Pop-ups (chain, swift water, patched up…): gold on a dark plate under the bar, newest at the top.
 	var py := by + 64.0
 	for k in range(floaters.size() - 1, -1, -1):
@@ -1807,7 +2294,7 @@ func _draw_tutorial(n: Node2D, font: Font, by: float, light: Color, a: float) ->
 	for l in lanterns:
 		if Vector2(l["p"]).distance_to(boat_pos) < Vector2(best_l["p"]).distance_to(boat_pos):
 			best_l = l
-	var lp: Vector2 = Vector2(best_l["p"]) + off
+	var lp: Vector2 = _glass_pos(best_l) + Vector2(0, 6) + off
 	var toward_centre := -1.0 if lp.x > w * 0.5 else 1.0
 	n.draw_arc(lp, 26.0, 0.0, TAU, 40, Color(0, 0, 0, 0.45 * a), 5.0, true)
 	n.draw_arc(lp, 26.0, 0.0, TAU, 40, Color(light, a), 2.5, true)
@@ -1851,7 +2338,7 @@ func _plate_box() -> StyleBoxFlat:
 # ---------------------------------------------------------------- screens
 
 func _pause() -> void:
-	if overlay != null or zooming or state in ["results", "crashed", "leaving"]:
+	if overlay != null or zooming or state in ["results", "crashed", "leaving", "dying"]:
 		return
 	touches.clear()
 	get_tree().paused = true
@@ -1915,7 +2402,7 @@ func _pause() -> void:
 			lit_now += 1
 	var par := int(lake["par"])
 	var goals := [["lantern", "%d/%d" % [lit_now, lanterns.size()]],
-		["sun", "%d s" % ceili((1.0 - dusk) * duration)],
+		[Game.battery_icon(battery / maxf(0.001, battery_max)), "%d s" % ceili(battery)] if battery >= 0.0 else ["sun", "%d s" % ceili((1.0 - dusk) * duration)],
 		["loop", "%d/%d" % [loops_used, par]]]
 	var g_row := HBoxContainer.new()
 	g_row.alignment = BoxContainer.ALIGNMENT_CENTER
@@ -1935,7 +2422,7 @@ func _pause() -> void:
 		var isz := 40.0 * float(Game.ICON_OPTICAL.get(String(g[0]), 1.0))
 		ic.custom_minimum_size = Vector2(isz, isz)
 		ic.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		ic.modulate = light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk)) if g[0] == "sun" else (Color("ff9a8a") if (g[0] == "loop" and loops_used > par) else light)
+		ic.modulate = Color("cfe6ff") if String(g[0]).begins_with("battery") else light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk)) if g[0] == "sun" else (Color("ff9a8a") if (g[0] == "loop" and loops_used > par) else light)
 		item.add_child(ic)
 		var t := Label.new()
 		t.text = String(g[1])
@@ -2055,6 +2542,7 @@ func _show_results() -> void:
 			got |= Game.MARK_LOOPS
 	if got & Game.MARK_ALL and lake_index + 1 < Game.lake_count() and not Game.is_unlocked(lake_index + 1):
 		newly_unlocked = lake_index + 1
+		Game.set_rig_pending(newly_unlocked)  # the pickup drives there once the map is on screen
 	Game.record_result(lake_index, got)
 	var prev_best := float(Game.stats[lake_index]["best"])
 	if lit == total:
@@ -2078,13 +2566,24 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
 	ui_root.add_child(overlay)
 	var can_continue := [false]
+	# A tap while the goals are still being stamped plays the rest about six times faster (still animated,
+	# so it never flickers); once it has all played, a tap carries on.
+	var speed := [1.0]
+	var seq: Array = []
 	var dim := ColorRect.new()
 	dim.color = Color(0.024, 0.047, 0.063, 0.74)
 	dim.size = view_size
 	dim.gui_input.connect(func(e: InputEvent):
-		if e is InputEventScreenTouch and not e.pressed and can_continue[0]:
+		if not (e is InputEventScreenTouch and not e.pressed):
+			return
+		if can_continue[0]:
 			Sfx.tap()
-			_zoom_to_map(true))
+			_zoom_to_map(true)
+		elif speed[0] == 1.0:
+			speed[0] = 6.0
+			for t in seq:
+				if is_instance_valid(t):
+					(t as Tween).set_speed_scale(6.0))
 	overlay.add_child(dim)
 
 	var title := Label.new()
@@ -2109,11 +2608,12 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 	const ITEM_W := 151.0
 	const GAP := 58.0
 	var goals := [["lantern", "All %d lanterns" % total, got & Game.MARK_ALL != 0],
-		["sun", "Before dusk", got & Game.MARK_TIME != 0],
+		[Game.time_goal(lake_index)[0], Game.time_goal(lake_index)[1], got & Game.MARK_TIME != 0],
 		["loop", "%d loop%s" % [par, "" if par == 1 else "s"], got & Game.MARK_LOOPS != 0]]
 	var x0 := (view_size.x - (3.0 * ITEM_W + 2.0 * GAP)) * 0.5
 	var gy := view_size.y * 0.33
 	var tw := overlay.create_tween()
+	seq.append(tw)
 	tw.tween_interval(0.5)
 	for k in 3:
 		var ok: bool = goals[k][2]
@@ -2170,33 +2670,33 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 			if ok:
 				ic.scale = Vector2.ONE * 2.6
 				ic.rotation = deg_to_rad(-14.0)
-				var st := ic.create_tween().set_parallel()
+				var st := ic.create_tween().set_speed_scale(speed[0]).set_parallel()
 				st.tween_property(ic, "modulate:a", 1.0, 0.25)
 				st.tween_property(ic, "scale", Vector2.ONE, 0.42).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 				st.tween_property(ic, "rotation", 0.0, 0.42).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 			else:
 				ic.scale = Vector2.ONE * 1.5
-				var st := ic.create_tween().set_parallel()
+				var st := ic.create_tween().set_speed_scale(speed[0]).set_parallel()
 				st.tween_property(ic, "modulate:a", 0.28, 0.3)
 				st.tween_property(ic, "scale", Vector2.ONE, 0.35).set_ease(Tween.EASE_OUT)
-				var sh := ic.create_tween()
+				var sh := ic.create_tween().set_speed_scale(speed[0])
 				sh.tween_interval(0.35)
 				for dx in [-10.0, 9.0, -5.0, 0.0]:
 					sh.tween_property(ic, "position:x", (SLOT - ic.size.x) * 0.5 + dx, 0.07))
 		tw.tween_interval(0.3)
 		tw.tween_callback(func():
 			Sfx.stamp(ok)
-			cap.create_tween().tween_property(cap, "modulate:a", 1.0 if ok else 0.5, 0.3)
+			cap.create_tween().set_speed_scale(speed[0]).tween_property(cap, "modulate:a", 1.0 if ok else 0.5, 0.3)
 			if ok:
 				Game.vibrate(20)
-				ring.create_tween().tween_method(func(v: float):
+				ring.create_tween().set_speed_scale(speed[0]).tween_method(func(v: float):
 					ring.set_meta("k", v)
 					ring.queue_redraw(), 0.0, 1.0, 0.7)
 				for d in 6:
 					var sp: Control = sparks[d]
 					var dir := Vector2.from_angle(TAU * d / 6.0 - PI * 0.5)
 					sp.modulate.a = 1.0
-					var ss := sp.create_tween().set_parallel()
+					var ss := sp.create_tween().set_speed_scale(speed[0]).set_parallel()
 					ss.tween_property(sp, "position", sp.position + dir * 80.0, 0.6).set_ease(Tween.EASE_OUT)
 					ss.tween_property(sp, "modulate:a", 0.0, 0.6))
 		tw.tween_interval(0.3)
@@ -2265,14 +2765,14 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 		best_l = mk_label.call("%d s" % roundi(best_t), "BEST", bx + BAR_W * best_f, by + 26, Color.WHITE)
 	tw.tween_callback(func():
 		sun.visible = true
-		bar.create_tween().tween_property(bar, "modulate:a", 1.0, 0.2)
-		bar.create_tween().tween_method(func(v: float):
+		bar.create_tween().set_speed_scale(speed[0]).tween_property(bar, "modulate:a", 1.0, 0.2)
+		bar.create_tween().set_speed_scale(speed[0]).tween_method(func(v: float):
 			bar.set_meta("f", v)
 			bar.queue_redraw(), 0.0, 1.0, 0.6).set_ease(Tween.EASE_OUT))
 	tw.tween_interval(0.5)
 	tw.tween_callback(func():
-		time_l.create_tween().tween_property(time_l, "modulate:a", 1.0, 0.25)
-		best_l.create_tween().tween_property(best_l, "modulate:a", 1.0, 0.25))
+		time_l.create_tween().set_speed_scale(speed[0]).tween_property(time_l, "modulate:a", 1.0, 0.25)
+		best_l.create_tween().set_speed_scale(speed[0]).tween_property(best_l, "modulate:a", 1.0, 0.25))
 	tw.tween_interval(0.3)
 
 	# Tap for the next lake.
@@ -2296,11 +2796,11 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 	overlay.add_child(tap)
 	tw.tween_callback(func():
 		can_continue[0] = true
-		tap.create_tween().tween_property(tap, "modulate:a", 0.8, 0.3)
+		tap.create_tween().set_speed_scale(speed[0]).tween_property(tap, "modulate:a", 0.8, 0.3)
 		var nudge := arrow.create_tween().set_loops()
 		nudge.tween_property(arrow, "position:x", arrow.position.x + 14.0, 0.8).set_trans(Tween.TRANS_SINE)
 		nudge.tween_property(arrow, "position:x", arrow.position.x, 0.8).set_trans(Tween.TRANS_SINE)
-		arrow.create_tween().tween_property(arrow, "modulate:a", 1.0, 0.3))
+		arrow.create_tween().set_speed_scale(speed[0]).tween_property(arrow, "modulate:a", 1.0, 0.3))
 
 	_add_corner_buttons(overlay)
 	overlay.modulate.a = 0.0
@@ -2342,7 +2842,7 @@ func _show_game_over(kind: String) -> void:
 	overlay.add_child(dim)
 
 	var title := Label.new()
-	title.text = "WRECKED" if wreck else "NIGHTFALL"
+	title.text = "WRECKED" if wreck else "LIGHTS OUT"
 	title.add_theme_font_override("font", Game.title_font)
 	title.add_theme_font_size_override("font_size", 60)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -2355,7 +2855,7 @@ func _show_game_over(kind: String) -> void:
 		line.text = String(lines[randi() % lines.size()]).replace("\n", " ")
 	else:
 		var left := total - lit
-		line.text = "The sun set with %d lantern%s still waiting." % [left, "" if left == 1 else "s"]
+		line.text = "The battery ran flat with %d lantern%s still waiting." % [left, "" if left == 1 else "s"]
 	line.add_theme_font_size_override("font_size", 30)
 	line.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	line.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -2477,7 +2977,7 @@ func _show_game_over(kind: String) -> void:
 		core.position = Vector2(cx - CORE * 0.5, cy - CORE * 0.5)
 		offer.add_child(core)
 		var ask := Label.new()
-		ask.text = "Patch the boat?" if wreck else "%d more seconds?" % int(_day_bonus())
+		ask.text = "Patch the boat?" if wreck else "%d s of headlight?" % int(_day_bonus())
 		ask.add_theme_font_size_override("font_size", 33)
 		ask.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		ask.position = Vector2(0, view_size.y * 0.67)
@@ -2518,16 +3018,16 @@ func _take_daylight() -> void:
 	_close_overlay()
 	day_taken = true
 	days_used += 1
-	elapsed = maxf(0.0, duration - _day_bonus())
-	dusk = clampf(elapsed / duration, 0.0, 1.0)
+	battery = _day_bonus()  # a fresh charge for the headlight
+	battery_max = battery
 	Game.stat_add(lake_index, "revives")
-	_float("+%d s of daylight" % int(_day_bonus()), boat_pos - Vector2(0, 40))
+	_float("+%d s of headlight" % int(_day_bonus()), boat_pos - Vector2(0, 40))
 	Sfx.chime(float(lake["pitch"]) * 1.5)
 
 
-## A quarter of the lake's daylight, at least 5 s.
+## The ad's headlight time: a quarter of the lake's time, plus 5 s.
 func _day_bonus() -> float:
-	return maxf(5.0, roundf(duration * DAY_BONUS))
+	return roundf(duration * DAY_BONUS) + 5.0
 
 
 ## Put the boat back where it was a moment before the crash, facing away from it.
