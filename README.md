@@ -8,6 +8,7 @@ A calm one-finger boat game for Android. Steer across still lakes and close loop
 - Your boat leaves a wake behind it. Cross it to close a loop, and every lantern inside lights up.
 - Light all the lanterns on a lake before dark to open the next one.
 - Each lake has three goals: light every lantern, finish before the sun is low, and use only a few loops.
+- Watch the water: stones and a head-on hit with the shore wreck the boat, reeds slow it down, and ducks that swim across your wake snap it.
 
 ## Built with
 
@@ -16,4 +17,5 @@ A calm one-finger boat game for Android. Steer across still lakes and close loop
 ## Credits
 
 - Icons by Lorc and Delapouite from [game-icons.net](https://game-icons.net), licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
-- Pause and play icons from [Phosphor Icons](https://phosphoricons.com) (MIT).
+- Pause, play and restart icons from [Phosphor Icons](https://phosphoricons.com) (MIT).
+- Boat: ["Fishing Boat"](https://sketchfab.com/3d-models/fishing-boat-a3f138089e164200b34bfb1bebb978c2) by CharlieCatling on Sketchfab, Sketchfab Free Standard licence.
