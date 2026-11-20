@@ -29,6 +29,10 @@ var settings: Control
 var celebrating := false
 var cele_test := false  # this celebration is a replay from the dev panel
 var ch2_label: Label = null  # what chapter two asks for, under the chapter's name
+var _thumb_xf := Transform2D()  # the lake picture being drawn: its own coordinates to the map
+const TEASE_K := 2.4  # teaser figures drawn larger than life, so they read at the picture's small size
+var _tease_swan: SubViewport = null  # the 3D swan gliding on her lake's picture (made in _ready)
+var _tease_seen := -10.0  # when she was last drawn: she only renders while she's on screen
 # Arriving from a lake (after a win, or Menu): the lake zooms out into its picture, a lake this win
 # opened unlocks, and the boat sails to the next lake, which the map then zooms in on. A fresh tap skips to the end.
 const A_HAND := 0.75  # the lake has faded into its picture here (level.gd LEAVE_HAND)
@@ -58,6 +62,7 @@ const KEEP_OUT := Vector2(62, 88)  # the road keeps this far from a lake's middl
 var tint_node: CanvasModulate
 var tint_color := Color.WHITE
 const Rig3D = preload("res://scripts/rig3d.gd")
+const Swan3D = preload("res://scripts/swan3d.gd")
 const RIG_RENDER := 200  # the rig's render size; it sees 26 m, so 7.7 px a metre
 const RIG_SCALE := 0.74  # drawn at about 5.7 map px a metre: the whole rig is about 125 px long
 const PICKUP_M := 8.7  # the drawn pickup's length (rig3d.gd scales it up)
@@ -182,6 +187,12 @@ func _ready() -> void:
 	if Game.chapter_done():
 		_make_shore_flies()
 		shore_fly_a = 1.0 if Game.chapter_seen else 0.0
+	for lk in Game.lakes:
+		if lk.has("swan"):
+			_tease_swan = Swan3D.new()  # the swan that glides on her lake's picture
+			_tease_swan.render_px = 128
+			add_child(_tease_swan)
+			break
 	_make_road_dots()
 	road_lit = _road_done()
 	if is_instance_valid(arrive_level) and reveal >= 0 and arrive_from >= 1 and road_lit >= float(arrive_from):
@@ -1045,6 +1056,11 @@ func _process(delta: float) -> void:
 		_fw_step(delta)
 	if is_instance_valid(cele_fx):
 		cele_fx.queue_redraw()
+	if is_instance_valid(_tease_swan):
+		# The map's swan renders only while she's drawn (not while a lake is in focus or being dived into).
+		var want := SubViewport.UPDATE_ALWAYS if clock - _tease_seen < 0.25 else SubViewport.UPDATE_DISABLED
+		if _tease_swan.render_target_update_mode != want:
+			_tease_swan.render_target_update_mode = want
 	draw_node.queue_redraw()
 	glow_node.queue_redraw()
 
@@ -1400,6 +1416,11 @@ func _draw_map(n: Node2D) -> void:
 				n.draw_texture_rect(tex, r, false, Color(1, 1, 1, alpha * mini))
 				if tex != lamp and i == still_lake and still_amp > 0.0:
 					n.draw_texture_rect(lamp, r, false, Color(1, 1, 1, alpha * mini * still_amp))
+		# Each lake's own thing, open or locked; gone while the camera dives into (or out of) a lake.
+		var tease_a := (1.0 - focus_f) * clampf(2.0 - scale.x, 0.0, 1.0)
+		if tease_a > 0.0:
+			_thumb_xf = Transform2D(0.0, Vector2(THUMB, THUMB), 0.0, origin)
+			_draw_teaser(n, i, th, tease_a)  # still in the lake's own coordinates
 		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 		# Goals under the name, as the same icons used everywhere else. Each sits on a small dark disc,
@@ -2549,6 +2570,139 @@ func _make_shore_flies() -> void:
 			var a := rng.randf() * TAU
 			shore_flies.append({"home": SPOTS[i] + off + Vector2.from_angle(a) * rng.randf_range(70.0, 135.0),
 				"ph": rng.randf(), "per": rng.randf_range(2.4, 4.6), "sx": rng.randf_range(0.18, 0.4), "sy": rng.randf_range(0.15, 0.35)})
+
+
+## Each lake shows the thing it brings, drawn small into its picture (in the lake's own coordinates), locked
+## or open: ducks paddling in a line, a swan gliding, reeds swaying at the shore, twin lights pulsing
+## together. It fades while a lake is in focus and while the camera dives in or out.
+func _draw_teaser(n: Node2D, i: int, th: Dictionary, a: float) -> void:
+	if a <= 0.01:
+		return
+	var lake: Dictionary = Game.lakes[i]
+	var pal: Dictionary = lake["pal"]
+	var path := _teaser_path(th)
+	var pairs := _pairs(lake)
+	if lake.has("swan"):
+		if lake.has("reeds") and not (lake["reeds"] as Array).is_empty():
+			_teaser_reeds(n, th, Color(pal["reed"]), a)  # Reed Bend: its reeds (its swans are met at Stones)
+			return
+		var sp: Array = _path_at(path, fmod(clock * 22.0, _path_len(path)))
+		_teaser_swan(n, sp[0], sp[1], a)
+	elif pairs.size() >= 2:
+		for pr in pairs:
+			# Twin lanterns: each pair glows and fades together, in step.
+			var pulse := 0.5 + 0.5 * sin(clock * 2.2 + float(pr[2]) * 1.7)
+			for q in [pr[0], pr[1]]:
+				var r := 70.0 + 20.0 * pulse
+				n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(q) - Vector2(r, r), Vector2(r, r) * 2.0), false,
+					Color(pal["light"], (0.25 + 0.55 * pulse) * a))
+	elif int(lake.get("ducks", 0)) >= 2:
+		var total := _path_len(path)
+		var head := fmod(clock * 16.0, total)
+		for k in 4:
+			var dp: Array = _path_at(path, fposmod(head - (k * 26.0 + (8.0 if k > 0 else 0.0)) * TEASE_K, total))
+			_teaser_duck(n, dp[0], dp[1], k == 0, a)
+
+
+## A loop round the lake's inside for things to travel along: its deep water, or the middle if there's
+## none deep enough.
+func _teaser_path(th: Dictionary) -> PackedVector2Array:
+	for key in ["deep", "mid"]:
+		var best := PackedVector2Array()
+		for p in th[key]:
+			if p.size() > best.size():
+				best = p
+		if best.size() > 8:
+			return best
+	return th["water"]
+
+
+func _path_len(poly: PackedVector2Array) -> float:
+	var total := 0.0
+	for k in poly.size():
+		total += poly[k].distance_to(poly[(k + 1) % poly.size()])
+	return maxf(total, 1.0)
+
+
+## The point s along a closed path, and the way along it there.
+func _path_at(poly: PackedVector2Array, s: float) -> Array:
+	var acc := 0.0
+	for k in poly.size():
+		var a := poly[k]
+		var b := poly[(k + 1) % poly.size()]
+		var seg := a.distance_to(b)
+		if acc + seg >= s:
+			return [a.lerp(b, (s - acc) / maxf(seg, 0.001)), (b - a).angle()]
+		acc += seg
+	return [poly[0], 0.0]
+
+
+func _pairs(lake: Dictionary) -> Array:
+	var by := {}
+	for l in lake["lanterns"]:
+		if (l as Array).size() > 2 and int(l[2]) != 0:
+			if not by.has(int(l[2])):
+				by[int(l[2])] = []
+			by[int(l[2])].append(Vector2(l[0], l[1]))
+	var out: Array = []
+	for key in by:
+		if (by[key] as Array).size() == 2:
+			out.append([by[key][0], by[key][1], key])
+	return out
+
+
+func _teaser_swan(n: Node2D, p: Vector2, dir: float, a: float) -> void:
+	var f := Vector2.from_angle(dir)
+	var s := f.orthogonal()
+	for side in [-1.0, 1.0]:
+		n.draw_line(p - f * 12.0 * TEASE_K, p - f * 46.0 * TEASE_K + s * side * 16.0 * TEASE_K, Color(1, 1, 1, 0.22 * a), 3.0 * TEASE_K, true)  # her wake
+	# The real swan (the same 3D model as on the lakes), turned to where she swims, with her shadow.
+	if not is_instance_valid(_tease_swan):
+		return
+	_tease_seen = clock
+	_tease_swan.set_pose(dir)
+	_tease_swan.play("Idle", 0.8)
+	var sc: float = 32.0 * TEASE_K * Swan3D.VIEW / float(_tease_swan.render_px)
+	var tex := _tease_swan.get_texture()
+	var anchor: Vector2 = _tease_swan.anchor()
+	n.draw_set_transform_matrix(_thumb_xf * Transform2D(0.0, Vector2.ONE * sc, 0.0, p + Vector2(-5, 7) * TEASE_K))
+	n.draw_texture(tex, -anchor, Color(0.04, 0.07, 0.08, 0.3 * a))
+	n.draw_set_transform_matrix(_thumb_xf * Transform2D(0.0, Vector2.ONE * sc, 0.0, p))
+	n.draw_texture(tex, -anchor, Color(1, 1, 1, a))
+	n.draw_set_transform_matrix(_thumb_xf)
+
+
+func _teaser_duck(n: Node2D, p: Vector2, dir: float, hen: bool, a: float) -> void:
+	n.draw_set_transform_matrix(_thumb_xf * Transform2D(dir, Vector2.ONE * TEASE_K, 0.0, p))
+	var k := 1.0 if hen else 0.55
+	n.draw_line(Vector2(-14, 0) * k, Vector2(-48, -16) * k, Color(1, 1, 1, 0.22 * a), 3.0, true)
+	n.draw_line(Vector2(-14, 0) * k, Vector2(-48, 16) * k, Color(1, 1, 1, 0.22 * a), 3.0, true)
+	_ellipse(n, Vector2.ZERO, Vector2(18, 10) * k, Color("8a6a48") if hen else Color("c8a46a"), a)
+	n.draw_circle(Vector2(16, 0) * k, 7.0 * k, Color(Color("6e5236") if hen else Color("b08a50"), a))
+	n.draw_set_transform_matrix(_thumb_xf)
+
+
+func _teaser_reeds(n: Node2D, th: Dictionary, col: Color, a: float) -> void:
+	var edge: PackedVector2Array = th["water"]
+	var count := 7
+	for t in count:
+		var base := edge[int(edge.size() * (t + 0.3) / count) % edge.size()]
+		var inward := (Vector2(LAKE_CENTER) - base).normalized()
+		base += inward * 12.0
+		for b in 5:
+			var sway := sin(clock * 1.6 + t * 1.3 + b * 0.7) * 0.22
+			var ang := inward.angle() + (b - 2) * 0.32 + sway  # leaning out over the water from the shallows
+			var tip := base + Vector2.from_angle(ang) * (140.0 + 36.0 * (b % 2))
+			n.draw_line(base, tip, Color(col, 0.9 * a), 14.0, true)
+			n.draw_circle(tip, 11.0, Color(col.darkened(0.25), 0.85 * a))
+
+
+func _ellipse(n: Node2D, c: Vector2, r: Vector2, col: Color, a := 1.0) -> void:
+	var pts := PackedVector2Array()
+	for k in 20:
+		var t := TAU * k / 20.0
+		pts.append(c + Vector2(cos(t) * r.x, sin(t) * r.y))
+	n.draw_colored_polygon(pts, Color(col, col.a * a))
 
 
 func _setting(key: String) -> bool:
