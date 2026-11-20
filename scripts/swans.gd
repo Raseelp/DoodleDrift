@@ -66,6 +66,7 @@ var nest_view: SubViewport
 # After the cob is killed the pen leaves the nest onto the bank and wanders there in distress.
 var pen_view: SubViewport = null
 var pen := {"p": Vector2.ZERO, "dir": 0.0, "target": Vector2.ZERO, "until": 0.0, "act": ""}
+var nest_hit := false  # a boat ran up the bank into the nest: she burst off it and stands guard nearby
 
 
 static func make(level, at: Vector2, size: float, temper_s: float, seed: int) -> SwanPair:
@@ -346,6 +347,9 @@ func _update_pen(delta: float, clock: float, boat: Vector2, alarmed: bool) -> vo
 	if not alive:
 		_update_widow(delta, clock)
 		return
+	if nest_hit:
+		_update_fled(delta, clock, boat)
+		return
 	pen_sit = move_toward(pen_sit, 0.0 if alarmed else 1.0, delta * 1.8)
 	nest_view.set_sit(pen_sit)
 	nest_view.set_pose(lerp_angle(out_dir, (boat - nest).angle(), 1.0 - pen_sit))
@@ -401,6 +405,61 @@ func _update_widow(delta: float, clock: float) -> void:
 			if clock > float(pen["until"]) and not pen_view.playing_once():
 				pen["act"] = "walk"
 				pen["target"] = _bank_point(out_dir + PI + rng.randf_range(-1.3, 1.3), 26.0, 70.0)
+	pen_view.set_pose(float(pen["dir"]))
+
+
+## A boat ploughs up the bank into the nest: twigs and down burst out, the eggs show, and the pen (if she is
+## on it) bursts off flapping and hissing, runs off along the bank away from the boat, then turns to face it.
+func hit_nest(dir: Vector2) -> void:
+	if nest_hit:
+		return
+	nest_hit = true
+	for k in 14:
+		lv._part(nest, Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(25, 80) + dir * 25.0, rng.randf_range(0.6, 1.1),
+			rng.randf_range(1.6, 2.6), Color("8a6a44") if k % 2 else Color("b39466"), false)  # twigs
+	for k in 12:
+		lv._part(nest, Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(8, 28), rng.randf_range(1.6, 2.6),
+			rng.randf_range(1.6, 2.4), Color(1, 1, 1, 0.85), false)  # down, drifting
+	Sfx.hiss()
+	Sfx.wingbeat()
+	if not alive or pen_view != null:
+		return
+	pen_view = Swan3D.new()
+	pen_view.render_px = RENDER
+	pen_view.on_land = true
+	lv.add_child(pen_view)
+	nest_view.empty_nest()
+	nest_view.render_target_update_mode = SubViewport.UPDATE_ONCE
+	pen["p"] = nest
+	pen["dir"] = dir.angle() + (0.9 if rng.randf() < 0.5 else -0.9)
+	pen["target"] = _bank_point(float(pen["dir"]), 50.0, 75.0)
+	pen["act"] = "flee"
+
+
+## After the nest was hit: she flees flapping, then stops, flings her wings up with a hiss and stands her
+## ground facing the boat, hissing now and then.
+func _update_fled(delta: float, clock: float, boat: Vector2) -> void:
+	if pen_view == null:
+		return
+	var pp: Vector2 = pen["p"]
+	var to: Vector2 = Vector2(pen["target"]) - pp
+	match String(pen["act"]):
+		"flee":
+			pen_view.play("WalkForwardStandWing", 1.7)
+			if to.length() > 3.0:
+				pen["dir"] = lerp_angle(float(pen["dir"]), to.angle(), 1.0 - exp(-6.0 * delta))
+				pen["p"] = pp + to.normalized() * minf(42.0 * delta, to.length())
+			else:
+				pen["act"] = "turn"
+				pen_view.play("Rebirth", 1.0, false)
+				Sfx.hiss()
+				pen["until"] = clock + 3.0
+		"turn":
+			pen["dir"] = lerp_angle(float(pen["dir"]), (boat - pp).angle(), 1.0 - exp(-3.0 * delta))
+			if clock > float(pen["until"]) and not pen_view.playing_once():
+				pen_view.play("WalkForwardStandWing", 0.5)
+				pen["until"] = clock + rng.randf_range(3.0, 5.0)
+				Sfx.hiss()
 	pen_view.set_pose(float(pen["dir"]))
 
 

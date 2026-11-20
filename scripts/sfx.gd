@@ -74,6 +74,10 @@ func _generate() -> void:
 		["fw_boom", _make_fw_boom],
 		["fw_launch", _make_fw_launch],
 		["fw_crackle", _make_fw_crackle],
+		["grind", _make_grind],
+		["horn", _make_horn],
+		["clunk", _make_clunk],
+		["rustle", _make_rustle],
 	]
 	var out := {}
 	var lock := Mutex.new()
@@ -212,6 +216,27 @@ func fw_boom(size: float) -> void:
 
 func fw_crackle() -> void:
 	_play("fw_crackle", randf_range(0.95, 1.1), -11.0)
+
+
+## Running aground: a dull thud, then the hull grinding up the sand (longer and louder the harder it hit).
+func beach(force: float) -> void:
+	_play("bump", lerpf(0.75, 0.6, force), lerpf(-6.0, -1.0, force))
+	_play("grind", lerpf(1.15, 0.9, force), lerpf(-12.0, -4.0, force))
+
+
+## A car's horn: one short honk (the alarm plays it a few times).
+func horn() -> void:
+	_play("horn", 1.0, -9.0)
+
+
+## Metal struck hard: a car's body panel.
+func clunk() -> void:
+	_play("clunk", randf_range(0.95, 1.05), -3.0)
+
+
+## Leaves shaken: a tree hit hard.
+func rustle() -> void:
+	_play("rustle", randf_range(0.9, 1.1), -8.0)
 
 
 func chain(pitch: float, level: int) -> void:
@@ -602,6 +627,81 @@ func _make_fw_crackle() -> AudioStreamWAV:
 		for j in int(0.004 * RATE_HI):
 			if at + j < s.size():
 				s[at + j] += rng.randf_range(-1.0, 1.0) * amp * exp(-float(j) / (0.0008 * RATE_HI))
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_grind() -> AudioStreamWAV:
+	# Sand under a hull: band-limited noise, broken into rough grains of crunch, fading as it slows.
+	var secs := 1.4
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 73
+	var lp := 0.0
+	var lp2 := 0.0
+	var grain := 0.0
+	var g_left := 0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var n := rng.randf_range(-1.0, 1.0)
+		lp += (n - lp) * 0.35
+		lp2 += (lp - lp2) * 0.08
+		var band := lp - lp2  # roughly 300 Hz to 2 kHz
+		if g_left <= 0:
+			g_left = rng.randi_range(int(0.006 * RATE_HI), int(0.03 * RATE_HI))
+			grain = rng.randf_range(0.35, 1.0)
+		g_left -= 1
+		var env := minf(1.0, t / 0.015) * exp(-t * 2.2)
+		s[i] = band * grain * env * 2.2
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_horn() -> AudioStreamWAV:
+	# Two slightly clashing reedy tones (the classic car-horn pair), softened, with a quick start and stop.
+	var secs := 0.32
+	var s := _buf(secs, RATE_HI)
+	var lp := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var a := 2.0 * fmod(t * 415.0, 1.0) - 1.0
+		var b := 2.0 * fmod(t * 498.0, 1.0) - 1.0
+		lp += ((a + b) * 0.5 - lp) * 0.22
+		var env := minf(1.0, t / 0.01) * (1.0 - smoothstep(secs - 0.04, secs, t))
+		s[i] = lp * env
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_clunk() -> AudioStreamWAV:
+	# A low thud with a few inharmonic metal partials ringing briefly over it.
+	var secs := 0.7
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 79
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var thud := sin(TAU * 78.0 * t) * exp(-t * 18.0)
+		var ring := (sin(TAU * 517.0 * t) * 0.5 + sin(TAU * 843.0 * t) * 0.35 + sin(TAU * 1291.0 * t) * 0.25) * exp(-t * 9.0)
+		var hit := rng.randf_range(-1.0, 1.0) * exp(-t * 70.0)
+		s[i] = thud + ring * 0.6 + hit * 0.5
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_rustle() -> AudioStreamWAV:
+	# Leaves: soft high noise in a quick swell and a long, uneven fade.
+	var secs := 1.1
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 83
+	var prev := 0.0
+	var flutter := 1.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var n := rng.randf_range(-1.0, 1.0)
+		var hp := n - prev
+		prev = n
+		if i % 300 == 0:
+			flutter = rng.randf_range(0.5, 1.0)
+		var env := minf(1.0, t / 0.05) * exp(-t * 2.8)
+		s[i] = hp * env * flutter * 0.5
 	return _to_wav(s, RATE_HI, false)
 
 

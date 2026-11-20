@@ -162,6 +162,17 @@ var crash_fast := false  # a tap during the wreck: the slow motion speeds up to 
 var crash_armed := false  # a fresh touch began during the wreck; its lift speeds it up
 var paused_scale := 1.0  # the slow motion's time scale while the pause screen is up
 var crash_pos := Vector2.ZERO
+# Running aground on a sandy shore (a crash of kind "shore"): the boat isn't broken, it rides up the beach,
+# skids to a stop and tips onto its side. Hard things (rocks, the jetty) still break and sink it.
+var beach := {}
+# The parked rig, once something hits it: live (rendered as it moves), shoved and turning, the trailer
+# swinging on its hitch, its hazard lights flashing.
+var rig_live: SubViewport = null
+var rig_v := Vector2.ZERO
+var rig_w := 0.0
+var trailer_w := 0.0
+var rig_flash_t := -10.0
+var rig_still := 0.0  # how long the hit rig has been at rest
 var duration := 30.0  # seconds of daylight, from Game.lake_duration
 var run_time := 0.0
 var water_time := 0.0  # seconds out on the water this visit (every try), saved to the lake's stats on leaving
@@ -837,7 +848,9 @@ func _process(delta: float) -> void:
 				var real := delta / maxf(Engine.time_scale, 0.01)
 				Engine.time_scale = move_toward(Engine.time_scale, 2.5, real * 3.0)
 			end_timer -= delta
-			if not boat3d:
+			if not beach.is_empty():
+				_beach_step(delta)
+			elif not boat3d:
 				heading += delta * 0.8 * maxf(0.0, end_timer)
 			if end_timer <= 0.0:
 				_show_game_over("wreck")
@@ -846,17 +859,22 @@ func _process(delta: float) -> void:
 			_move_boat(delta, true)  # still bringing itself home behind the results
 
 	_run_events()
+	_rig_step(delta)
 	_update_effects(delta)
 	if boat3d:
 		var shown := 1.0
 		boat_sprite.position = boat_pos
 		boat_sprite.modulate.a = (1.0 - 0.9 * boat3d.sunk()) * shown
-		boat_shadow.position = boat_pos + Vector2(-12, 16)
+		var aground := float(beach.get("ground", 0.0))
+		boat_shadow.position = boat_pos + Vector2(-12, 16).lerp(Vector2(-6, 8), aground)
 		boat_shadow.modulate.a = 0.32 * (1.0 - boat3d.sunk()) * shown
-		# A gentle rock and pitch on top of the lean into turns, so it sits in the water.
-		var lean := -turn_vel / TURN_RATE * 0.36 + sin(clock * 1.3) * 0.035  # leans well into turns, so its depth shows
-		var pitch := speed / SPEED * 0.05 + sin(clock * 1.9) * 0.03
-		boat3d.set_pose(_vis_heading(), lean, pitch, 0.0)
+		if not beach.is_empty():
+			boat3d.set_pose(_vis_heading(), float(beach["roll"]), float(beach["pitch"]), 0.0)
+		else:
+			# A gentle rock and pitch on top of the lean into turns, so it sits in the water.
+			var lean := -turn_vel / TURN_RATE * 0.36 + sin(clock * 1.3) * 0.035  # leans well into turns, so its depth shows
+			var pitch := speed / SPEED * 0.05 + sin(clock * 1.9) * 0.03
+			boat3d.set_pose(_vis_heading(), lean, pitch, 0.0)
 	if state == "leaving":
 		pass  # the map has the sound now
 	elif state in ["ready", "play"]:
@@ -972,6 +990,10 @@ func _move_boat(delta: float, steering: bool) -> void:
 			head_on = Vector2.from_angle(move_dir).dot(-Vector2(jn[1])) > 0.7 and speed > 70.0
 		elif not hit_rock:
 			head_on = Vector2.from_angle(move_dir).dot(-Vector2(shore[1])) > 0.7 and speed > 70.0
+		# A crash is decided before anything turns the boat, so it hits (and runs aground) as it was going.
+		if state == "play" and Game.dev_on("crash") and (hit_rock or head_on):
+			_crash("rock" if hit_rock else "jetty" if hit_jetty else "shore")
+			return
 		var pref := 1.0 if _turn_input() >= 0 else -1.0
 		var bend := 0
 		for k in range(1, 18):
@@ -987,8 +1009,8 @@ func _move_boat(delta: float, steering: bool) -> void:
 					break
 			if moved:
 				break
-		if state == "play" and Game.dev_on("crash") and (hit_rock or head_on or not moved):
-			_crash("rock" if hit_rock else "jetty" if hit_jetty else "shore")
+		if state == "play" and Game.dev_on("crash") and not moved:
+			_crash("rock" if hit_rock else "jetty" if hit_jetty else "shore")  # boxed in
 			return
 		if not moved:
 			heading += PI * 0.5
@@ -1101,6 +1123,238 @@ func _scrape(shore: Array) -> void:
 		_part(cp, nrm * randf_range(15, 40) + nrm.orthogonal() * randf_range(-20, 20), randf_range(0.4, 0.8), randf_range(1.4, 2.4), Color(pal["sand"], 0.9), false)
 
 
+## Running aground: how hard it hit sets how far it skids up the sand (a few px slow, two boat-widths fast),
+## how much it slews round and how far it tips over. Spray at the bow, then sand.
+func _start_beach(impact: float) -> void:
+	var f := clampf((impact - 60.0) / (SPEED - 60.0), 0.0, 1.0)
+	var dir := Vector2.from_angle(move_dir)
+	var shore := _shore_info(boat_pos)
+	var into_land: Vector2 = -Vector2(shore[1])
+	# It slews towards lying along the shore: the way it was already angled, or either way if square on.
+	var side := signf(dir.cross(into_land))
+	if side == 0.0:
+		side = 1.0 if randf() < 0.5 else -1.0
+	var dist := lerpf(20.0, 80.0, f)
+	var v0 := maxf(impact, 70.0)
+	beach = {"v": v0, "v0": v0, "decel": v0 * v0 / (2.0 * dist), "f": f, "side": side, "dist": dist,
+		"yaw_total": side * lerpf(0.06, 0.32, f), "pitch": 0.0, "roll": 0.0, "roll_v": 0.0,
+		"moved": 0.0, "mark": 0.0, "spray": 0.0, "stopped": false, "ground": 0.0}
+	end_timer = 2.3
+	Engine.time_scale = 0.55  # a touch of slow motion, as for a wreck
+	Sfx.beach(f)
+	Game.vibrate(int(lerpf(40.0, 90.0, f)))
+	# Water thrown up where the bow meets the beach.
+	var bow := boat_pos + dir * BOAT_RADIUS * 0.6
+	for k in int(lerpf(6.0, 14.0, f)):
+		_part(bow, dir.rotated(randf_range(-1.2, 1.2)) * randf_range(30, 90) * (0.6 + f), randf_range(0.35, 0.7),
+			randf_range(1.6, 2.8), Color(1, 1, 1, 0.75), false)
+	ripples.append({"p": boat_pos, "t": clock, "life": 1.4, "r0": 8.0, "r1": 40.0, "light": false})
+
+
+## Each frame of running aground: it skids on (sand slows it fast, it slews a little), the bow rides up,
+## and as it stops the hull, with no water under it, tips onto its side, rocks back once and settles.
+func _beach_step(delta: float) -> void:
+	var b := beach
+	var f := float(b["f"])
+	var dir := Vector2.from_angle(move_dir)
+	var perp := dir.orthogonal()
+	var v := float(b["v"])
+	if v > 0.0:
+		var step := v * delta
+		var np := boat_pos + dir * step
+		if not _free(np):
+			b["landed"] = true
+		elif b.has("landed"):
+			v = 0.0  # over a narrow neck of land and at water again: it stops at the edge
+		if v > 0.0:
+			v = _land_contacts(np + dir * BOAT_RADIUS * 1.3, dir, v)  # whatever is on the bank ahead of the bow
+		if v <= 0.0:
+			pass
+		else:
+			boat_pos = np
+			b["moved"] = float(b["moved"]) + step
+			# It slews more as it goes (sand grips one side), so the start of the slide stays straight.
+			var turn := float(b["yaw_total"]) * step / float(b["dist"]) * 2.0 * clampf(float(b["moved"]) / float(b["dist"]), 0.0, 1.0)
+			heading += turn
+			move_dir += turn
+			# Sand thrown out from both sides of the bow, more the faster it goes.
+			b["spray"] = float(b["spray"]) - delta
+			if float(b["spray"]) <= 0.0:
+				b["spray"] = 0.025
+				var k := v / float(b["v0"])
+				for s in [-1.0, 1.0]:
+					for g in 2:
+						var at: Vector2 = boat_pos + dir * BOAT_RADIUS * 0.55 + perp * s * 7.0
+						# Wet sand, dark against the dry beach (dry grains wouldn't show); past the sand, dirt and
+						# torn grass.
+						var sand: Color = Color(pal["sand"]).darkened(randf_range(0.2, 0.45))
+						if not _on_sand(at):
+							sand = Color(pal["land_dark"]).darkened(randf_range(0.25, 0.5)) if randf() < 0.6 else Color(pal["tree"])
+						_part(at, perp * s * randf_range(30, 95) * (0.4 + k) + dir * randf_range(5, 35), randf_range(0.45, 0.9),
+							randf_range(2.0, 3.4), sand, false)
+			# Two furrows behind, where the keel and the chine dug in.
+			b["mark"] = float(b["mark"]) + step
+			while float(b["mark"]) >= 3.0:
+				b["mark"] = float(b["mark"]) - 3.0
+				for s in [-1.0, 1.0]:
+					var at: Vector2 = boat_pos - dir * BOAT_RADIUS * 0.5 + perp * s * 5.0
+					var ground: Color = Color(pal["sand"]) if _on_sand(at) else Color(pal["land_dark"])
+					_part(at, Vector2.ZERO, 6.0, 2.1, Color(ground.darkened(0.45), 0.9), false)
+			v = maxf(0.0, v - float(b["decel"]) * delta)
+		b["v"] = v
+	if v <= 0.0 and not bool(b["stopped"]):
+		b["stopped"] = true
+		Sfx.bump()  # the hull settling on the sand
+		for k in int(lerpf(4.0, 10.0, f)):
+			_part(boat_pos + Vector2(randf_range(-14, 14), randf_range(-8, 8)), Vector2.from_angle(randf() * TAU) * randf_range(6, 22),
+				randf_range(0.7, 1.2), randf_range(2.2, 3.4), Color(Color(pal["sand"]).lightened(0.15), 0.6), false)
+	# The bow rides up the slope while it skids, and stays a little raised once it stops.
+	var ride := clampf(float(b["moved"]) / maxf(float(b["dist"]) * 0.5, 1.0), 0.0, 1.0)
+	var pitch_to := lerpf(0.1, 0.24, f) * ride if v > 0.0 else lerpf(0.06, 0.12, f)
+	b["pitch"] = lerpf(float(b["pitch"]), pitch_to, 1.0 - exp(-10.0 * delta))
+	# The roll: a slight lean as it slews, then, slowing, it tips over onto its side: a damped spring, so
+	# it goes a little past, rocks back once and settles.
+	var slow := v < float(b["v0"]) * 0.35
+	var roll_to := float(b["side"]) * (lerpf(0.2, 0.45, f) if slow else 0.05)
+	var rv := float(b["roll_v"]) + (60.0 * (roll_to - float(b["roll"])) - 7.0 * float(b["roll_v"])) * delta
+	b["roll_v"] = rv
+	b["roll"] = float(b["roll"]) + rv * delta
+	b["ground"] = minf(1.0, float(b["ground"]) + delta * 2.5)
+
+
+func _on_sand(p: Vector2) -> bool:
+	for poly in sand_polys:
+		if Geometry2D.is_point_in_polygon(p, poly):
+			return true
+	return false
+
+
+## The boat running up the bank meets whatever is there. Every thing on the land that a boat can hit is
+## listed here, each reacting in its own way; it returns the boat's speed after the hit. (Anything new
+## added to the banks later gets its own entry here.)
+func _land_contacts(bow: Vector2, dir: Vector2, v: float) -> float:
+	var b := beach
+	if _hits_rock(bow):
+		if not b.has("hit_rock"):
+			b["hit_rock"] = true
+			Sfx.bump()
+			Game.vibrate(40)
+		return 0.0  # rocks don't give
+	if jet and float(jet.nearest(bow)[0]) < JETTY_PAD:
+		if not b.has("hit_jetty"):
+			b["hit_jetty"] = true
+			Sfx.bump()
+			Game.vibrate(40)
+		return 0.0  # nor do the jetty's piles
+	if rig_ok and rig_tex and not b.has("hit_rig"):
+		var fwd := Vector2.from_angle(rig_dir)
+		var front := rig_hitch + fwd * PICKUP_M * LAKE_PX_PER_M
+		var back := rig_hitch - Vector2.from_angle(rig_dir + rig_bend) * TRAILER_M * LAKE_PX_PER_M
+		var on_pickup := bow.distance_to(Geometry2D.get_closest_point_to_segment(bow, rig_hitch, front)) < 8.0 + 4.0
+		var on_trailer := bow.distance_to(Geometry2D.get_closest_point_to_segment(bow, rig_hitch, back)) < 9.0 + 4.0
+		if on_pickup or on_trailer:
+			b["hit_rig"] = true
+			_hit_rig(bow, dir, v, on_pickup)
+			return v * 0.12  # a car doesn't give much: the boat all but stops
+	if swans and not b.has("hit_nest") and bow.distance_to(swans.nest) < 18.0:
+		b["hit_nest"] = true
+		swans.hit_nest(dir)
+		return v * 0.75  # twigs and grass: it ploughs through
+	for t in trees:
+		if bow.distance_to(t["p"]) < float(t["r"]) * _tree_size(t) * 0.35 + 3.0:
+			if not t.has("hit") or clock - float(t["hit"]) > 2.0:
+				t["hit"] = clock
+				_hit_tree(t, dir, v)
+			return 0.0  # a trunk stops it dead
+	return v
+
+
+## The boat shoves the parked pickup (heavier than the boat, handbrake on): a push and a twist from where
+## it was struck, the trailer swinging round its hitch; a metal clunk, then the hazards flash and it honks.
+func _hit_rig(at: Vector2, dir: Vector2, v: float, on_pickup: bool) -> void:
+	if not is_instance_valid(rig_live):
+		rig_live = load("res://scripts/rig3d.gd").new()
+		rig_live.render_px = RIG_RENDER
+		rig_live.view_m = RIG_VIEW_M
+		rig_live.show_boat = false
+		add_child(rig_live)
+		rig_live.set_pose(rig_dir, rig_bend)
+	var fwd := Vector2.from_angle(rig_dir)
+	var plen := PICKUP_M * LAKE_PX_PER_M
+	if on_pickup:
+		var centre := rig_hitch + fwd * plen * 0.5
+		rig_v += dir * v * 0.3
+		rig_w += (at - centre).cross(dir) / (plen * 0.5) * v * 0.012
+		trailer_w -= rig_w * 0.6  # the trailer lags behind the pickup's turn
+	else:
+		trailer_w += (at - rig_hitch).cross(dir) / (TRAILER_M * LAKE_PX_PER_M) * v * 0.035
+		rig_v += dir * v * 0.08
+	rig_flash_t = clock
+	Sfx.clunk()
+	Game.vibrate(70)
+	for k in 4:
+		get_tree().create_timer(0.35 + k * 0.5).timeout.connect(Sfx.horn)
+	for k in 8:
+		_part(at, Vector2.from_angle(randf() * TAU) * randf_range(20, 70), randf_range(0.3, 0.6), randf_range(1.2, 2.0),
+			Color(1, 1, 1, 0.8), false)
+
+
+## The parked rig moving after a hit: it slides to a stop on the grass (friction), the trailer swinging
+## round its hitch and settling; drawn live from the 3D rig while it moves.
+func _rig_step(delta: float) -> void:
+	if not is_instance_valid(rig_live):
+		return
+	var moving := rig_v.length() > 0.3 or absf(rig_w) > 0.003 or absf(trailer_w) > 0.003
+	if not moving:
+		# At rest a moment (its last pose rendered): keep that picture and let the 3D scene go.
+		rig_still += delta
+		if rig_still > 0.4:
+			var img := rig_live.get_texture().get_image()
+			img.generate_mipmaps()
+			rig_tex = ImageTexture.create_from_image(img)
+			rig_live.queue_free()
+			rig_live = null
+		return
+	rig_still = 0.0
+	rig_hitch += rig_v * delta
+	rig_dir += rig_w * delta
+	rig_bend = clampf(rig_bend + trailer_w * delta, -1.25, 1.25)  # it can jackknife, not fold through itself
+	rig_v *= exp(-5.5 * delta)
+	rig_w *= exp(-5.5 * delta)
+	trailer_w *= exp(-3.5 * delta)
+	rig_live.set_pose(rig_dir, rig_bend)
+
+
+## The pickup's lights after a hit: the hazards blink, head and tail, a few times.
+func _draw_rig_lights(n: Node2D) -> void:
+	var t := clock - rig_flash_t
+	if t < 0.0 or t > 3.4 or fmod(t, 0.5) > 0.25:
+		return
+	var fwd := Vector2.from_angle(rig_dir)
+	var side := fwd.orthogonal()
+	var plen := PICKUP_M * LAKE_PX_PER_M
+	var glow: Texture2D = Game.glow_tex
+	for s in [-1.0, 1.0]:
+		var head: Vector2 = rig_hitch + fwd * plen * 0.95 + side * s * 5.5
+		var tail: Vector2 = rig_hitch + fwd * plen * 0.06 + side * s * 6.0
+		n.draw_texture_rect(glow, Rect2(head - Vector2(12, 12), Vector2(24, 24)), false, Color(1.0, 0.95, 0.75, 0.9))
+		n.draw_circle(head, 1.8, Color(1.0, 1.0, 0.9))
+		n.draw_texture_rect(glow, Rect2(tail - Vector2(11, 11), Vector2(22, 22)), false, Color(1.0, 0.25, 0.15, 0.85))
+		n.draw_circle(tail, 1.6, Color(1.0, 0.45, 0.35))
+
+
+## A boat runs into a tree: it shakes and drops a shower of leaves.
+func _hit_tree(t: Dictionary, dir: Vector2, v: float) -> void:
+	Sfx.bump()
+	Sfx.rustle()
+	Game.vibrate(50)
+	var r := float(t["r"]) * _tree_size(t)
+	for k in int(lerpf(8.0, 18.0, clampf(v / SPEED, 0.0, 1.0))):
+		var from: Vector2 = Vector2(t["p"]) + Vector2.from_angle(randf() * TAU) * randf_range(0.0, r * 0.8)
+		var leaf: Color = Color(pal["tree"]) if randf() < 0.6 else Color(pal["tree_hi"])
+		_part(from, Vector2.from_angle(randf() * TAU) * randf_range(8, 30) + dir * 12.0, randf_range(1.0, 1.8), randf_range(1.8, 2.8), leaf, false)
+
+
 func _hits_rock(p: Vector2) -> bool:
 	for r in rocks:
 		if p.distance_to(r["c"]) < float(r["r"]) + BOAT_RADIUS:
@@ -1109,6 +1363,7 @@ func _hits_rock(p: Vector2) -> bool:
 
 
 func _crash(kind: String) -> void:
+	var impact := speed
 	state = "crashed"
 	crash_kind = kind
 	crash_fast = false
@@ -1118,6 +1373,9 @@ func _crash(kind: String) -> void:
 	speed = 0.0
 	end_timer = 1.4
 	touches.clear()
+	if kind == "shore":
+		_start_beach(impact)
+		return
 	Sfx.crash()
 	Game.vibrate(90)
 	if boat3d:
@@ -1896,11 +2154,16 @@ func _draw_trees(n: Node2D) -> void:
 		if g <= 0.0:
 			continue
 		var t: Dictionary = trees[i]
+		# Struck by a boat: the canopy shakes, hard at first, dying away.
+		var shake := Vector2.ZERO
+		var st := clock - float(t.get("hit", -10.0))
+		if st < 2.0:
+			shake = Vector2(sin(st * 31.0), cos(st * 23.0)) * 4.0 * exp(-st * 2.6)
 		for part in t["parts"]:
-			n.draw_circle(t["p"] + part[0] * g, part[1] * g, pal["tree"], true, -1.0, true)
+			n.draw_circle(t["p"] + part[0] * g + shake * (0.5 + part[1] / 30.0), part[1] * g, pal["tree"], true, -1.0, true)
 		for part in t["parts"]:
 			var r: float = part[1] * g
-			n.draw_circle(t["p"] + part[0] * g + Vector2(-r * 0.22, -r * 0.24), r * 0.62, pal["tree_hi"], true, -1.0, true)
+			n.draw_circle(t["p"] + part[0] * g + shake * (0.5 + part[1] / 30.0) + Vector2(-r * 0.22, -r * 0.24), r * 0.62, pal["tree_hi"], true, -1.0, true)
 
 
 func _draw_details(n: Node2D) -> void:
@@ -1921,11 +2184,13 @@ func _draw_details(n: Node2D) -> void:
 	if rig_tex:
 		var sc := LAKE_PX_PER_M / (RIG_RENDER / RIG_VIEW_M)
 		var hitch := rig_hitch
+		var tex: Texture2D = rig_live.get_texture() if is_instance_valid(rig_live) else rig_tex
 		n.draw_set_transform(hitch + Vector2(-5, 6), 0.0, Vector2.ONE * sc)
-		n.draw_texture(rig_tex, -rig_anchor, Color(shade, 0.5))
+		n.draw_texture(tex, -rig_anchor, Color(shade, 0.5))
 		n.draw_set_transform(hitch, 0.0, Vector2.ONE * sc)
-		n.draw_texture(rig_tex, -rig_anchor)
+		n.draw_texture(tex, -rig_anchor)
 		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+		_draw_rig_lights(n)
 
 	if jet:
 		jet.draw_water(n, clock)  # the water moving round the pilings, under the deck
@@ -3061,7 +3326,7 @@ func _show_game_over(kind: String) -> void:
 	overlay.add_child(dim)
 
 	var title := Label.new()
-	title.text = "WRECKED" if wreck else "LIGHTS OUT"
+	title.text = ("ON THE SAND" if crash_kind == "shore" else "WRECKED") if wreck else "LIGHTS OUT"
 	title.add_theme_font_override("font", Game.title_font)
 	title.add_theme_font_size_override("font_size", 60)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -3252,6 +3517,7 @@ func _day_bonus() -> float:
 ## Put the boat back where it was a moment before the crash, facing away from it.
 func _patch_boat() -> void:
 	patches_used += 1
+	beach = {}
 	if boat3d:
 		boat3d.reset()
 	_close_overlay()
