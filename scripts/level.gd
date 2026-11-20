@@ -173,6 +173,7 @@ var rig_w := 0.0
 var trailer_w := 0.0
 var rig_flash_t := -10.0
 var rig_still := 0.0  # how long the hit rig has been at rest
+var rig_lamps: Array = []  # its headlamps, relative to the hitch and its heading (from the 3D rig)
 var duration := 30.0  # seconds of daylight, from Game.lake_duration
 var run_time := 0.0
 var water_time := 0.0  # seconds out on the water this visit (every try), saved to the lake's stats on leaving
@@ -1292,8 +1293,8 @@ func _hit_rig(at: Vector2, dir: Vector2, v: float, on_pickup: bool) -> void:
 	rig_flash_t = clock
 	Sfx.clunk()
 	Game.vibrate(70)
-	for k in 4:
-		get_tree().create_timer(0.35 + k * 0.5).timeout.connect(Sfx.horn)
+	for k in 5:
+		get_tree().create_timer(0.02 + k * 0.9).timeout.connect(Sfx.horn)  # in time with the lights' flashes
 	for k in 8:
 		_part(at, Vector2.from_angle(randf() * TAU) * randf_range(20, 70), randf_range(0.3, 0.6), randf_range(1.2, 2.0),
 			Color(1, 1, 1, 0.8), false)
@@ -1325,22 +1326,50 @@ func _rig_step(delta: float) -> void:
 	rig_live.set_pose(rig_dir, rig_bend)
 
 
-## The pickup's lights after a hit: the hazards blink, head and tail, a few times.
+## The pickup's alarm after a hit, drawn as added light: the headlights flash (each a real beam over the
+## ground ahead, a pool where they meet, like the map's), with the red tail lights and the amber indicators
+## at the four corners, about once a second, the bulbs warming up quickly and fading a little slower.
 func _draw_rig_lights(n: Node2D) -> void:
 	var t := clock - rig_flash_t
-	if t < 0.0 or t > 3.4 or fmod(t, 0.5) > 0.25:
+	if t < 0.0 or t > 4.4:
 		return
+	var c := fmod(t, 0.9)  # one flash: on for half of it
+	var k := smoothstep(0.0, 0.06, c) * (1.0 - smoothstep(0.42, 0.56, c))
+	if k <= 0.0:
+		return
+	var vis := lerpf(0.6, 1.0, smoothstep(0.4, 0.85, dusk))  # weaker against daylight
 	var fwd := Vector2.from_angle(rig_dir)
 	var side := fwd.orthogonal()
 	var plen := PICKUP_M * LAKE_PX_PER_M
 	var glow: Texture2D = Game.glow_tex
+	# The headlamps where the 3D pickup has them (kept relative to it, so they follow it when shoved).
+	if is_instance_valid(rig_live):
+		var hl: Array = rig_live.headlamps()
+		if not hl.is_empty():
+			var sc := LAKE_PX_PER_M / (RIG_RENDER / RIG_VIEW_M)
+			rig_lamps = []
+			for q in [hl[0], hl[1]]:
+				rig_lamps.append((rig_hitch + (Vector2(q) - rig_anchor) * sc - rig_hitch).rotated(-rig_dir))
+	var heads: Array = []
+	if rig_lamps.size() == 2:
+		for q in rig_lamps:
+			heads.append(rig_hitch + Vector2(q).rotated(rig_dir))
+	else:
+		for s in [-1.0, 1.0]:
+			heads.append(rig_hitch + fwd * plen * 0.95 + side * s * 5.5)
+	var warm := Color(1.0, 0.92, 0.72)
+	for h in heads:
+		Game.draw_beam(n, h, rig_dir, 92.0, 70.0, Color(warm, 0.5 * k * vis))
+		n.draw_texture_rect(glow, Rect2(Vector2(h) - Vector2(9, 9), Vector2(18, 18)), false, Color(1.0, 0.98, 0.9, 0.95 * k))
+	var mid: Vector2 = (Vector2(heads[0]) + Vector2(heads[1])) * 0.5 + fwd * 40.0
+	n.draw_texture_rect(glow, Rect2(mid - Vector2(40, 40), Vector2(80, 80)), false, Color(warm, 0.22 * k * vis))
 	for s in [-1.0, 1.0]:
-		var head: Vector2 = rig_hitch + fwd * plen * 0.95 + side * s * 5.5
 		var tail: Vector2 = rig_hitch + fwd * plen * 0.06 + side * s * 6.0
-		n.draw_texture_rect(glow, Rect2(head - Vector2(12, 12), Vector2(24, 24)), false, Color(1.0, 0.95, 0.75, 0.9))
-		n.draw_circle(head, 1.8, Color(1.0, 1.0, 0.9))
-		n.draw_texture_rect(glow, Rect2(tail - Vector2(11, 11), Vector2(22, 22)), false, Color(1.0, 0.25, 0.15, 0.85))
-		n.draw_circle(tail, 1.6, Color(1.0, 0.45, 0.35))
+		n.draw_texture_rect(glow, Rect2(tail - Vector2(13, 13), Vector2(26, 26)), false, Color(1.0, 0.18, 0.1, 0.75 * k))
+		n.draw_texture_rect(glow, Rect2(tail - Vector2(3, 3), Vector2(6, 6)), false, Color(1.0, 0.5, 0.4, 0.9 * k))
+		var front_x: float = Vector2(rig_lamps[0]).x + 1.0 if rig_lamps.size() == 2 else plen * 0.95  # beside the headlamps
+		for corner in [rig_hitch + fwd * front_x + side * s * 9.5, rig_hitch + fwd * plen * 0.03 + side * s * 7.5]:
+			n.draw_texture_rect(glow, Rect2(Vector2(corner) - Vector2(8, 8), Vector2(16, 16)), false, Color(1.0, 0.62, 0.12, 0.85 * k))
 
 
 ## A boat runs into a tree: it shakes and drops a shower of leaves.
@@ -1353,6 +1382,16 @@ func _hit_tree(t: Dictionary, dir: Vector2, v: float) -> void:
 		var from: Vector2 = Vector2(t["p"]) + Vector2.from_angle(randf() * TAU) * randf_range(0.0, r * 0.8)
 		var leaf: Color = Color(pal["tree"]) if randf() < 0.6 else Color(pal["tree_hi"])
 		_part(from, Vector2.from_angle(randf() * TAU) * randf_range(8, 30) + dir * 12.0, randf_range(1.0, 1.8), randf_range(1.8, 2.8), leaf, false)
+
+
+## The swans have their egg back: a word over the boat (the goal itself counts if the lake is finished).
+func egg_returned() -> void:
+	_float("Egg returned", boat_pos - Vector2(0, 40))
+
+
+## The returned egg broke when the boat ran into the nest: the goal is undone for this try.
+func egg_broken() -> void:
+	_float("The egg broke", boat_pos - Vector2(0, 40))
 
 
 func _hits_rock(p: Vector2) -> bool:
@@ -2190,7 +2229,6 @@ func _draw_details(n: Node2D) -> void:
 		n.draw_set_transform(hitch, 0.0, Vector2.ONE * sc)
 		n.draw_texture(tex, -rig_anchor)
 		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
-		_draw_rig_lights(n)
 
 	if jet:
 		jet.draw_water(n, clock)  # the water moving round the pilings, under the deck
@@ -2311,6 +2349,8 @@ func _draw_light(n: Node2D) -> void:
 	var light: Color = pal["light"]
 	var glow: Texture2D = Game.glow_tex
 	# The boat's lamp: a small warm light at the bow that flares when it sends an ember.
+	if rig_tex:
+		_draw_rig_lights(n)  # the pickup's alarm, as light
 	var flare := clampf(1.0 - (clock - lamp_flare) / 0.35, 0.0, 1.0)
 	var lamp := boat_pos + Vector2.from_angle(_vis_heading()) * BOW * 0.7
 	var lamp_r := 18.0 + 16.0 * flare
@@ -2635,6 +2675,11 @@ func _draw_ui(n: Node2D) -> void:
 		day_col.a = blink
 	Game.draw_icon(n, Game.battery_icon(charge) if batt else "sun", Vector2(sun_x - 8 - 17, cy), 34, day_col)
 	n.draw_string(font, Vector2(sun_x, cy + 10), secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28, Color.WHITE)
+	# The swans' egg: dim while it's out there, white aboard, in the lake's light once it's home.
+	if swans:
+		var es: String = swans.egg_state
+		var egg_col := light if es == "home" else Color("ff9a8a") if es == "broken" else (Color.WHITE if es in ["carried", "passing", "cob"] else Color(1, 1, 1, 0.38))
+		Game.draw_icon(n, "egg", Vector2(sun_x - 8 - 34 - 26 - 15, cy), 30, egg_col)
 
 	# Daylight: a bar under the strip that fills to the right as the day passes, the sun riding its end.
 	# Two marks on it, told apart by colour, shape and label: DUSK (white tick, the "before dusk" goal)
@@ -2676,9 +2721,11 @@ func _draw_ui(n: Node2D) -> void:
 		_draw_popups(n, font, by, light)
 		return
 	n.draw_rect(Rect2(0, by, w * day_f, 10), day_col)
-	var dusk_x := w * 0.75
+	var has_dusk := swans == null  # where the egg is the second goal there is no "before dusk" mark
+	var dusk_x := w * 0.75 if has_dusk else -1000.0
 	var dusk_a := 0.35 if late else 0.95
-	n.draw_rect(Rect2(dusk_x - 2, by - 6, 4, 22), Color(1, 1, 1, dusk_a))
+	if has_dusk:
+		n.draw_rect(Rect2(dusk_x - 2, by - 6, 4, 22), Color(1, 1, 1, dusk_a))
 	var label_y := by + 22.0
 	var dusk_w := _tag_width(font, "DUSK")
 	var dusk_l := dusk_x - dusk_w * 0.5
@@ -2700,7 +2747,8 @@ func _draw_ui(n: Node2D) -> void:
 				dusk_l = mid - 4.0 - dusk_w
 				best_l = mid + 4.0
 		_tag(n, font, best_l, label_y, bt, light)
-	_tag(n, font, dusk_l, label_y, "DUSK", Color(1, 1, 1, dusk_a))
+	if has_dusk:
+		_tag(n, font, dusk_l, label_y, "DUSK", Color(1, 1, 1, dusk_a))
 	var sx := clampf(w * day_f, 22.0, w - 22.0)
 	Game.draw_icon(n, "sun", Vector2(sx, by + 5), 36, day_col)
 
@@ -2884,6 +2932,8 @@ func _pause() -> void:
 	var goals := [["lantern", "%d/%d" % [lit_now, lanterns.size()]],
 		[Game.battery_icon(battery / maxf(0.001, battery_max)), "%d s" % ceili(battery)] if battery >= 0.0 else ["sun", "%d s" % ceili((1.0 - dusk) * duration)],
 		["loop", "%d/%d" % [loops_used, par]]]
+	if swans:
+		goals.append(["egg", "Home" if swans.egg_state == "home" else "Aboard" if swans.egg_state in ["carried", "passing", "cob"] else "Broken" if swans.egg_state == "broken" else "Lost" if swans.egg_state == "gone" else "Out"])
 	var g_row := HBoxContainer.new()
 	g_row.alignment = BoxContainer.ALIGNMENT_CENTER
 	g_row.add_theme_constant_override("separation", 50)
@@ -3020,7 +3070,10 @@ func _show_results() -> void:
 	var got := 0
 	if lit == total:
 		got |= Game.MARK_ALL
-		if finished_dusk <= 0.75 and not day_taken:
+		if lake.has("swan"):
+			if swans and swans.egg_state == "home":
+				got |= Game.MARK_TIME  # this lake's second goal is the swans' egg, home in the nest
+		elif finished_dusk <= 0.75 and not day_taken:
 			got |= Game.MARK_TIME
 		if loops_used <= int(lake["par"]):
 			got |= Game.MARK_LOOPS

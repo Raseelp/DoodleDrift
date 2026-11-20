@@ -78,6 +78,7 @@ func _generate() -> void:
 		["horn", _make_horn],
 		["clunk", _make_clunk],
 		["rustle", _make_rustle],
+		["swan_call", _make_swan_call],
 	]
 	var out := {}
 	var lock := Mutex.new()
@@ -237,6 +238,17 @@ func clunk() -> void:
 ## Leaves shaken: a tree hit hard.
 func rustle() -> void:
 	_play("rustle", randf_range(0.9, 1.1), -8.0)
+
+
+## An eggshell cracking: a short bright snap, very small.
+func egg_crack() -> void:
+	_play("snap", 1.5, -6.0)
+	_play("tap", 0.45, -10.0)
+
+
+## A mute swan's soft call: a low, breathy, nasal snort (quite unlike the hiss).
+func swan_call() -> void:
+	_play("swan_call", randf_range(0.92, 1.08), -10.0)
 
 
 func chain(pitch: float, level: int) -> void:
@@ -702,6 +714,27 @@ func _make_rustle() -> AudioStreamWAV:
 			flutter = rng.randf_range(0.5, 1.0)
 		var env := minf(1.0, t / 0.05) * exp(-t * 2.8)
 		s[i] = hp * env * flutter * 0.5
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_swan_call() -> AudioStreamWAV:
+	# A soft low honk: a reedy tone around 260 Hz bending down, through a nasal formant, with breath.
+	var secs := 0.42
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 89
+	var ph := 0.0
+	var lp := 0.0
+	var bp := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		ph += TAU * lerpf(270.0, 225.0, t / secs) / RATE_HI
+		var reed := sin(ph) + 0.5 * sin(2.0 * ph) + 0.3 * sin(3.0 * ph)
+		var breath := rng.randf_range(-1.0, 1.0) * 0.35
+		lp += (reed + breath - lp) * 0.3
+		bp += (lp - bp) * 0.06
+		var env := smoothstep(0.0, 0.05, t) * (1.0 - smoothstep(0.22, secs, t))
+		s[i] = (lp - bp) * env
 	return _to_wav(s, RATE_HI, false)
 
 

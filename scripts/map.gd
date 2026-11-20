@@ -28,6 +28,7 @@ var map_ui: Control  # title, lake names and the gear; hidden while zoomed in on
 var settings: Control
 var celebrating := false
 var cele_test := false  # this celebration is a replay from the dev panel
+var ch2_label: Label = null  # what chapter two asks for, under the chapter's name
 # Arriving from a lake (after a win, or Menu): the lake zooms out into its picture, a lake this win
 # opened unlocks, and the boat sails to the next lake, which the map then zooms in on. A fresh tap skips to the end.
 const A_HAND := 0.75  # the lake has faded into its picture here (level.gd LEAVE_HAND)
@@ -960,6 +961,22 @@ func _build_ui() -> void:
 		l.modulate.a = 1.0 if Game.is_unlocked(i) else 0.4
 		map_labels.append(l)
 		map_ui.add_child(l)
+	# What opens chapter two, from the start, so it's never a surprise (after the lake names: their order
+	# in map_labels matters).
+	var eggs: Array = Game.eggs_returned()
+	ch2_label = Label.new()
+	if Game.goals_earned() >= Game.CH2_GOALS and int(eggs[0]) >= int(eggs[1]):
+		ch2_label.text = "Chapter two is ready"
+	else:
+		ch2_label.text = "Chapter two: %d goals and every egg   ·   %d/%d, eggs %d/%d" % [Game.CH2_GOALS, Game.goals_earned(),
+			Game.lake_count() * 3, int(eggs[0]), int(eggs[1])]
+	ch2_label.add_theme_font_size_override("font_size", 18)
+	ch2_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	ch2_label.modulate.a = 0.55
+	ch2_label.position = Vector2(0, top_inset + off.y * 0.5 + 222)
+	ch2_label.size = Vector2(view_size.x, 30)
+	map_labels.append(ch2_label)
+	map_ui.add_child(ch2_label)
 	# Labels take the day's ink colour; in daylight the dark drop shadow becomes a faint light one.
 	for lb in map_labels:
 		lb.add_theme_color_override("font_color", ink)
@@ -1949,7 +1966,7 @@ func _celebrate() -> void:
 	cele_fx.draw.connect(_fw_draw)
 	cele_ui.add_child(cele_fx)
 	road_lit = 0.0
-	for lb in [map_labels[0], map_labels[1]]:
+	for lb in [map_labels[0], map_labels[1], ch2_label]:
 		create_tween().tween_property(lb, "modulate:a", 0.0, 0.8)
 	if shore_flies.is_empty():
 		_make_shore_flies()
@@ -2045,7 +2062,7 @@ func _show_chapter_words() -> void:
 		dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		shades.append(dim)
 		cele_dimmed.clear()
-		for lb in map_labels.slice(2):
+		for lb in map_labels.slice(2, 2 + Game.lake_count()):  # the lake names
 			cele_dimmed.append([lb, lb.modulate.a])
 			lb.create_tween().tween_property(lb, "modulate:a", 0.0, 0.6)
 		for lb in cele_ui.get_children():
@@ -2214,6 +2231,7 @@ func _on_cele_input(e: InputEvent) -> void:
 	create_tween().tween_property(self, "cele_icons_a", 1.0, 0.6)
 	create_tween().tween_property(map_labels[0], "modulate:a", 1.0, 0.6)
 	create_tween().tween_property(map_labels[1], "modulate:a", 0.75, 0.6)
+	create_tween().tween_property(ch2_label, "modulate:a", 0.55, 0.6)
 	fw_show = false
 	fw_show_words = false
 	create_tween().tween_property(self, "cele_night", 0.0, 2.5).set_trans(Tween.TRANS_SINE)  # back to this spot's own time of day

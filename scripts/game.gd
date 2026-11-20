@@ -150,7 +150,7 @@ func _build_lakes() -> void:
 			"rocks": [[360, 520, 40], [215, 790, 32], [495, 850, 45], [385, 1035, 28]],
 			"reeds": [],
 			"start": [300, 1150, -PI / 2], "jetty": [292, 1226, 296, 1182, ""], "rig": 1, "ducks": 1,
-			"swan": [604, 1095, 225.0, 0.8],  # nest, how far their water reaches, seconds before the cob charges
+			"swan": [71, 705, 190.0, 0.8],  # nest, how far their water reaches, seconds before the cob charges
 		},
 		{
 			"name": "Reed Bend",
@@ -170,7 +170,7 @@ func _build_lakes() -> void:
 			"rocks": [],
 			"reeds": [[245, 690, 70], [520, 330, 60], [235, 1055, 70]],
 			"start": [390, 1150, -PI * 0.6], "jetty": [384, 1242, 388, 1184, "T"], "rig": -1, "dusk_start": 0.5, "ducks": 1,
-			"swan": [521, 582, 225.0, 1.0],
+			"swan": [346, 674, 190.0, 1.0],
 		},
 		{
 			"name": "Twin Lights",
@@ -235,7 +235,34 @@ func is_night(i: int) -> bool:
 
 ## The time goal's icon and name for a lake.
 func time_goal(i: int) -> Array:
+	# A lake with swans swaps this goal for returning their egg (daylight still ends the run).
+	if lakes[i].has("swan"):
+		return ["egg", "Return the egg"]
 	return ["battery", "Battery to spare"] if is_night(i) else ["sun", "Before dusk"]
+
+
+## Chapter two opens at this many goals of the chapter's 15, with every swans' egg returned.
+const CH2_GOALS := 12
+
+
+func goals_earned() -> int:
+	var n := 0
+	for i in lakes.size():
+		var m := int(marks[i])
+		n += int(m & MARK_ALL != 0) + int(m & MARK_TIME != 0) + int(m & MARK_LOOPS != 0)
+	return n
+
+
+## [eggs returned, egg goals in the chapter].
+func eggs_returned() -> Array:
+	var got := 0
+	var all := 0
+	for i in lakes.size():
+		if lakes[i].has("swan"):
+			all += 1
+			if int(marks[i]) & MARK_TIME != 0:
+				got += 1
+	return [got, all]
 
 
 func lake_count() -> int:

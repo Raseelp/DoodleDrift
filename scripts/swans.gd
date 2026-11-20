@@ -67,6 +67,20 @@ var nest_view: SubViewport
 var pen_view: SubViewport = null
 var pen := {"p": Vector2.ZERO, "dir": 0.0, "target": Vector2.ZERO, "until": 0.0, "act": ""}
 var nest_hit := false  # a boat ran up the bank into the nest: she burst off it and stands guard nearby
+# One of their eggs has rolled off into the water. Picked up by running over it, carried on the boat's deck;
+# with it aboard the cob is welcoming (wings down, a soft call, he comes for it), takes it, and paddles it
+# home to the nest. A crash drops it back where it was; if he is killed it is gone for the try.
+var egg_home := Vector2.ZERO
+var egg_p := Vector2.ZERO
+var egg_state := "float"  # float, carried, passing (boat to cob), cob (he takes it home), home, gone, broken
+var shore_spot := Vector2.ZERO  # where he settles on the bank beside the nest once the egg is home
+var wait_spot := Vector2.ZERO  # where he waits, eagerly, while the boat has the egg
+var egg_t := 0.0
+var call_t := 0.0
+var bump_t := 0.0
+var ring_a := 0.0  # the rings round him while the boat has the egg
+const EGG_PICK := 24.0
+const EGG_PASS := 46.0
 
 
 static func make(level, at: Vector2, size: float, temper_s: float, seed: int) -> SwanPair:
@@ -103,7 +117,37 @@ static func make(level, at: Vector2, size: float, temper_s: float, seed: int) ->
 	s.nest_view.nest = true
 	level.add_child(s.nest_view)
 	s.nest_view.set_sit(1.0)
+	s._place_egg(level)
 	return s
+
+
+## The egg's spot: on open water about half way from the jetty towards their water, clear of lanterns, so
+## a player heading out often comes across it.
+func _place_egg(level) -> void:
+	var start := Vector2(level.lake["start"][0], level.lake["start"][1])
+	var their := nest + Vector2.from_angle(out_dir) * territory * 0.7
+	var best := their
+	for k in 60:
+		var q := start.lerp(their, 0.5 + rng.randf_range(-0.15, 0.15)) + Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(0.0, 70.0)
+		if not level._free(q) or level._in_reeds(q):
+			continue
+		var ok := true
+		for l in level.lanterns:
+			if q.distance_to(l["p"]) < 70.0:
+				ok = false
+		if ok:
+			best = q
+			break
+	if not level._free(best):
+		# Nowhere clear found: walk back from their water towards the jetty until it is open water, so the
+		# egg can always be reached.
+		for k in range(1, 41):
+			var q := their.lerp(start, k / 40.0)
+			if level._free(q):
+				best = q
+				break
+	egg_home = best
+	egg_p = best
 
 
 ## A point of his water near the nest, round from the nest by angle a.
@@ -151,12 +195,55 @@ func update(delta: float) -> void:
 	var inside := playing and near_nest < territory
 	var warned := playing and near_nest < territory + WARN_MARGIN
 	var near := playing and near_nest < territory + WATCH_MARGIN
+	_update_egg(delta, clock, boat, playing)
+	if state == "ashore":
+		_update_ashore(delta, clock, boat)
+		return
 	var at_nest := near_nest < territory * 0.75 and playing 			and Vector2.from_angle(lv.move_dir).dot((nest - boat).normalized()) > 0.75  # well in, heading for the nest
 	var want := Vector2.ZERO
 	var anim := "Idle"
 	var speed_k := 1.0
 
+	# The egg aboard: he comes down if he was up, and welcomes the boat instead of guarding against it.
+	if egg_state == "carried" and playing:
+		if state in ["takeoff", "fly"]:
+			state = "land"
+			until = clock + LANDING
+		elif state not in ["land", "welcome"] and not (state == "strike" and alt > 0.0):
+			state = "welcome"
+			wait_spot = cp
 	match state:
+		"welcome":
+			# Waiting where he is for it, eagerly: wings down, neck up, turned to the boat, shuffling forward
+			# and back on the spot, paddling with little ripples; calling, more often the nearer it comes.
+			anim = "Idle"
+			speed_k = 1.6
+			cob["dir"] = lerp_angle(float(cob["dir"]), (boat - cp).angle(), 1.0 - exp(-4.0 * delta))
+			var toward := (boat - wait_spot).normalized()
+			var eager := wait_spot + toward * (6.0 + 6.0 * sin(clock * 3.4))
+			want = (eager - cp) * 4.0
+			if rng.randf() < delta * 3.0:
+				lv.ripples.append({"p": cp, "t": clock, "life": 1.0, "r0": 4.0, "r1": 16.0, "light": false})
+			var gap := clampf(cp.distance_to(boat) / 400.0, 0.0, 1.0)
+			if clock - call_t > lerpf(0.9, 2.6, gap):
+				call_t = clock
+				Sfx.swan_call()
+			if egg_state not in ["carried", "passing"]:
+				state = "patrol"
+		"bring":
+			# Taking it home: he paddles back to the nest and tucks it under her.
+			anim = "Idle"
+			var drop := nest + Vector2.from_angle(out_dir) * 22.0
+			want = (drop - cp).normalized() * 28.0 if cp.distance_to(drop) > 8.0 else Vector2.ZERO
+			# Home when he reaches it (or, should the bank keep him a little short, after a few seconds' try).
+			if egg_state == "cob" and (cp.distance_to(drop) < 14.0 or clock - egg_t > 7.0):
+				egg_state = "home"
+				egg_t = clock
+				Sfx.swan_call()
+				Sfx.chime(0.84 * 3.0)
+				Game.vibrate(30)
+				lv.egg_returned()
+				_go_ashore()
 		"patrol", "groom":
 			if near:
 				state = "watch"
@@ -306,8 +393,18 @@ func update(delta: float) -> void:
 
 	# Running into him bow first kills him, whatever he is doing (even mid-charge, head to head).
 	if playing and float(lv.speed) > 40.0 and _bow_on(cp, boat):  # on the water or flying low at it
-		_die(clock, boat)
-		return
+		if egg_state in ["carried", "passing", "cob"]:
+			# Coming to take the egg (or taking it home), he's alongside on purpose: a bump, not a kill.
+			var away: Vector2 = (cp - boat).normalized()
+			cob["p"] = boat + away * (RAM + 2.0)
+			cob["v"] = away * 70.0
+			lv.speed *= 0.85
+			if clock - bump_t > 0.6:
+				bump_t = clock
+				Sfx.bump()
+		else:
+			_die(clock, boat)
+			return
 	var airborne := state in ["takeoff", "fly", "land"] or (state == "strike" and alt > 0.0)
 	if not airborne:
 		_move(want, 400.0 if state in ["return", "display"] else 50.0, delta)
@@ -315,9 +412,9 @@ func update(delta: float) -> void:
 		cob["dir"] = lerp_angle(float(cob["dir"]), Vector2(cob["v"]).angle(), 1.0 - exp(-5.0 * delta))
 	if not airborne and Vector2(cob["v"]).length() > 8.0 and rng.randf() < delta * 1.4:
 		lv.ripples.append({"p": cob["p"], "t": clock, "life": 1.3, "r0": 4.0, "r1": 18.0, "light": false})
-	if not airborne:
-		_cut_trail(clock)  # in the air he leaves the trail alone
-	_update_pen(delta, clock, boat, inside or state in ["warn", "takeoff", "fly", "land", "strike", "display"])
+	if not airborne and state not in ["welcome", "bring"]:
+		_cut_trail(clock)  # in the air (or bringing the egg in) he leaves the trail alone
+	_update_pen(delta, clock, boat, (inside and egg_state != "carried") or state in ["warn", "takeoff", "fly", "land", "strike", "display"])
 	cob_view.set_pose(float(cob["dir"]))
 	cob_view.play(anim, speed_k)
 
@@ -352,7 +449,13 @@ func _update_pen(delta: float, clock: float, boat: Vector2, alarmed: bool) -> vo
 		return
 	pen_sit = move_toward(pen_sit, 0.0 if alarmed else 1.0, delta * 1.8)
 	nest_view.set_sit(pen_sit)
-	nest_view.set_pose(lerp_angle(out_dir, (boat - nest).angle(), 1.0 - pen_sit))
+	# Sitting, she looks out towards her lost egg while it's out there (or the boat that has it now), and
+	# calls for it now and then.
+	var rest_dir := (egg_p - nest).angle() if egg_state == "float" else (boat - nest).angle() if egg_state == "carried" else out_dir
+	nest_view.set_pose(lerp_angle(rest_dir, (boat - nest).angle(), 1.0 - pen_sit))
+	if egg_state == "float" and not alarmed and clock - call_t > 6.5 and boat.distance_to(nest) < territory + 260.0:
+		call_t = clock
+		Sfx.swan_call()
 	if alarmed:
 		nest_view.play("WalkForwardStandWing")
 	else:
@@ -408,12 +511,60 @@ func _update_widow(delta: float, clock: float) -> void:
 	pen_view.set_pose(float(pen["dir"]))
 
 
+## The egg is home: he walks up out of the water onto the bank beside the nest and stays there with her.
+## He doesn't guard their water any more (and on land a boat can't run him down).
+func _go_ashore() -> void:
+	state = "ashore"
+	var side := Vector2.from_angle(out_dir).orthogonal()
+	shore_spot = nest + side * 16.0 - Vector2.from_angle(out_dir) * 6.0
+	if Geometry2D.is_point_in_polygon(shore_spot, pool):
+		shore_spot = nest - side * 16.0 - Vector2.from_angle(out_dir) * 6.0
+	cob_view.on_land = true
+	if cob_view.fold:
+		cob_view.fold.active = false  # his legs show on the bank
+	cob["v"] = Vector2.ZERO
+
+
+## Ashore with her: he walks up beside the nest, then rests there, preening now and then; if the boat comes
+## up the bank at them, he stands and hisses at it.
+func _update_ashore(delta: float, clock: float, boat: Vector2) -> void:
+	var cp: Vector2 = cob["p"]
+	var to := shore_spot - cp
+	var anim := "Idle"
+	if to.length() > 2.0:
+		anim = "WalkForwardStandWing"
+		cob["dir"] = lerp_angle(float(cob["dir"]), to.angle(), 1.0 - exp(-5.0 * delta))
+		cob["p"] = cp + to.normalized() * minf(16.0 * delta, to.length())
+	elif nest_hit:
+		anim = "WalkForwardStandWing"
+		cob["dir"] = lerp_angle(float(cob["dir"]), (boat - cp).angle(), 1.0 - exp(-3.0 * delta))
+		if clock - hiss_t > 2.0:
+			hiss_t = clock
+			Sfx.hiss()
+	else:
+		cob["dir"] = lerp_angle(float(cob["dir"]), out_dir, 1.0 - exp(-1.5 * delta))
+		anim = "Grooming" if fmod(clock, 11.0) < 3.0 else "Idle"
+	alt = 0.0
+	_update_pen(delta, clock, boat, false)
+	cob_view.set_pose(float(cob["dir"]))
+	cob_view.play(anim)
+
+
 ## A boat ploughs up the bank into the nest: twigs and down burst out, the eggs show, and the pen (if she is
 ## on it) bursts off flapping and hissing, runs off along the bank away from the boat, then turns to face it.
+## If their returned egg was back in it, it breaks: the goal is undone for this try.
 func hit_nest(dir: Vector2) -> void:
 	if nest_hit:
 		return
 	nest_hit = true
+	if egg_state == "home":
+		egg_state = "broken"
+		for k in 9:
+			lv._part(nest + Vector2(rng.randf_range(-4, 4), rng.randf_range(-4, 4)),
+				Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(20, 60) + dir * 20.0, rng.randf_range(0.6, 1.0),
+				rng.randf_range(1.2, 2.0), Color("f4efe4") if k % 3 else Color("e8c66a"), false)  # shell, a little yolk
+		Sfx.egg_crack()
+		lv.egg_broken()
 	for k in 14:
 		lv._part(nest, Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(25, 80) + dir * 25.0, rng.randf_range(0.6, 1.1),
 			rng.randf_range(1.6, 2.6), Color("8a6a44") if k % 2 else Color("b39466"), false)  # twigs
@@ -502,6 +653,11 @@ func _strike(clock: float, boat: Vector2) -> void:
 ## The boat ran him down: he is knocked, collapses and sinks.
 func _die(clock: float, boat: Vector2) -> void:
 	alive = false
+	if egg_state != "home":
+		if egg_state in ["carried", "passing", "cob"]:
+			egg_p = lv.boat_pos  # it rolls off the deck where the boat is
+		egg_state = "gone"  # no one to bring it to now
+		egg_t = clock
 	state = "dead"
 	dead_t = clock
 	var push: Vector2 = Vector2.from_angle(lv.move_dir)
@@ -586,13 +742,93 @@ func _cut_trail(clock: float) -> void:
 
 # ---------------------------------------------------------------- drawing
 
+## The egg on the water: white, bobbing, a glint and small rings round it. (Aboard and being passed over
+## it is drawn in the air layer, draw_egg_air, so the boat doesn't hide it.)
+func draw_egg(ci: CanvasItem) -> void:
+	var clock: float = lv.clock
+	if egg_state == "float":
+		var bob := sin(clock * 2.1) * 1.2
+		var p := egg_p + Vector2(0, bob)
+		for k in 2:
+			var rk := fmod(clock * 0.45 + k * 0.5, 1.0)
+			ci.draw_arc(egg_p, 9.0 + rk * 16.0, 0.0, TAU, 32, Color(1, 1, 1, 0.35 * (1.0 - rk)), 1.2, true)
+		_draw_egg_shape(ci, p, 1.0, 1.0)
+	elif egg_state == "gone":
+		var a := 1.0 - clampf((clock - egg_t) / 1.5, 0.0, 1.0)  # slips under
+		if a > 0.0:
+			_draw_egg_shape(ci, egg_p, a, 1.0 - 0.4 * (1.0 - a))
+
+
+func draw_egg_air(ci: CanvasItem) -> void:
+	if egg_state == "carried":
+		var d := Vector2.from_angle(float(lv.heading))
+		_draw_egg_shape(ci, Vector2(lv.boat_pos) - d * 12.0, 1.0, 0.9)  # on the deck, aft
+	elif egg_state == "passing":
+		var k := clampf((lv.clock - egg_t) / 0.45, 0.0, 1.0)
+		var from: Vector2 = egg_p
+		var to: Vector2 = cob["p"]
+		var p := from.lerp(to, k) - Vector2(0, sin(PI * k) * 14.0)  # a little lift as it goes over
+		_draw_egg_shape(ci, p, 1.0, 0.9)
+	elif egg_state == "cob":
+		_draw_egg_shape(ci, Vector2(cob["p"]) + Vector2.from_angle(float(cob["dir"])) * 6.0, 1.0, 0.8)
+
+
+func _draw_egg_shape(ci: CanvasItem, p: Vector2, a: float, s: float) -> void:
+	ci.draw_set_transform(p + Vector2(2, 2.5), 0.0, Vector2(0.82, 1.0) * s)
+	ci.draw_circle(Vector2.ZERO, 6.5, Color(0.02, 0.06, 0.08, 0.3 * a))
+	ci.draw_set_transform(p, 0.0, Vector2(0.82, 1.0) * s)
+	ci.draw_circle(Vector2.ZERO, 6.5, Color(0.97, 0.95, 0.9, a))
+	ci.draw_circle(Vector2(1.6, 1.8), 4.6, Color(0.86, 0.83, 0.76, 0.6 * a))
+	var gl := 0.6 + 0.4 * sin(lv.clock * 3.0)
+	ci.draw_circle(Vector2(-2.0, -2.6), 1.6, Color(1, 1, 1, 0.9 * a * gl))
+	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+
+## The egg each frame: picked up by running over it; while aboard, the cob takes it once alongside; a
+## crash (or the run ending another way) drops it back on its spot.
+func _update_egg(delta: float, clock: float, boat: Vector2, playing: bool) -> void:
+	match egg_state:
+		"float":
+			if playing and boat.distance_to(egg_p) < EGG_PICK:
+				egg_state = "carried"
+				Sfx.chime(0.84 * 2.5)
+				Game.vibrate(20)
+				call_t = clock - 2.0  # he calls out soon after
+		"carried":
+			if lv.state == "crashed" or not alive:
+				egg_state = "float" if alive else "gone"
+				egg_p = egg_home
+				egg_t = clock
+			elif playing and alive and Vector2(cob["p"]).distance_to(boat) < EGG_PASS and alt <= 0.0:
+				egg_state = "passing"
+				egg_p = boat
+				egg_t = clock
+		"passing":
+			if clock - egg_t > 0.45:
+				egg_state = "cob"
+				state = "bring"
+
+
 func draw_nest(ci: CanvasItem) -> void:
+	draw_egg(ci)
 	_draw_view(ci, nest_view, nest, NEST_PX_PER_M, Color(0.04, 0.07, 0.08, 0.3), 1.0, 0.0)
 	if pen_view:
 		_draw_view(ci, pen_view, pen["p"], NEST_PX_PER_M, Color(0.04, 0.07, 0.08, 0.3), 1.0, 0.0)
 
 
 func draw_cob(ci: CanvasItem) -> void:
+	# While the boat has the egg: soft rings of light spreading slowly out from him on the water, like
+	# ripples, so the eye goes to him (fading in on pick-up, out once he has it).
+	var want_ring := 1.0 if egg_state in ["carried", "passing"] else 0.0
+	ring_a = move_toward(ring_a, want_ring, lv.get_process_delta_time() * 1.5)
+	if ring_a > 0.0 and alt < 0.3:
+		var cp: Vector2 = cob["p"]
+		for k in 3:
+			var rk := fmod(lv.clock / 2.4 + k / 3.0, 1.0)
+			var e := 1.0 - (1.0 - rk) * (1.0 - rk)
+			var r := 16.0 + e * 34.0
+			var a := sin(PI * rk) * 0.5 * ring_a  # rises as it leaves him, gone as it spreads
+			ci.draw_arc(cp, r, 0.0, TAU, 48, Color(1.0, 0.95, 0.82, a), 1.6 * (1.0 - rk) + 0.6, true)
 	if alt >= 0.3:
 		return  # drawn up in the air layer (draw_cob_air)
 	var a := 1.0
@@ -605,6 +841,7 @@ func draw_cob(ci: CanvasItem) -> void:
 
 ## The cob in the air, drawn above the boat and the trees.
 func draw_cob_air(ci: CanvasItem) -> void:
+	draw_egg_air(ci)
 	if alt < 0.3:
 		return
 	var bob := Vector2(0, sin(lv.clock * 7.0) * 1.5 * alt)
