@@ -11,5 +11,8 @@ Boat model
 Pickup model
 "Low Poly Car - Chevrolet C10 Pickup 1963" by ROH3D, https://sketchfab.com/3d-models/low-poly-car-chevrolet-c10-pickup-1963-679354c151984747bb74310ec5af8995, CC BY 4.0
 
+Swan model
+"Animated Swan - Rigged & Optimized Game Ready" by GAMICO, https://sketchfab.com/3d-models/04ac4add046843ee975f6785d24c042e, CC BY 4.0
+
 Trailer model
 "Boat Trailer" by BoatUS Foundation, https://sketchfab.com/3d-models/none-594ef36c27924dcaa677781c756fbc7c, CC BY 4.0

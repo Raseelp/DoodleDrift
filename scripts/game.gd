@@ -42,6 +42,7 @@ const BOAT_MODEL := "res://models/fishing_boat.glb"
 var _boat_scene: PackedScene
 const PICKUP_MODEL := "res://models/pickup_low.glb"
 const TRAILER_MODEL := "res://models/trailer_low.glb"
+const SWAN_MODEL := "res://models/swan.glb"
 var _scenes := {}  # the pickup and trailer, loaded once like the boat
 ## The storm lantern pictures (scripts/lantern_art.gd), rendered once shortly after start-up.
 ## anchor: where the float meets the water in the picture; glass: the flame. Null until ready.
@@ -54,7 +55,7 @@ var lantern_glass := Vector2.ZERO
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
-	for path in [BOAT_MODEL, PICKUP_MODEL, TRAILER_MODEL]:
+	for path in [BOAT_MODEL, PICKUP_MODEL, TRAILER_MODEL, SWAN_MODEL]:
 		if ResourceLoader.exists(path):
 			ResourceLoader.load_threaded_request(path)
 	_build_lakes()
@@ -127,7 +128,7 @@ func _build_lakes() -> void:
 		},
 		{
 			"name": "Stones",
-			"hint": "Stones block the boat.\nSteer around them.",
+			"hint": "Swans guard their nest.\nKeep your distance.",
 			"par": 2, "pitch": 0.8909, "motes": "leaves",
 			"pal": _pal({
 				"land": "b08a55", "land_dark": "9e7a4a", "tree": "b2603c", "tree_hi": "da8c57",
@@ -142,6 +143,7 @@ func _build_lakes() -> void:
 			"rocks": [[360, 520, 40], [215, 790, 32], [495, 850, 45], [385, 1035, 28]],
 			"reeds": [],
 			"start": [300, 1150, -PI / 2], "jetty": [292, 1226, 296, 1182, ""], "rig": 1, "ducks": 1,
+			"swan": [604, 1095, 225.0, 0.8],  # nest, how far their water reaches, seconds before the cob charges
 		},
 		{
 			"name": "Reed Bend",
@@ -161,6 +163,7 @@ func _build_lakes() -> void:
 			"rocks": [],
 			"reeds": [[245, 690, 70], [520, 330, 60], [235, 1055, 70]],
 			"start": [390, 1150, -PI * 0.6], "jetty": [384, 1242, 388, 1184, "T"], "rig": -1, "dusk_start": 0.5, "ducks": 1,
+			"swan": [521, 582, 225.0, 1.0],
 		},
 		{
 			"name": "Twin Lights",

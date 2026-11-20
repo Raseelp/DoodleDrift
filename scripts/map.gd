@@ -1760,7 +1760,7 @@ func _open_settings() -> void:
 	col.add_child(kicker.call("CREDITS"))
 	gap.call(8)
 	var credits := Label.new()
-	credits.text = "Boat: \"Fishing Boat\" by CharlieCatling, Sketchfab\nPickup: \"Low Poly Car - Chevrolet C10 Pickup 1963\" by ROH3D (CC BY 4.0)\nTrailer: \"Boat Trailer\" by BoatUS Foundation (CC BY 4.0)\nIcons by Lorc, Delapouite and priorblue, game-icons.net (CC BY 3.0)\nPause, play and restart icons: Phosphor Icons (MIT)\nMade with the Godot Engine"
+	credits.text = "Boat: \"Fishing Boat\" by CharlieCatling, Sketchfab\nPickup: \"Low Poly Car - Chevrolet C10 Pickup 1963\" by ROH3D (CC BY 4.0)\nTrailer: \"Boat Trailer\" by BoatUS Foundation (CC BY 4.0)\nSwan: \"Animated Swan - Rigged & Optimized\" by GAMICO (CC BY 4.0)\nIcons by Lorc, Delapouite and priorblue, game-icons.net (CC BY 3.0)\nPause, play and restart icons: Phosphor Icons (MIT)\nMade with the Godot Engine"
 	credits.add_theme_font_size_override("font_size", 21)
 	credits.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	credits.custom_minimum_size = Vector2(inner_w, 0)

@@ -142,10 +142,24 @@ var light_times: Array = []
 var chain := 0
 var last_loop_t := -10.0
 var families: Array = []  # mallard hens and their ducklings (ducks.gd)
+var swans: SwanPair = null  # a pair of mute swans guarding their nest (swans.gd), one pair at most
 var splashes: Array = []
 var floaters: Array = []
 var fish_timer := 3.0
 var crash_kind := ""
+# After the last lantern: the player can still steer; let go and the boat brings itself home to its
+# mooring off the end of the jetty, gliding in nose first and stopping there (_dock_step).
+const DOCK_IDLE := 0.5  # seconds without steering before it heads home
+var homing := false
+var dock_turn := 0.0  # the autopilot's steering, -1..1
+var dock_speed := 0.0
+var idle_t := 0.0
+var dock_path := PackedVector2Array()  # the way home over open water, ending lined up with the jetty
+var dock_check_t := 0.0
+var dock_check_p := Vector2.ZERO
+var crash_fast := false  # a tap during the wreck: the slow motion speeds up to the wreck screen
+var crash_armed := false  # a fresh touch began during the wreck; its lift speeds it up
+var paused_scale := 1.0  # the slow motion's time scale while the pause screen is up
 var crash_pos := Vector2.ZERO
 var duration := 30.0  # seconds of daylight, from Game.lake_duration
 var run_time := 0.0
@@ -170,6 +184,7 @@ var zoom_in_t := -1.0
 var skip_armed := false  # a touch began during the zoom in; only its lift skips
 var newly_unlocked := -1  # the lake this win opened, for the map to show
 var tree_layer: Node2D
+var air_node: Node2D
 var light_layer: CanvasLayer
 var ui_layer: CanvasLayer
 
@@ -552,6 +567,9 @@ func _build_geometry() -> void:
 			if clear:
 				families.append(DuckFamily.make(self, q, drng.randi_range(3, 5), drng.randi()))
 				break
+	if lake.has("swan"):
+		var sw: Array = lake["swan"]
+		swans = SwanPair.make(self, Vector2(sw[0], sw[1]), float(sw[2]), float(sw[3]), 9001 * (lake_index + 1))
 
 	_place_trees(rng)
 
@@ -576,6 +594,8 @@ func _place_trees(rng: RandomNumberGenerator) -> void:
 			var cp := Geometry2D.get_closest_point_to_segment(p, jetty[0], jetty[1])
 			if p.distance_to(cp) < r + 30.0:
 				continue
+		if swans and p.distance_to(swans.nest) < r + 44.0:
+			continue  # the swans' nest stays in the open
 		if rig_ok:
 			var near_rig := false
 			var ends := [rig_hitch + Vector2.from_angle(rig_dir) * PICKUP_M * LAKE_PX_PER_M,
@@ -670,6 +690,11 @@ func _build_nodes() -> void:
 	tree_layer = tree_node
 	tree_node.draw_fn = _draw_trees
 	world.add_child(tree_node)
+	air_node = DrawNode.new()  # birds in flight, above the boat and the trees
+	air_node.draw_fn = func(n: Node2D) -> void:
+		if swans:
+			swans.draw_cob_air(n)
+	world.add_child(air_node)
 
 	modulate_node = CanvasModulate.new()
 	add_child(modulate_node)
@@ -781,20 +806,33 @@ func _process(delta: float) -> void:
 			end_timer -= delta
 			if end_timer <= 0.0:
 				_show_game_over("dark")
-		"complete", "dark":
+		"complete":
+			_dock_step(delta)
+			_move_boat(delta, true)
+			end_timer -= delta
+			if end_timer <= 0.0:
+				state = "results"
+				touches.clear()  # a finger held now lifts on the results card; it mustn't stay "held"
+				_show_results()
+		"dark":
 			_move_boat(delta, false)
 			end_timer -= delta
 			if end_timer <= 0.0:
 				state = "results"
 				_show_results()
 		"crashed":
+			if crash_fast:
+				# Speeding up smoothly (in real time) rather than jumping to the end.
+				var real := delta / maxf(Engine.time_scale, 0.01)
+				Engine.time_scale = move_toward(Engine.time_scale, 2.5, real * 3.0)
 			end_timer -= delta
 			if not boat3d:
 				heading += delta * 0.8 * maxf(0.0, end_timer)
 			if end_timer <= 0.0:
 				_show_game_over("wreck")
 		"results":
-			_move_boat(delta, false)
+			_dock_step(delta)
+			_move_boat(delta, true)  # still bringing itself home behind the results
 
 	_run_events()
 	_update_effects(delta)
@@ -822,6 +860,7 @@ func _process(delta: float) -> void:
 	if not zooming:
 		modulate_node.color = _day_tint()
 	detail_node.queue_redraw()
+	air_node.queue_redraw()
 	for m in reed_mats:
 		m.set_shader_parameter("time", clock)
 	light_node.queue_redraw()
@@ -847,6 +886,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			elif skip_armed:
 				zoom_in_t = ENTER_CAM + GROW_TIME  # skip to the end
 		return
+	if state == "crashed":
+		# A fresh tap during the wreck speeds it up to the wreck screen (smoothly, see _process).
+		if event is InputEventScreenTouch:
+			if event.pressed:
+				crash_armed = true
+			elif crash_armed:
+				crash_fast = true
+		return
 	if event is InputEventScreenTouch:
 		if event.pressed:
 			touches[event.index] = event.position.x
@@ -868,20 +915,27 @@ func _notification(what: int) -> void:
 		else:
 			_pause()
 	elif what == NOTIFICATION_APPLICATION_FOCUS_OUT or what == NOTIFICATION_APPLICATION_PAUSED:
-		if state == "play" and overlay == null:
+		if state in ["play", "crashed"] and overlay == null:
 			_pause()
 
 
 func _move_boat(delta: float, steering: bool) -> void:
 	var want := float(_turn_input()) * TURN_RATE if steering else 0.0
+	if steering and homing:
+		want = dock_turn * TURN_RATE
 	turn_vel = move_toward(turn_vel, want, TURN_RATE / TURN_EASE * delta)
 	heading += turn_vel * delta
 	var target := 0.0
+	var accel := 45.0
 	if state == "play":
 		target = REED_SPEED if _in_reeds(boat_pos) or clock < scrape_until else SPEED
 		if clock < boost_until:
 			target *= BOOST_MULT
-	var accel := 140.0 if state == "play" else 45.0
+		accel = 140.0
+	elif steering and state in ["complete", "results"]:
+		# Done: sailing on freely while steered, or heading home on its own.
+		target = dock_speed if homing else (REED_SPEED if _in_reeds(boat_pos) else SPEED)
+		accel = 90.0
 	speed = move_toward(speed, target, accel * delta)
 	if speed < 0.5:
 		return
@@ -1044,6 +1098,8 @@ func _hits_rock(p: Vector2) -> bool:
 func _crash(kind: String) -> void:
 	state = "crashed"
 	crash_kind = kind
+	crash_fast = false
+	crash_armed = false
 	crash_pos = boat_pos
 	finished_dusk = dusk
 	speed = 0.0
@@ -1352,13 +1408,184 @@ func _run_events() -> void:
 	events = keep
 
 
+## After the last lantern: while the player steers, nothing to do. Once they let go, it finds a way home
+## over open water (round rocks, the jetty, the shore's bends, lanterns and reed beds) to its mooring
+## just off the jetty's end, follows it smoothly, lines up with the jetty on the way in so it glides in
+## nose first, slows as it nears and stops there, square to the jetty.
+func _dock_step(delta: float) -> void:
+	if _turn_input() != 0:
+		idle_t = 0.0
+		homing = false
+		dock_path = PackedVector2Array()
+		return
+	idle_t += delta
+	if idle_t < DOCK_IDLE and not homing:
+		return  # just let go: a moment's coasting before it takes over
+	var st: Array = lake["start"]
+	var moor := Vector2(st[0], st[1])
+	var face := float(st[2]) + PI  # set off facing away from the jetty; comes home facing it
+	if not homing or dock_path.is_empty():
+		homing = true
+		dock_path = _plan_home(moor, face)
+		dock_check_t = 0.0
+		dock_check_p = boat_pos
+	# Held up for a while (pushed off line): find the way again.
+	dock_check_t += delta
+	if dock_check_t > 1.5:
+		if boat_pos.distance_to(dock_check_p) < 12.0 and boat_pos.distance_to(moor) > 12.0:
+			dock_path = _plan_home(moor, face)
+		dock_check_t = 0.0
+		dock_check_p = boat_pos
+	# Follow the way: aim at a point a little ahead along it.
+	var k := 0
+	var best := INF
+	for i in dock_path.size():
+		var dd := boat_pos.distance_squared_to(dock_path[i])
+		if dd < best:
+			best = dd
+			k = i
+	var left := 0.0  # how far there is still to go
+	for i in range(k, dock_path.size() - 1):
+		left += dock_path[i].distance_to(dock_path[i + 1])
+	var look := clampf(left * 0.5, 0.0, 46.0)
+	var carrot := dock_path[dock_path.size() - 1]
+	var acc := 0.0
+	for i in range(k, dock_path.size() - 1):
+		var seg := dock_path[i].distance_to(dock_path[i + 1])
+		if acc + seg >= look:
+			carrot = dock_path[i].lerp(dock_path[i + 1], (look - acc) / maxf(seg, 0.001))
+			break
+		acc += seg
+	var d := boat_pos.distance_to(moor)
+	var aim := (carrot - boat_pos).angle() if d > 6.0 else face
+	var diff := wrapf(aim - heading, -PI, PI)
+	dock_turn = clampf(diff * 1.6, -1.0, 1.0)
+	# Easing off as it nears: cruising speed far away, a gentle drift at the end, then still; slower
+	# through a tight turn.
+	dock_speed = clampf(minf(left, d) * 1.2 + 4.0, 0.0, SPEED * 0.85) * (1.0 - 0.6 * clampf(absf(diff) - 0.8, 0.0, 1.0))
+	if d < 4.0:
+		dock_speed = 0.0
+
+
+## The way home: a search over a grid of open water from the boat to a point back along the jetty's
+## line, then straight in to the mooring. Lanterns and reed beds cost extra (it keeps clear of them),
+## and the path is straightened wherever there is a clear line.
+func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
+	const STEP := 16.0
+	var into := Vector2.from_angle(face)
+	var approach := moor - into * 70.0
+	if not _free(approach):
+		approach = moor - into * 40.0
+	var cols := int(Game.LAKE_SIZE.x / STEP)
+	var rows := int(Game.LAKE_SIZE.y / STEP)
+	var cell := func(c: Vector2i) -> Vector2: return Vector2(c) * STEP + Vector2(STEP, STEP) * 0.5
+	var near_cell := func(p: Vector2) -> Vector2i:
+		var best := Vector2i(clampi(int(p.x / STEP), 0, cols - 1), clampi(int(p.y / STEP), 0, rows - 1))
+		var bd := INF
+		for dy in range(-4, 5):
+			for dx in range(-4, 5):
+				var c := Vector2i(int(p.x / STEP) + dx, int(p.y / STEP) + dy)
+				if c.x < 0 or c.y < 0 or c.x >= cols or c.y >= rows:
+					continue
+				var q: Vector2 = cell.call(c)
+				if _free(q) and q.distance_to(p) < bd:
+					bd = q.distance_to(p)
+					best = c
+		return best
+	var start: Vector2i = near_cell.call(boat_pos)
+	var goal: Vector2i = near_cell.call(approach)
+	var open_cells: Dictionary = {}
+	var extra: Dictionary = {}  # per cell: free (0+ cost) or blocked (-1)
+	var cost_of := func(c: Vector2i) -> float:
+		if extra.has(c):
+			return extra[c]
+		var q: Vector2 = cell.call(c)
+		var v := -1.0
+		if _free(q):
+			v = 0.0
+			for l in lanterns:
+				var ld := q.distance_to(l["p"])
+				if ld < 60.0:
+					v += (60.0 - ld) * 0.6
+			if _in_reeds(q):
+				v += 12.0
+		extra[c] = v
+		return v
+	var g := {start: 0.0}
+	var came := {}
+	open_cells[start] = boat_pos.distance_to(cell.call(goal))
+	var found := false
+	var guard := 0
+	while not open_cells.is_empty() and guard < 6000:
+		guard += 1
+		var cur: Vector2i = open_cells.keys()[0]
+		var cf: float = open_cells[cur]
+		for c in open_cells:
+			if float(open_cells[c]) < cf:
+				cf = open_cells[c]
+				cur = c
+		open_cells.erase(cur)
+		if cur == goal:
+			found = true
+			break
+		for dy in range(-1, 2):
+			for dx in range(-1, 2):
+				if dx == 0 and dy == 0:
+					continue
+				var nb := cur + Vector2i(dx, dy)
+				if nb.x < 0 or nb.y < 0 or nb.x >= cols or nb.y >= rows:
+					continue
+				var cc: float = cost_of.call(nb)
+				if cc < 0.0:
+					continue
+				var ng: float = float(g[cur]) + STEP * (1.414 if dx != 0 and dy != 0 else 1.0) + cc
+				if not g.has(nb) or ng < float(g[nb]):
+					g[nb] = ng
+					came[nb] = cur
+					open_cells[nb] = ng + Vector2(nb).distance_to(Vector2(goal)) * STEP
+	var raw := PackedVector2Array([boat_pos])
+	if found:
+		var chain: Array = []
+		var c: Vector2i = goal
+		while came.has(c):
+			chain.push_front(c)
+			c = came[c]
+		for cc in chain:
+			raw.append(cell.call(cc))
+	raw.append(approach)
+	raw.append(moor)
+	# Straighten it: skip ahead wherever the line between two points is clear water.
+	var path := PackedVector2Array([raw[0]])
+	var i := 0
+	while i < raw.size() - 1:
+		var j := raw.size() - 1
+		while j > i + 1 and not _clear_line(raw[i], raw[j]):
+			j -= 1
+		path.append(raw[j])
+		i = j
+	return path
+
+
+func _clear_line(a: Vector2, b: Vector2) -> bool:
+	var n := int(a.distance_to(b) / 8.0) + 1
+	for k in n + 1:
+		var q := a.lerp(b, float(k) / n)
+		if not _free(q):
+			return false
+		for l in lanterns:
+			if q.distance_to(l["p"]) < 44.0:
+				return false
+	return true
+
+
 func _end(kind: String, wait := 1.8) -> void:
 	if state != "play":
 		return
 	state = kind
 	finished_dusk = dusk
 	end_timer = wait
-	touches.clear()
+	if kind != "complete":
+		touches.clear()  # after the last lantern the player keeps steering: a held finger still counts
 
 
 func _update_effects(delta: float) -> void:
@@ -1401,6 +1628,8 @@ func _update_effects(delta: float) -> void:
 			_spawn_fish()
 	for f in families:
 		f.update(delta)
+	if swans:
+		swans.update(delta)
 	_update_shards(delta)
 	var fk: Array = []
 	for f in floaters:
@@ -1678,6 +1907,9 @@ func _draw_details(n: Node2D) -> void:
 	# Duck families (ducks.gd).
 	for f in families:
 		f.draw(n, shade)
+	if swans:
+		swans.draw_nest(n)
+		swans.draw_cob(n)
 
 	var pair_col: Color = pal["pair"]
 	for i in lanterns.size():
@@ -2263,10 +2495,16 @@ func _plate_box() -> StyleBoxFlat:
 # ---------------------------------------------------------------- screens
 
 func _pause() -> void:
-	if overlay != null or zooming or state in ["results", "crashed", "leaving", "dying"]:
+	if overlay != null or zooming or state in ["results", "leaving", "dying"]:
 		return
 	touches.clear()
 	get_tree().paused = true
+	if state == "crashed":
+		# Paused mid-wreck: the slow motion and the sinking boat wait; the pause screen runs at normal speed.
+		paused_scale = Engine.time_scale
+		Engine.time_scale = 1.0
+		if boat3d:
+			boat3d.process_mode = Node.PROCESS_MODE_PAUSABLE
 	overlay = Control.new()
 	overlay.process_mode = Node.PROCESS_MODE_ALWAYS
 	overlay.size = view_size
@@ -2423,6 +2661,10 @@ func _resume() -> void:
 	if overlay != null:
 		overlay.queue_free()
 		overlay = null
+	if state == "crashed":
+		Engine.time_scale = paused_scale
+		if boat3d:
+			boat3d.process_mode = Node.PROCESS_MODE_ALWAYS
 	_set_hud_visible(true)
 	touches.clear()
 	get_tree().paused = false

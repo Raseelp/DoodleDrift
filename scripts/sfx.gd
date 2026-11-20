@@ -56,7 +56,8 @@ func _generate() -> void:
 		"pad": _make_pad(), "shimmer": _make_shimmer(), "bells": _make_bells(),
 		"hull": _make_hull(), "reeds": _make_reeds(),
 		"bird": _make_bird(), "frog": _make_frog(), "owl": _make_owl(), "quack": _make_quack(),
-		"stamp": _make_stamp(), "snap": _make_snap(), "peep": _make_peep(),
+		"stamp": _make_stamp(), "snap": _make_snap(), "peep": _make_peep(), "hiss": _make_hiss(),
+		"beats": _make_beats(),
 	}
 	call_deferred("_on_generated", out)
 
@@ -113,6 +114,16 @@ func crash() -> void:
 func plop() -> void:
 	_play("tap", randf_range(0.28, 0.36), -14.0)
 	_play("whoosh", 2.2, -20.0)
+
+
+## A mute swan's hiss: a breathy, rasping warning.
+func hiss() -> void:
+	_play("hiss", randf_range(0.92, 1.06), -8.0)
+
+
+## A swan's wings beating on the water.
+func wingbeat() -> void:
+	_play("beats", randf_range(0.9, 1.05), -6.0)
 
 
 ## A duckling left behind: a thin high "peep-peep".
@@ -466,6 +477,34 @@ func _make_reeds() -> AudioStreamWAV:
 		prev = w
 		s[i] = hp * (0.4 + 0.6 * pow(absf(sin(TAU * t * 3.0 + sin(TAU * t))), 3.0))
 	return _to_wav(s, RATE_HI, true)
+
+
+func _make_hiss() -> AudioStreamWAV:
+	var secs := 0.75
+	var s := _buf(secs, RATE_HI)
+	var prev := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var n := randf_range(-1.0, 1.0)
+		var hp := n - prev  # brighter: mostly the high hiss of breath
+		prev = n
+		var env := smoothstep(0.0, 0.06, t) * (1.0 - smoothstep(0.35, secs, t))
+		var rasp := 0.75 + 0.25 * sin(TAU * 38.0 * t)  # a little throaty flutter
+		s[i] = hp * env * rasp * 0.35
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_beats() -> AudioStreamWAV:
+	var secs := 0.6
+	var s := _buf(secs, RATE_HI)
+	var lp := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var k := fmod(t, 0.17)
+		var env := exp(-k * 28.0) if t < 0.51 else 0.0
+		lp += (randf_range(-1.0, 1.0) - lp) * 0.18  # dull thump of wing on water
+		s[i] = (lp * 2.2 + randf_range(-1.0, 1.0) * 0.25 * exp(-k * 60.0)) * env * 0.6
+	return _to_wav(s, RATE_HI, false)
 
 
 func _make_peep() -> AudioStreamWAV:

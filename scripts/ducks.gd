@@ -477,6 +477,13 @@ func _avoid(p: Vector2, near: float) -> Vector2:
 		var jn: Array = lv.jet.nearest(p)
 		if float(jn[0]) < near:
 			push += Vector2(jn[1]) * (near - float(jn[0])) * 2.0
+	if lv.swans and lv.swans.alive:
+		# Ducks keep out of the swans' way, and well away from their nest.
+		for pair in [[Vector2(lv.swans.cob["p"]), near + 22.0], [lv.swans.nest, near + 40.0]]:
+			var d: Vector2 = p - Vector2(pair[0])
+			var keep: float = pair[1]
+			if d.length() < keep and d.length() > 0.01:
+				push += d.normalized() * (keep - d.length()) * 2.0
 	return push
 
 
