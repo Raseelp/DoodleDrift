@@ -12,8 +12,8 @@ config_version=5
 boot_splash/show_image=false
 boot_splash/bg_color=Color(0.113725, 0.164706, 0.192157, 1)
 
-config/name="Wake"
-config/description="Light the lanterns with your wake before the water settles."
+config/name="Finding Light"
+config/description="Light the lanterns with your trail before the water settles."
 run/main_scene="res://main.tscn"
 config/quit_on_go_back=false
 config/features=PackedStringArray("4.7")

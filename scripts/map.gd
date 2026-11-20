@@ -63,6 +63,7 @@ var tint_node: CanvasModulate
 var tint_color := Color.WHITE
 const Rig3D = preload("res://scripts/rig3d.gd")
 const Swan3D = preload("res://scripts/swan3d.gd")
+const GAME_TITLE := "FINDING LIGHT"
 const RIG_RENDER := 200  # the rig's render size; it sees 26 m, so 7.7 px a metre
 const RIG_SCALE := 0.74  # drawn at about 5.7 map px a metre: the whole rig is about 125 px long
 const PICKUP_M := 8.7  # the drawn pickup's length (rig3d.gd scales it up)
@@ -938,9 +939,12 @@ func _build_ui() -> void:
 	_set_corner(0.0)
 
 	var title := Label.new()
-	title.text = "WAKE"
+	title.text = GAME_TITLE
 	title.add_theme_font_override("font", Game.title_font)
-	title.add_theme_font_size_override("font_size", 84)
+	var title_fs := 84
+	while title_fs > 40 and Game.title_font.get_string_size(GAME_TITLE, HORIZONTAL_ALIGNMENT_LEFT, -1, title_fs).x > view_size.x - 90.0:
+		title_fs -= 2  # as big as fits across the screen
+	title.add_theme_font_size_override("font_size", title_fs)
 	map_labels.append(title)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.position = Vector2(0, top_inset + off.y * 0.5 + 70)
@@ -1614,7 +1618,7 @@ func _draw_glow(n: Node2D) -> void:
 const DEV_ITEMS := [
 	["chains", "Chain loops", "Quick loops one after another give the sun +3 s."],
 	["boost", "Speed boost", "3 lanterns within 7 s gives 4.5 s of swift water."],
-	["life", "Moving life", "Ducks cut your wake, fish jump, lanterns drift."],
+	["life", "Moving life", "Ducks cut your trail, fish jump, lanterns drift."],
 	["fading", "Fading lanterns", "Lit lanterns go out again after 28 s."],
 	["crash", "Crashes end the run", "Hitting a rock, or the shore head-on, ends the lake."],
 	["unlock_all", "Unlock all lakes", "For testing."],

@@ -3,7 +3,7 @@ lantern, sun, loop: Lorc, https://game-icons.net, CC BY 3.0
 sound, music, vibration: Delapouite, https://game-icons.net, CC BY 3.0
 battery (empty to full): priorblue, https://game-icons.net, CC BY 3.0
 pause, play, restart: Phosphor Icons, https://phosphoricons.com, MIT
-menu, next, close, settings, lock: drawn for Wake
+menu, next, close, settings, lock: drawn for Finding Light
 
 Boat model
 "Fishing Boat" by CharlieCatling, https://sketchfab.com/3d-models/fishing-boat-a3f138089e164200b34bfb1bebb978c2, Sketchfab Free Standard licence

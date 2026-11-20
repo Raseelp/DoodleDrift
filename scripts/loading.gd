@@ -185,8 +185,12 @@ func _draw_art() -> void:
 	# Text is drawn at the screen's own size (not scaled up), so it stays sharp.
 	ci.draw_set_transform(Vector2.ZERO)
 	var ty := sz.y * 0.17
-	_text(ci, "WAKE", _font(Game.title_font), 96, Vector2(sz.x * 0.5 + 7.0, ty + 4.0), Color(0, 0, 0, 0.3))
-	_text(ci, "WAKE", _font(Game.title_font), 96, Vector2(sz.x * 0.5 + 7.0, ty), Color(1, 1, 1, 0.95))
+	var title := "FINDING LIGHT"
+	var tfs := 96
+	while tfs > 40 and Game.title_font.get_string_size(title, HORIZONTAL_ALIGNMENT_LEFT, -1, tfs).x > sz.x - 90.0:
+		tfs -= 2  # as big as fits across the design width
+	_text(ci, title, _font(Game.title_font), tfs, Vector2(sz.x * 0.5 + 7.0, ty + 4.0), Color(0, 0, 0, 0.3))
+	_text(ci, title, _font(Game.title_font), tfs, Vector2(sz.x * 0.5 + 7.0, ty), Color(1, 1, 1, 0.95))
 	_text(ci, "close the loop, light the lantern", _font(Game.heading_font), 26, Vector2(sz.x * 0.5, ty + 52.0),
 		Color(1, 1, 1, 0.6))
 	_text(ci, "Loading" if _shown < 1.0 else "Ready", _font(Game.heading_font), 24,

@@ -1,14 +1,14 @@
-# Wake
+# Finding Light
 
-A calm one-finger boat game for Android. Steer across still lakes and close loops with your wake to light the floating lanterns before the sun goes down.
+A calm one-finger boat game for Android. Steer across still lakes and close loops with your trail to light the floating lanterns before the sun goes down.
 
 ## How to play
 
 - Hold the left or right side of the screen to steer.
-- Your boat leaves a wake behind it. Cross it to close a loop, and every lantern inside lights up.
+- Your boat leaves a trail behind it. Cross it to close a loop, and every lantern inside lights up.
 - Light all the lanterns on a lake before dark to open the next one.
 - Each lake has three goals: light every lantern, finish before the sun is low, and use only a few loops.
-- Watch the water: stones and a head-on hit with the shore wreck the boat, reeds slow it down, and ducks that swim across your wake snap it.
+- Watch the water: stones and a head-on hit with the shore wreck the boat, reeds slow it down, and ducks that swim across your trail snap it.
 
 ## Built with
 
