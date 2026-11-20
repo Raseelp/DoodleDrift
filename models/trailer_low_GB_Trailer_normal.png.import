@@ -2,19 +2,19 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://b0itewkcq4k8c"
-path="res://.godot/imported/trailer_low_3.png-2608576cf3dfbf2bb10b5f23ca75943d.ctex"
+uid="uid://tfuxqf66f6g3"
+path="res://.godot/imported/trailer_low_GB_Trailer_normal.png-6827e06e0e7023a068ad03f853fad309.ctex"
 metadata={
 "vram_texture": false
 }
 generator_parameters={
-"md5": "18d290b7f5c81110ed2a5b702e34cf04"
+"md5": "9a94ed2cfae215376270f4e3005a1367"
 }
 
 [deps]
 
-source_file="res://models/trailer_low_3.png"
-dest_files=["res://.godot/imported/trailer_low_3.png-2608576cf3dfbf2bb10b5f23ca75943d.ctex"]
+source_file="res://models/trailer_low_GB_Trailer_normal.png"
+dest_files=["res://.godot/imported/trailer_low_GB_Trailer_normal.png-6827e06e0e7023a068ad03f853fad309.ctex"]
 
 [params]
 

@@ -55,9 +55,6 @@ var lantern_glass := Vector2.ZERO
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
-	for path in [BOAT_MODEL, PICKUP_MODEL, TRAILER_MODEL, SWAN_MODEL]:
-		if ResourceLoader.exists(path):
-			ResourceLoader.load_threaded_request(path)
 	_build_lakes()
 	marks.resize(lakes.size())
 	marks.fill(0)
@@ -67,7 +64,15 @@ func _ready() -> void:
 	_build_theme()
 	glow_tex = _make_glow()
 	beam_tex = _make_beam()
-	_make_lantern_art.call_deferred()
+
+
+## The heavy start-up work, begun once the loading screen's first frame is up (main.gd): all four models
+## load in the background (started later, with the map already up, their textures going to the GPU would
+## stall a visible frame) and the lantern art renders.
+func start_loading() -> void:
+	for path in [PICKUP_MODEL, TRAILER_MODEL, BOAT_MODEL, SWAN_MODEL]:
+		_request(path)
+	_make_lantern_art()
 
 
 func _make_lantern_art() -> void:
@@ -190,13 +195,33 @@ func _build_lakes() -> void:
 ## The boat model (waits for the background load the first time), or null if the file is missing.
 func boat_scene() -> PackedScene:
 	if _boat_scene == null and ResourceLoader.exists(BOAT_MODEL):
+		_request(BOAT_MODEL)
 		_boat_scene = ResourceLoader.load_threaded_get(BOAT_MODEL) as PackedScene
 	return _boat_scene
+
+
+## Whether these models have finished loading in the background (so using them won't wait).
+func models_ready(paths: Array) -> bool:
+	for path in paths:
+		if not ResourceLoader.exists(path):
+			continue
+		if path == BOAT_MODEL and _boat_scene != null or _scenes.has(path):
+			continue
+		if ResourceLoader.load_threaded_get_status(path) == ResourceLoader.THREAD_LOAD_IN_PROGRESS:
+			return false  # a failed load counts as done: that part is just left out, as before
+	return true
+
+
+## Starts loading a model in the background (once; asking again is harmless).
+func _request(path: String) -> void:
+	if ResourceLoader.exists(path) and ResourceLoader.load_threaded_get_status(path) == ResourceLoader.THREAD_LOAD_INVALID_RESOURCE:
+		ResourceLoader.load_threaded_request(path)
 
 
 ## The pickup or trailer model (waits for its background load the first time).
 func model_scene(path: String) -> PackedScene:
 	if not _scenes.has(path) and ResourceLoader.exists(path):
+		_request(path)  # not asked for yet: ask now (and wait for it)
 		_scenes[path] = ResourceLoader.load_threaded_get(path) as PackedScene
 	return _scenes.get(path)
 

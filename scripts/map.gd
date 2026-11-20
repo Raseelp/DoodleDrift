@@ -61,6 +61,8 @@ const RIG_SCALE := 0.74  # drawn at about 5.7 map px a metre: the whole rig is a
 const PICKUP_M := 8.7  # the drawn pickup's length (rig3d.gd scales it up)
 const PX_PER_M := RIG_SCALE * RIG_RENDER / 26.0
 var boat3d: SubViewport  # the pickup, trailer and boat (rig3d.gd), drawn on the map
+var rig_waiting := false  # its models are still loading: the map shows meanwhile, the rig fades in after
+var rig_fade := 1.0
 var rings: Array = []  # gold ripples spreading from lakes during the chapter-complete moment
 
 # Time of day on the map follows the chapter: bright morning with no lake lit, golden afternoon,
@@ -217,9 +219,11 @@ func _ready() -> void:
 	add_child(glow_node)
 
 	if Game.dev_on("boat3d"):
-		boat3d = Rig3D.new()
-		boat3d.render_px = RIG_RENDER
-		add_child(boat3d)
+		if Game.models_ready([Game.PICKUP_MODEL, Game.TRAILER_MODEL, Game.BOAT_MODEL]):
+			_make_rig()
+		else:
+			rig_waiting = true  # don't hold up the map for them (first launch)
+			rig_fade = 0.0
 	_build_ui()
 	Sfx.start_ambience(0.84, false)
 	Sfx.set_mood(day_t, 0.0, false)
@@ -941,6 +945,10 @@ func _process(delta: float) -> void:
 	if not has_meta("day_t"):
 		day_t = _day_target()
 		_apply_day()
+	if rig_waiting and Game.models_ready([Game.PICKUP_MODEL, Game.TRAILER_MODEL, Game.BOAT_MODEL]):
+		rig_waiting = false
+		_make_rig()
+		create_tween().tween_property(self, "rig_fade", 1.0, 0.4)
 	var bn := _boat_now()
 	if boat3d:
 		boat3d.set_pose(float(bn[1]), float(bn[3]))
@@ -1391,6 +1399,8 @@ func _draw_map(n: Node2D) -> void:
 			n.draw_line(Vector2(trail[k - 1]["p"]) + sd0 * side, Vector2(trail[k]["p"]) + sd1 * side, col, 1.4, true)
 	var bn := _boat_now()
 	var bp: Vector2 = bn[0]
+	if rig_waiting:
+		return  # still loading: it fades in shortly
 	if boat3d:
 		_draw_boat(n, bp, 0.0)
 		return
@@ -1401,13 +1411,19 @@ func _draw_map(n: Node2D) -> void:
 
 
 ## The rig's render with its hitch at p, and its shadow on the ground.
+func _make_rig() -> void:
+	boat3d = Rig3D.new()
+	boat3d.render_px = RIG_RENDER
+	add_child(boat3d)
+
+
 func _draw_boat(ci: CanvasItem, p: Vector2, _rot: float) -> void:
 	var tex := boat3d.get_texture()
 	var at: Vector2 = -boat3d.anchor()
 	ci.draw_set_transform(p + Vector2(-4, 5), 0.0, Vector2.ONE * RIG_SCALE)
-	ci.draw_texture(tex, at, Color(0.05, 0.08, 0.05, 0.3))
+	ci.draw_texture(tex, at, Color(0.05, 0.08, 0.05, 0.3 * rig_fade))
 	ci.draw_set_transform(p, 0.0, Vector2.ONE * RIG_SCALE)
-	ci.draw_texture(tex, at)
+	ci.draw_texture(tex, at, Color(1, 1, 1, rig_fade))
 	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 

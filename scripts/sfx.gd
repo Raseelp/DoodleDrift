@@ -51,14 +51,35 @@ func _exit_tree() -> void:
 
 
 func _generate() -> void:
-	var out := {
-		"chime": _make_chime(), "whoosh": _make_whoosh(), "bump": _make_bump(), "tap": _make_tap(),
-		"pad": _make_pad(), "shimmer": _make_shimmer(), "bells": _make_bells(),
-		"hull": _make_hull(), "reeds": _make_reeds(),
-		"bird": _make_bird(), "frog": _make_frog(), "owl": _make_owl(), "quack": _make_quack(),
-		"stamp": _make_stamp(), "snap": _make_snap(), "peep": _make_peep(), "hiss": _make_hiss(),
-		"beats": _make_beats(),
-	}
+	# Each sound is made on its own worker (the phone's cores in parallel); this thread waits for them.
+	var makers := [
+		["chime", _make_chime],
+		["whoosh", _make_whoosh],
+		["bump", _make_bump],
+		["tap", _make_tap],
+		["pad", _make_pad],
+		["shimmer", _make_shimmer],
+		["bells", _make_bells],
+		["hull", _make_hull],
+		["reeds", _make_reeds],
+		["bird", _make_bird],
+		["frog", _make_frog],
+		["owl", _make_owl],
+		["quack", _make_quack],
+		["stamp", _make_stamp],
+		["snap", _make_snap],
+		["peep", _make_peep],
+		["hiss", _make_hiss],
+		["beats", _make_beats],
+	]
+	var out := {}
+	var lock := Mutex.new()
+	var task := WorkerThreadPool.add_group_task(func(i: int):
+		var w = makers[i][1].call()
+		lock.lock()
+		out[makers[i][0]] = w
+		lock.unlock(), makers.size())
+	WorkerThreadPool.wait_for_group_task_completion(task)
 	call_deferred("_on_generated", out)
 
 
@@ -482,10 +503,12 @@ func _make_reeds() -> AudioStreamWAV:
 func _make_hiss() -> AudioStreamWAV:
 	var secs := 0.75
 	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()  # its own: the sounds are made on several threads at once
+	rng.seed = 53
 	var prev := 0.0
 	for i in s.size():
 		var t := float(i) / RATE_HI
-		var n := randf_range(-1.0, 1.0)
+		var n := rng.randf_range(-1.0, 1.0)
 		var hp := n - prev  # brighter: mostly the high hiss of breath
 		prev = n
 		var env := smoothstep(0.0, 0.06, t) * (1.0 - smoothstep(0.35, secs, t))
@@ -497,13 +520,15 @@ func _make_hiss() -> AudioStreamWAV:
 func _make_beats() -> AudioStreamWAV:
 	var secs := 0.6
 	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()  # its own: the sounds are made on several threads at once
+	rng.seed = 59
 	var lp := 0.0
 	for i in s.size():
 		var t := float(i) / RATE_HI
 		var k := fmod(t, 0.17)
 		var env := exp(-k * 28.0) if t < 0.51 else 0.0
-		lp += (randf_range(-1.0, 1.0) - lp) * 0.18  # dull thump of wing on water
-		s[i] = (lp * 2.2 + randf_range(-1.0, 1.0) * 0.25 * exp(-k * 60.0)) * env * 0.6
+		lp += (rng.randf_range(-1.0, 1.0) - lp) * 0.18  # dull thump of wing on water
+		s[i] = (lp * 2.2 + rng.randf_range(-1.0, 1.0) * 0.25 * exp(-k * 60.0)) * env * 0.6
 	return _to_wav(s, RATE_HI, false)
 
 
