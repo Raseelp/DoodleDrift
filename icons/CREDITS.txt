@@ -16,3 +16,6 @@ Swan model
 
 Trailer model
 "Boat Trailer" by BoatUS Foundation, https://sketchfab.com/3d-models/none-594ef36c27924dcaa677781c756fbc7c, CC BY 4.0
+
+Font
+"Josefin Sans" by Santiago Orozco (The Josefin Sans Project Authors), https://github.com/ThomasJockin/JosefinSansFont-master, SIL Open Font License 1.1 (fonts/OFL.txt)

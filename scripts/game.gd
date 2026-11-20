@@ -12,6 +12,7 @@ const MARK_LOOPS := 4
 var lakes: Array = []
 var unlocked := 1
 var chapter_seen := false  # the "still lakes are bright again" moment has played
+var dev_victory := false  # dev: play the chapter victory on the next map, as a test (never saved)
 # Where the pickup is parked on the map (-1: by the first open lake not yet lit), and a lake a win has
 # just opened, which it drives to the next time the map is on screen (-1: none).
 var rig_lake := -1
@@ -43,6 +44,7 @@ var _boat_scene: PackedScene
 const PICKUP_MODEL := "res://models/pickup_low.glb"
 const TRAILER_MODEL := "res://models/trailer_low.glb"
 const SWAN_MODEL := "res://models/swan.glb"
+const FONT_PATH := "res://fonts/JosefinSans-Variable.ttf"
 var _scenes := {}  # the pickup and trailer, loaded once like the boat
 ## The storm lantern pictures (scripts/lantern_art.gd), rendered once shortly after start-up.
 ## anchor: where the float meets the water in the picture; glass: the flame. Null until ready.
@@ -313,7 +315,7 @@ func record_result(i: int, got: int) -> void:
 
 
 func _new_stat() -> Dictionary:
-	return {"tries": 0, "wins": 0, "fails": 0, "crashes": 0, "revives": 0, "best": 0.0, "last_fails": []}
+	return {"tries": 0, "wins": 0, "fails": 0, "crashes": 0, "revives": 0, "best": 0.0, "last_fails": [], "water": 0.0}
 
 
 func stat_add(i: int, key: String) -> void:
@@ -328,6 +330,12 @@ func stat_fail(i: int, lit: int, total: int) -> void:
 	lf.append("%d/%d" % [lit, total])
 	while lf.size() > 5:
 		lf.remove_at(0)
+	_save()
+
+
+## Time out on the water on lake i (every try, wins or not), for the chapter's totals.
+func add_water(i: int, secs: float) -> void:
+	stats[i]["water"] = float(stats[i].get("water", 0.0)) + secs
 	_save()
 
 
@@ -508,16 +516,23 @@ func _save() -> void:
 # ---------------------------------------------------------------- look
 
 func _build_theme() -> void:
-	var base := ThemeDB.fallback_font
+	# Josefin Sans (fonts/, SIL Open Font License): one variable font, its weight set per use. Godot's
+	# built-in font only if the file were ever missing.
+	var base: Font = load(FONT_PATH) if ResourceLoader.exists(FONT_PATH) else ThemeDB.fallback_font
+	var wght := TextServerManager.get_primary_interface().name_to_tag("wght")
 	var body := FontVariation.new()
 	body.base_font = base
+	body.variation_opentype = {wght: 600}
 	body.spacing_glyph = 1
 	title_font = FontVariation.new()
 	title_font.base_font = base
+	title_font.variation_opentype = {wght: 700}
 	title_font.spacing_glyph = 14
 	heading_font = FontVariation.new()
 	heading_font.base_font = base
+	heading_font.variation_opentype = {wght: 600}
 	heading_font.spacing_glyph = 3
+	ThemeDB.fallback_font = body  # every label, themed or not, uses it
 
 	ui_theme = Theme.new()
 	ui_theme.default_font = body

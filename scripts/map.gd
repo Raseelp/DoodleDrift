@@ -27,6 +27,7 @@ var dev_panel: Control
 var map_ui: Control  # title, lake names and the gear; hidden while zoomed in on a lake
 var settings: Control
 var celebrating := false
+var cele_test := false  # this celebration is a replay from the dev panel
 # Arriving from a lake (after a win, or Menu): the lake zooms out into its picture, a lake this win
 # opened unlocks, and the boat sails to the next lake, which the map then zooms in on. A fresh tap skips to the end.
 const A_HAND := 0.75  # the lake has faded into its picture here (level.gd LEAVE_HAND)
@@ -63,7 +64,37 @@ const PX_PER_M := RIG_SCALE * RIG_RENDER / 26.0
 var boat3d: SubViewport  # the pickup, trailer and boat (rig3d.gd), drawn on the map
 var rig_waiting := false  # its models are still loading: the map shows meanwhile, the rig fades in after
 var rig_fade := 1.0
-var rings: Array = []  # gold ripples spreading from lakes during the chapter-complete moment
+var rings: Array = []  # gold ripples spreading from a lake a win has just opened
+# Chapter complete: each lake's lantern light on the water (0..1, 1 once it is done; the chapter moment brings
+# them up one by one), a brief flare as each lights, and fireflies round the shores once night has fallen.
+var lake_lit: Array = []
+var lake_flare: Array = []
+var shore_flies: Array = []
+var shore_fly_a := 0.0
+# The road of lights: the dotted road between two lakes lights up once both are done (all of it once the
+# chapter is complete). road_lit is how far along it is lit, in lakes (0 = first lake, 4 = the last).
+var road_dots: Array = []  # [position, how far along in lakes]
+var road_lit := 0.0
+var road_front := -1.0  # while a stretch is lighting: where its leading lamp is, else -1
+# Fireworks for the chapter: shells rise and burst into sparks that slow in the air and fall.
+var fw_shells: Array = []
+var fw_sparks: Array = []
+var fw_flashes: Array = []
+var fw_glints: Array = []  # lanterns flashing as their lake lights up in the celebration
+var fw_show := false  # the finale keeps sending them up, now and then, until the tap
+var fw_show_words := false  # the chapter's words are up (on a short screen, bursts keep clear of them)
+var fw_next := 0.0
+var fw_rng := RandomNumberGenerator.new()
+var cele_fx: Control = null
+const FW_COLORS := [Color(1.0, 0.78, 0.36), Color(1.0, 0.3, 0.28), Color(0.38, 1.0, 0.48), Color(0.4, 0.6, 1.0),
+	Color(0.84, 0.46, 1.0), Color(1.0, 0.97, 0.9), Color(0.32, 0.95, 1.0), Color(1.0, 0.52, 0.18), Color(1.0, 0.45, 0.7)]
+var cele_ui: Control = null
+var cele_blocker: Control = null
+var cele_armed := false
+var cele_tick := 0.0
+var cele_dimmed: Array = []  # on short screens: [label, its alpha] faded while the words are up
+var cele_icons_a := 1.0  # the lakes' goal icons, faded under the chapter words on a short screen
+var cele_night := 0.0  # the chapter moment brings night to the whole map, wherever the pickup is
 
 # Time of day on the map follows the chapter: bright morning with no lake lit, golden afternoon,
 # dusk near the end, and night once every lake is bright (so the lanterns shine). 0 = morning, 1 = night.
@@ -143,6 +174,18 @@ func _ready() -> void:
 	for k in 26:
 		flies.append({"p": Vector2(rng.randf() * view_size.x, rng.randf() * view_size.y),
 			"ph": rng.randf() * TAU, "v": Vector2(rng.randf_range(-6, 6), rng.randf_range(-8, -2))})
+
+	for i in Game.lake_count():
+		lake_lit.append(1.0 if Game.lake_done(i) else 0.0)
+		lake_flare.append(0.0)
+	if Game.chapter_done():
+		_make_shore_flies()
+		shore_fly_a = 1.0 if Game.chapter_seen else 0.0
+	_make_road_dots()
+	road_lit = _road_done()
+	if is_instance_valid(arrive_level) and reveal >= 0 and arrive_from >= 1 and road_lit >= float(arrive_from):
+		road_lit = float(arrive_from - 1)  # this win's stretch lights up during the arrival
+	fw_rng.randomize()
 
 	var bg := Polygon2D.new()
 	# Ground well past the screen, so zooming in on a lake near the edge never runs out of it.
@@ -229,6 +272,10 @@ func _ready() -> void:
 	Sfx.set_mood(day_t, 0.0, false)
 	if is_instance_valid(arrive_level):
 		_start_arrival()
+	elif Game.dev_victory:
+		Game.dev_victory = false
+		cele_test = true  # a replay from the dev panel: the save isn't touched, the map comes back as it was
+		_celebrate.call_deferred()
 	elif Game.chapter_done() and not Game.chapter_seen:
 		_celebrate.call_deferred()
 	else:
@@ -434,6 +481,8 @@ func _arrive_step() -> void:
 			Sfx.chime(0.84 * 2.0)
 			Sfx.stamp(true)
 			Game.vibrate(20)
+			if _road_done() > road_lit:
+				_light_road(_road_done(), 1.6)
 		map_labels[2 + reveal].modulate.a = lerpf(0.4, 1.0, _reveal_f())
 	if t >= _t_end():
 		_finish_arrival()
@@ -943,7 +992,7 @@ func _process(delta: float) -> void:
 		drive_to = -1
 		Game.set_rig(current)
 	if not has_meta("day_t"):
-		day_t = _day_target()
+		day_t = lerpf(_day_target(), 1.0, cele_night)
 		_apply_day()
 	if rig_waiting and Game.models_ready([Game.PICKUP_MODEL, Game.TRAILER_MODEL, Game.BOAT_MODEL]):
 		rig_waiting = false
@@ -975,6 +1024,10 @@ func _process(delta: float) -> void:
 			p.y = view_size.y + 20.0
 		p.x = wrapf(p.x, -20.0, view_size.x + 20.0)
 		f["p"] = p
+	if not fw_shells.is_empty() or not fw_sparks.is_empty() or not fw_flashes.is_empty() or not fw_glints.is_empty() or fw_show:
+		_fw_step(delta)
+	if is_instance_valid(cele_fx):
+		cele_fx.queue_redraw()
 	draw_node.queue_redraw()
 	glow_node.queue_redraw()
 
@@ -1264,17 +1317,15 @@ func _open_curve(pts: PackedVector2Array, sub: int) -> PackedVector2Array:
 
 
 func _draw_map(n: Node2D) -> void:
-	# Dotted path between the lakes.
-	var acc := 0.0
-	for i in range(1, path_pts.size()):
-		var a := path_pts[i - 1]
-		var b := path_pts[i]
-		var seg := a.distance_to(b)
-		while acc < seg:
-			var p := a.lerp(b, acc / seg)
-			n.draw_circle(p, 2.4, Color(ink, 0.28 * (1.0 - 0.75 * focus_f)))
-			acc += 15.0
-		acc -= seg
+	# Dotted path between the lakes; where it is lit, the dots are small warm lamps.
+	var dot_a := 1.0 - 0.75 * focus_f
+	for d in road_dots:
+		var lit := _road_lamp(float(d[1]))
+		if lit <= 0.0:
+			n.draw_circle(d[0], 2.4, Color(ink, 0.28 * dot_a))
+		else:
+			var warm := Color(1.0, 0.9, 0.7, lerpf(0.42, 0.75, smoothstep(0.4, 0.85, day_t)) * dot_a)
+			n.draw_circle(d[0], 2.4, Color(ink, 0.28 * dot_a).lerp(warm, lit))
 
 	# Trees, shadows first: the shadow falls away from the sun (down and left by day, longer as it sinks).
 	var green := Color("5f8a4a").lerp(Color("1e2c26"), smoothstep(0.4, 1.0, day_t))
@@ -1344,7 +1395,7 @@ func _draw_map(n: Node2D) -> void:
 			var gp := Vector2(x, spot.y + 26)
 			var kind: String = ["lantern", Game.time_goal(i)[0], "loop"][k]
 			var on := m & (1 << k) != 0
-			var ga := (1.0 - focus_f) * clampf(3.0 - scale.x, 0.0, 1.0)  # hidden while the camera is close in
+			var ga := (1.0 - focus_f) * clampf(3.0 - scale.x, 0.0, 1.0) * cele_icons_a  # hidden while the camera is close in (and under the chapter words on a short screen)
 			n.draw_circle(gp, 17.0, Color(0.03, 0.06, 0.08, (0.62 if on else 0.42) * lerpf(0.6, 1.0, of) * ga), true, -1.0, true)
 			Game.draw_icon(n, kind, gp, 24, Color(Color(pal["light"]) if on else Color(1, 1, 1, lerpf(0.3, 0.5, of)), (1.0 if on else lerpf(0.3, 0.5, of)) * ga))
 		if of < 1.0:
@@ -1384,9 +1435,11 @@ func _draw_map(n: Node2D) -> void:
 
 	# Chapter-complete ripples.
 	for r in rings:
-		var rk := (clock - float(r["t"])) / 1.2
-		if rk >= 0.0 and rk <= 1.0:
-			n.draw_arc(r["p"], 40.0 + rk * 90.0, 0.0, TAU, 48, Color(r["c"], 0.9 * (1.0 - rk)), 4.0, true)
+		for k in 2:
+			var rk := (clock - float(r["t"]) - 0.28 * k) / 1.8
+			if rk >= 0.0 and rk <= 1.0:
+				var e := 1.0 - (1.0 - rk) * (1.0 - rk)
+				n.draw_arc(r["p"], 46.0 + e * 110.0, 0.0, TAU, 64, Color(r["c"], (0.8 - 0.3 * k) * (1.0 - rk)), 3.2 * (1.0 - rk) + 0.8, true)
 
 	# The pickup parked by the current lake, or towing the boat to the next one, leaving tyre tracks.
 	var half_track := 0.85 * PX_PER_M
@@ -1461,13 +1514,55 @@ func _draw_glow(n: Node2D) -> void:
 		for k in 3:
 			var r: float = [620.0, 300.0, 120.0][k]
 			n.draw_texture_rect(glow, Rect2(sp - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(sc, float([0.28, 0.32, 0.55][k]) * sun_a))
+	var dark := smoothstep(0.45, 0.85, day_t)
 	for i in Game.lake_count():
 		if not Game.lake_done(i):
 			continue
 		var spot: Vector2 = SPOTS[i] + off
 		var c: Color = Game.lakes[i]["pal"]["light"]
-		var r := 80.0
-		n.draw_texture_rect(glow, Rect2(spot - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(c, 0.22))
+		var lit := float(lake_lit[i])
+		var fl := float(lake_flare[i])
+		var r := 80.0 + 50.0 * fl
+		n.draw_texture_rect(glow, Rect2(spot - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(c, 0.22 * lit + 0.4 * fl))
+		# After dark each lantern lays a warm, flickering pool of light on the water around it.
+		if dark > 0.0 and lit > 0.0:
+			var origin := spot - LAKE_CENTER * THUMB + Vector2(0, sin(clock * 0.9 + i) * 2.0 * (still_amp if i == still_lake else 1.0))
+			var lights: Array = Game.lakes[i]["lanterns"]
+			for li in lights.size():
+				var lp := origin + Vector2(lights[li][0], lights[li][1]) * THUMB
+				var flick := 0.86 + 0.08 * sin(clock * 7.1 + li * 2.3 + i) + 0.06 * sin(clock * 12.7 + li)
+				var pr := 26.0 * flick
+				n.draw_texture_rect(glow, Rect2(lp - Vector2(pr, pr), Vector2(pr, pr) * 2.0), false, Color(c, 0.34 * dark * lit * flick))
+	# Fireflies round the lakes once the chapter is complete: they wander slowly near the shore and flash
+	# on briefly every few seconds, each to its own rhythm, then go dark again.
+	var shore_a := shore_fly_a * smoothstep(0.55, 0.85, day_t)
+	if shore_a > 0.0:
+		for f in shore_flies:
+			var per := float(f["per"])
+			var u := fposmod(clock + float(f["ph"]) * per, per) / per
+			var flash := smoothstep(0.0, 0.06, u) * (1.0 - smoothstep(0.1, 0.32, u))
+			if flash <= 0.01:
+				continue
+			var ph := float(f["ph"]) * TAU
+			var fp: Vector2 = Vector2(f["home"]) + Vector2(sin(clock * float(f["sx"]) + ph) * 26.0 + sin(clock * 0.9 + ph * 2.0) * 8.0,
+				cos(clock * float(f["sy"]) + ph) * 20.0 + sin(clock * 1.3 + ph) * 6.0)
+			var col := Color(0.8, 1.0, 0.45)
+			n.draw_texture_rect(glow, Rect2(fp - Vector2(13, 13), Vector2(26, 26)), false, Color(col, 0.55 * flash * shore_a))
+			n.draw_texture_rect(glow, Rect2(fp - Vector2(3.5, 3.5), Vector2(7, 7)), false, Color(1.0, 1.0, 0.85, flash * shore_a))
+	# The road's lamps: barely a warmth by day, a soft glow after dusk; the leading lamp brighter while a
+	# stretch is lighting.
+	var lamp_a := 0.03 + 0.3 * smoothstep(0.4, 0.85, day_t)
+	for d in road_dots:
+		var lit := _road_lamp(float(d[1]))
+		if lit <= 0.0:
+			continue
+		var u := float(d[1])
+		var flick := 0.93 + 0.07 * sin(clock * 2.3 + u * 7.0)
+		var r := 9.0 + 3.0 * smoothstep(0.4, 0.85, day_t)
+		n.draw_texture_rect(glow, Rect2(Vector2(d[0]) - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(1.0, 0.82, 0.52, lamp_a * lit * flick))
+		if road_front >= 0.0 and absf(u - road_front) < 0.06:
+			var k := 1.0 - absf(u - road_front) / 0.06
+			n.draw_texture_rect(glow, Rect2(Vector2(d[0]) - Vector2(20, 20), Vector2(40, 40)), false, Color(1.0, 0.86, 0.6, 0.5 * k))
 	var fire_a := smoothstep(0.5, 0.8, day_t)
 	for f in flies:
 		if fire_a <= 0.0:
@@ -1622,6 +1717,14 @@ func _open_dev() -> void:
 		st.text = "Stats cleared."
 		Sfx.tap())
 	box.add_child(st_reset)
+	var victory := Button.new()
+	victory.text = "Play chapter victory"
+	victory.custom_minimum_size = Vector2(0, 56)
+	victory.pressed.connect(func():
+		Sfx.tap()
+		Game.dev_victory = true  # the map that opens next plays it, as a test
+		reload_requested.emit())
+	box.add_child(victory)
 	var spacer := Control.new()
 	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	box.add_child(spacer)
@@ -1776,7 +1879,7 @@ func _open_settings() -> void:
 	col.add_child(kicker.call("CREDITS"))
 	gap.call(8)
 	var credits := Label.new()
-	credits.text = "Boat: \"Fishing Boat\" by CharlieCatling, Sketchfab\nPickup: \"Low Poly Car - Chevrolet C10 Pickup 1963\" by ROH3D (CC BY 4.0)\nTrailer: \"Boat Trailer\" by BoatUS Foundation (CC BY 4.0)\nSwan: \"Animated Swan - Rigged & Optimized\" by GAMICO (CC BY 4.0)\nIcons by Lorc, Delapouite and priorblue, game-icons.net (CC BY 3.0)\nPause, play and restart icons: Phosphor Icons (MIT)\nMade with the Godot Engine"
+	credits.text = "Boat: \"Fishing Boat\" by CharlieCatling, Sketchfab\nPickup: \"Low Poly Car - Chevrolet C10 Pickup 1963\" by ROH3D (CC BY 4.0)\nTrailer: \"Boat Trailer\" by BoatUS Foundation (CC BY 4.0)\nSwan: \"Animated Swan - Rigged & Optimized\" by GAMICO (CC BY 4.0)\nIcons by Lorc, Delapouite and priorblue, game-icons.net (CC BY 3.0)\nPause, play and restart icons: Phosphor Icons (MIT)\nFont: Josefin Sans by Santiago Orozco (SIL OFL 1.1)\nMade with the Godot Engine"
 	credits.add_theme_font_size_override("font_size", 21)
 	credits.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	credits.custom_minimum_size = Vector2(inner_w, 0)
@@ -1821,92 +1924,613 @@ func _close_settings() -> void:
 		settings = null
 
 
-## Chapter complete, shown once: each lake sends out a gold ripple with a stamp and a rising chime,
-## then "THE STILL LAKES ARE BRIGHT AGAIN" over the map. Tap to carry on.
+## Chapter complete, shown once (or replayed from the dev panel). Night falls over the map; one by one each
+## lake lights up (its lanterns glint, sparks fountain off the water, a small shell goes up, a rising chime)
+## and its best time shows beside it, while the road of lights sweeps on; fireflies come out. Then the
+## heading and the chapter's numbers over the map itself, under a volley of fireworks. A tap carries on.
 func _celebrate() -> void:
 	celebrating = true
+	cele_armed = false
+	cele_blocker = Control.new()  # takes every tap while this plays (the map, the gear), and the last one ends it
+	cele_blocker.size = view_size
+	cele_blocker.mouse_filter = Control.MOUSE_FILTER_STOP
+	cele_blocker.gui_input.connect(_on_cele_input)
+	ui_root.add_child(cele_blocker)
+	cele_ui = Control.new()
+	cele_ui.size = view_size
+	cele_ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui_root.add_child(cele_ui)
+	cele_fx = Control.new()  # the fireworks: over the map and any shade, under the words
+	cele_fx.size = view_size
+	cele_fx.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var add := CanvasItemMaterial.new()
+	add.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+	cele_fx.material = add
+	cele_fx.draw.connect(_fw_draw)
+	cele_ui.add_child(cele_fx)
+	road_lit = 0.0
+	for lb in [map_labels[0], map_labels[1]]:
+		create_tween().tween_property(lb, "modulate:a", 0.0, 0.8)
+	if shore_flies.is_empty():
+		_make_shore_flies()
 	create_tween().tween_property(self, "night_f", 1.0, 3.0).set_trans(Tween.TRANS_SINE)
+	create_tween().tween_property(self, "cele_night", 1.0, 3.0).set_trans(Tween.TRANS_SINE)
+	var flies_in := create_tween()
+	flies_in.tween_interval(1.6)
+	flies_in.tween_property(self, "shore_fly_a", 1.0, 3.5)
+	for i in Game.lake_count():
+		lake_lit[i] = 0.0
 	var notes := [1.0, 1.125, 1.25, 1.5, 1.6667]
 	var tw := create_tween()
-	tw.tween_interval(0.6)
+	tw.tween_interval(1.0)
 	for i in Game.lake_count():
 		var lp: Dictionary = Game.lakes[i]["pal"]
 		tw.tween_callback(func():
-			rings.append({"p": SPOTS[i] + off, "t": clock, "c": lp["light"]})
-			Sfx.stamp(true)
-			Sfx.chime(0.84 * 2.0 * float(notes[i]))
-			Game.vibrate(18))
-		tw.tween_interval(0.45)
+			_lake_burst(i, Color(lp["light"]))
+			lake_flare[i] = 1.0
+			var up := create_tween().set_parallel()
+			up.tween_method(func(v: float): lake_lit[i] = v, 0.0, 1.0, 0.9).set_trans(Tween.TRANS_SINE)
+			up.tween_method(func(v: float): lake_flare[i] = v, 1.0, 0.0, 1.8).set_ease(Tween.EASE_OUT)
+			_cele_best_label(i)
+			if i > 0:
+				_light_road(float(i), 0.55)
+			var from: Vector2 = SPOTS[i] + off + Vector2(fw_rng.randf_range(-30.0, 30.0), -40.0)
+			_fw_launch(from, from + Vector2(fw_rng.randf_range(-70.0, 70.0), -fw_rng.randf_range(200.0, 260.0)), "peony", 0.6)
+			Sfx.ignite()
+			Sfx.chime(0.84 * 2.0 * float(notes[i % notes.size()]))
+			Game.vibrate(14))
+		tw.tween_interval(0.6)
+	tw.tween_interval(0.3)
 	tw.tween_callback(func():
 		Sfx.chord(0.84 * 2.0)
-		_show_chapter_card())
+		_show_chapter_words())
 
 
-func _show_chapter_card() -> void:
-	var c := Control.new()
-	c.size = view_size
-	c.mouse_filter = Control.MOUSE_FILTER_STOP
-	ui_root.add_child(c)
-	var dim := ColorRect.new()
-	dim.color = Color(0.024, 0.047, 0.063, 0.9)
-	dim.size = view_size
-	c.add_child(dim)
-	var col := VBoxContainer.new()
-	col.alignment = BoxContainer.ALIGNMENT_CENTER
-	col.add_theme_constant_override("separation", 16)
-	col.size = view_size
-	col.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	c.add_child(col)
-	var kick := Label.new()
-	kick.text = "CHAPTER ONE COMPLETE"
-	kick.add_theme_font_override("font", Game.heading_font)
-	kick.add_theme_font_size_override("font_size", 24)
-	kick.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	kick.modulate.a = 0.6
-	col.add_child(kick)
-	var title := Label.new()
-	title.text = "THE STILL LAKES\nARE BRIGHT AGAIN"
-	title.add_theme_font_override("font", Game.title_font)
-	title.add_theme_font_size_override("font_size", 44)
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	col.add_child(title)
-	var lights := HBoxContainer.new()
-	lights.alignment = BoxContainer.ALIGNMENT_CENTER
-	lights.add_theme_constant_override("separation", 20)
-	lights.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	col.add_child(lights)
+## Beside a lake as it lights up: its best time (or that it was lit), in the lake's own light.
+func _cele_best_label(i: int) -> void:
+	var spot: Vector2 = SPOTS[i] + off
+	var left_side := spot.x < 360.0 + off.x
+	var best := float(Game.stats[i]["best"])
+	var l := Label.new()
+	l.text = ("Best  %.1f s" % best) if best > 0.0 else "Lit"
+	l.add_theme_font_override("font", Game.heading_font)
+	l.add_theme_font_size_override("font_size", 20)
+	l.add_theme_color_override("font_color", Color(Game.lakes[i]["pal"]["light"]))
+	l.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.5))
+	l.size = Vector2(230, 30)
+	if left_side:
+		l.position = Vector2(spot.x + 90, spot.y + 50)
+	else:
+		l.position = Vector2(spot.x - 90 - 230, spot.y + 50)
+		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.modulate.a = 0.0
+	cele_ui.add_child(l)
+	var tw := l.create_tween().set_parallel()
+	tw.tween_property(l, "modulate:a", 1.0, 0.6)
+	tw.tween_property(l, "position:y", l.position.y - 8.0, 0.6).from(l.position.y).set_ease(Tween.EASE_OUT)
+
+
+## The chapter's words at the top and its numbers at the bottom, over soft shade so they read on the map.
+func _show_chapter_words() -> void:
+	var n := Game.lake_count()
+	var lanterns := 0
+	var goals := 0
+	var tries := 0
+	var water := 0.0
+	var best_i := -1
+	var best_k := INF
+	for i in n:
+		lanterns += (Game.lakes[i]["lanterns"] as Array).size()
+		var m := int(Game.marks[i])
+		var got := int(m & 1 != 0) + int(m & 2 != 0) + int(m & 4 != 0)
+		goals += got
+		var st: Dictionary = Game.stats[i]
+		tries += int(st["tries"])
+		water += float(st.get("water", 0.0))
+		var b := float(st["best"])
+		if b > 0.0 and b / maxf(1.0, Game.lake_duration(i)) < best_k:
+			best_k = b / maxf(1.0, Game.lake_duration(i))
+			best_i = i
+
+	var top := top_inset + off.y * 0.5
+	# A tall screen has room above and below the map: the words go at the top and the numbers at the bottom,
+	# over soft shade. A short one hasn't: the map dims a little, its labels fade, and it all sits in the middle.
+	var compact := view_size.y < 1450.0
+	var shades: Array = []
+	if compact:
+		var dim := ColorRect.new()
+		dim.color = Color(0.02, 0.05, 0.07, 0.7)
+		dim.size = view_size
+		dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		shades.append(dim)
+		cele_dimmed.clear()
+		for lb in map_labels.slice(2):
+			cele_dimmed.append([lb, lb.modulate.a])
+			lb.create_tween().tween_property(lb, "modulate:a", 0.0, 0.6)
+		for lb in cele_ui.get_children():
+			if lb is Label:
+				lb.create_tween().tween_property(lb, "modulate:a", 0.0, 0.6)  # the best times beside the lakes
+		create_tween().tween_property(self, "cele_icons_a", 0.0, 0.6)
+	else:
+		shades.append(_shade(true, top + 330.0))
+		shades.append(_shade(false, 380.0 + off.y * 0.5))
+	for sh in shades:
+		cele_ui.add_child(sh)
+		cele_ui.move_child(sh, 0)  # under the fireworks
+		sh.modulate.a = 0.0
+		sh.create_tween().tween_property(sh, "modulate:a", 1.0, 0.8)
+	var col: VBoxContainer = null
+	if compact:
+		col = VBoxContainer.new()
+		col.add_theme_constant_override("separation", 56)
+		col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		col.position.x = 30
+		col.custom_minimum_size = Vector2(view_size.x - 60, 0)
+		cele_ui.add_child(col)
+		col.resized.connect(func(): col.position.y = (view_size.y - col.size.y) * 0.5)
+
+	var steps: Array = []  # [node, at seconds]
+	var head := VBoxContainer.new()
+	head.add_theme_constant_override("separation", 14)
+	head.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	head.position = Vector2(30, top + 52)
+	head.custom_minimum_size = Vector2(view_size.x - 60, 0)
+	(col if compact else cele_ui).add_child(head)
+	# The heading lands: big and gold, settling from a touch larger.
+	var lines := ["CHAPTER ONE", "COMPLETE"]
+	var fs := 58
+	while fs > 24 and Game.title_font.get_string_size(lines[0], HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x > view_size.x - 80.0:
+		fs -= 1
+	var heading := _cele_label("\n".join(lines), Game.title_font, fs, 1.0)
+	heading.autowrap_mode = TextServer.AUTOWRAP_OFF
+	heading.add_theme_color_override("font_color", Color("ffd796"))
+	heading.add_theme_constant_override("line_spacing", -6)
+	head.add_child(heading)
+	var sub := _cele_label("%s lakes  ·  %s lanterns lit" % [_words(n).capitalize(), _words(lanterns)], Game.heading_font, 25, 0.85)
+	head.add_child(sub)
+	steps.append([sub, 0.6])
+	heading.modulate.a = 0.0
+	heading.resized.connect(func(): heading.pivot_offset = heading.size * 0.5)
+	var land := heading.create_tween().set_parallel()
+	land.tween_property(heading, "modulate:a", 1.0, 0.45)
+	land.tween_property(heading, "scale", Vector2.ONE, 0.7).from(Vector2.ONE * 1.12).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
+
+	# Bottom: four even columns of numbers with fine rules between, then the best run, then the way on.
+	var bottom := VBoxContainer.new()
+	bottom.add_theme_constant_override("separation", 16)
+	bottom.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bottom.position.x = 30
+	bottom.custom_minimum_size = Vector2(view_size.x - 60, 0)
+	(col if compact else cele_ui).add_child(bottom)
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 0)
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bottom.add_child(row)
+	var counters := [
+		[lanterns, "LANTERNS", func(v: float) -> String: return str(roundi(v))],
+		[goals, "GOALS", func(v: float) -> String: return "%d/%d" % [roundi(v), n * 3]],
+		[tries, "TRIES", func(v: float) -> String: return str(roundi(v))],
+		[water, "ON THE WATER", _water_text],
+	]
+	var col_w := floorf((view_size.x - 60.0 - 3.0) / counters.size())
+	var num_font := Game.title_font.duplicate() as FontVariation
+	num_font.spacing_glyph = 3
+	var t0 := 1.0
+	for k in counters.size():
+		var c: Array = counters[k]
+		if k > 0:
+			var rule := ColorRect.new()
+			rule.color = Color(1, 1, 1, 0.14)
+			rule.custom_minimum_size = Vector2(1, 58)
+			rule.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			row.add_child(rule)
+		var box := VBoxContainer.new()
+		box.add_theme_constant_override("separation", 2)
+		box.custom_minimum_size.x = col_w
+		box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var num := _cele_label((c[2] as Callable).call(0.0), num_font, 36, 1.0)
+		num.add_theme_color_override("font_color", Color("ffd796"))
+		num.autowrap_mode = TextServer.AUTOWRAP_OFF
+		num.custom_minimum_size.x = col_w
+		var cap := _cele_label(String(c[1]), Game.heading_font, 15, 0.6)
+		cap.autowrap_mode = TextServer.AUTOWRAP_OFF
+		cap.custom_minimum_size.x = col_w
+		box.add_child(num)
+		box.add_child(cap)
+		row.add_child(box)
+		box.modulate.a = 0.0
+		var at := t0 + k * 0.45
+		var tw := box.create_tween()
+		tw.tween_interval(at)
+		tw.tween_property(box, "modulate:a", 1.0, 0.3)
+		var fmt: Callable = c[2]
+		tw.parallel().tween_method(func(v: float):
+			var txt: String = fmt.call(v)
+			if txt != num.text:
+				num.text = txt
+				if clock - cele_tick > 0.07:
+					cele_tick = clock
+					Sfx.tap(), 0.0, float(c[0]), 0.9).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
+	if best_i >= 0:
+		var best := _cele_label("Best run  ·  %s  ·  %.1f s" % [Game.lakes[best_i]["name"], float(Game.stats[best_i]["best"])], Game.heading_font, 20, 0.8)
+		bottom.add_child(best)
+		steps.append([best, t0 + 2.4])
+	var gap := Control.new()  # the way on stands apart from the numbers
+	gap.custom_minimum_size = Vector2(0, 58)
+	gap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bottom.add_child(gap)
+	var tap := _cele_label("TAP TO CONTINUE", Game.title_font, 19, 0.0)
+	bottom.add_child(tap)
+	# Sits on the bottom edge once its wrapped lines have their real width (known only after layout).
+	if not compact:
+		bottom.resized.connect(func(): bottom.position.y = view_size.y - 78.0 - bottom.size.y)
+
+	# The finale: a quick volley of fireworks as the heading lands, then one now and then until the tap.
+	fw_show_words = true
+	var volley := create_tween()
+	for k in 7:
+		volley.tween_callback(func(): _fw_random(1.0))
+		volley.tween_interval([0.18, 0.35, 0.12, 0.5, 0.3, 0.6, 0.0][k])
+	volley.tween_callback(func():
+		fw_show = true
+		fw_next = 1.0)
+
+	for st in steps:
+		var node: Control = st[0]
+		var keep := node.modulate.a
+		node.modulate.a = 0.0
+		var tw := node.create_tween()
+		tw.tween_interval(float(st[1]))
+		tw.tween_property(node, "modulate:a", keep, 0.7)
+	var arm := create_tween()
+	arm.tween_interval(t0 + 3.2)
+	arm.tween_callback(func():
+		cele_armed = true
+		var blink := tap.create_tween().set_loops()
+		blink.tween_property(tap, "modulate:a", 0.85, 0.9).set_trans(Tween.TRANS_SINE)
+		blink.tween_property(tap, "modulate:a", 0.35, 0.9).set_trans(Tween.TRANS_SINE))
+
+
+func _on_cele_input(e: InputEvent) -> void:
+	if not (e is InputEventScreenTouch and not e.pressed and celebrating and cele_armed):
+		return
+	Sfx.tap()
+	if cele_test:
+		_end_cele_test()
+	else:
+		Game.mark_chapter_seen()
+	celebrating = false
+	cele_armed = false
+	var out := cele_ui.create_tween()
+	out.tween_property(cele_ui, "modulate:a", 0.0, 0.5)
+	out.tween_callback(cele_ui.queue_free)
+	cele_blocker.queue_free()
+	for d in cele_dimmed:
+		create_tween().tween_property(d[0], "modulate:a", float(d[1]), 0.6)
+	cele_dimmed.clear()
+	create_tween().tween_property(self, "cele_icons_a", 1.0, 0.6)
+	create_tween().tween_property(map_labels[0], "modulate:a", 1.0, 0.6)
+	create_tween().tween_property(map_labels[1], "modulate:a", 0.75, 0.6)
+	fw_show = false
+	fw_show_words = false
+	create_tween().tween_property(self, "cele_night", 0.0, 2.5).set_trans(Tween.TRANS_SINE)  # back to this spot's own time of day
+
+
+## After a dev replay: the lakes, the road, the fireflies and the night go back to what this save really has.
+func _end_cele_test() -> void:
+	cele_test = false
+	var done := Game.chapter_done() and Game.chapter_seen
+	var back := create_tween().set_parallel()
+	back.tween_property(self, "night_f", 1.0 if done else 0.0, 2.5).set_trans(Tween.TRANS_SINE)
+	back.tween_property(self, "shore_fly_a", 1.0 if done else 0.0, 2.0)
+	back.tween_method(func(v: float): road_lit = v, road_lit, _road_done(), 1.2)
 	for i in Game.lake_count():
-		var ic := TextureRect.new()
-		ic.texture = Game.icon("lantern")
-		ic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-		ic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-		ic.custom_minimum_size = Vector2(52, 52)
-		ic.modulate = Game.lakes[i]["pal"]["light"]
-		lights.add_child(ic)
-	var spacer := Control.new()
-	spacer.custom_minimum_size = Vector2(0, 40)
-	col.add_child(spacer)
-	var tap := Label.new()
-	tap.text = "TAP TO CONTINUE"
-	tap.add_theme_font_override("font", Game.title_font)
-	tap.add_theme_font_size_override("font_size", 24)
-	tap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	tap.modulate.a = 0.0
-	col.add_child(tap)
-	c.modulate.a = 0.0
-	var tw := c.create_tween()
-	tw.tween_property(c, "modulate:a", 1.0, 0.6)
-	tw.tween_interval(1.0)
-	tw.tween_property(tap, "modulate:a", 0.8, 0.4)
-	tw.tween_callback(func():
-		dim.gui_input.connect(func(e: InputEvent):
-			if e is InputEventScreenTouch and not e.pressed and celebrating:
-				Sfx.tap()
-				Game.mark_chapter_seen()
-				celebrating = false
-				var out := c.create_tween()
-				out.tween_property(c, "modulate:a", 0.0, 0.3)
-				out.tween_callback(c.queue_free)))
+		lake_lit[i] = 1.0 if Game.lake_done(i) else 0.0
+
+
+func _cele_label(text: String, font: Font, size: int, alpha: float) -> Label:
+	var l := Label.new()
+	l.text = text
+	if font:
+		l.add_theme_font_override("font", font)
+	l.add_theme_font_size_override("font_size", size)
+	l.add_theme_color_override("font_color", Color(1, 1, 1))
+	l.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.55))
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.custom_minimum_size.x = view_size.x - 60.0  # a set width, so wrapped lines measure right in a container
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.modulate.a = alpha
+	return l
+
+
+## A soft dark shade from one edge of the screen, so words read over the map.
+func _shade(from_top: bool, h: float) -> TextureRect:
+	var g := Gradient.new()
+	g.offsets = PackedFloat32Array([0.0, 0.55, 1.0])
+	g.colors = PackedColorArray([Color(0.02, 0.05, 0.07, 0.78), Color(0.02, 0.05, 0.07, 0.45), Color(0.02, 0.05, 0.07, 0.0)])
+	var t := GradientTexture2D.new()
+	t.gradient = g
+	t.fill_from = Vector2(0.5, 0.0) if from_top else Vector2(0.5, 1.0)
+	t.fill_to = Vector2(0.5, 1.0) if from_top else Vector2(0.5, 0.0)
+	t.width = 4
+	t.height = 64
+	var r := TextureRect.new()
+	r.texture = t
+	r.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	r.stretch_mode = TextureRect.STRETCH_SCALE
+	r.size = Vector2(view_size.x, h)
+	r.position = Vector2(0, 0.0 if from_top else view_size.y - h)
+	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return r
+
+
+func _water_text(v: float) -> String:
+	var mins := roundi(v / 60.0)
+	if v < 60.0:
+		return "%d s" % roundi(v)
+	if mins < 60:
+		return "%d min" % mins
+	return "%d h %d min" % [mins / 60, mins % 60]
+
+
+## Small numbers in words, for the chapter's title.
+func _words(v: int) -> String:
+	var ones := ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+		"twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+	var tens := ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+	if v < 20:
+		return ones[v]
+	if v < 100:
+		return tens[v / 10] + ("" if v % 10 == 0 else "-" + ones[v % 10])
+	return str(v)
+
+
+## The road's dots, every 15 px along it, each with how far along it is in lakes (the curve has 16 points
+## from one lake to the next).
+func _make_road_dots() -> void:
+	road_dots.clear()
+	var acc := 0.0
+	for i in range(1, path_pts.size()):
+		var a := path_pts[i - 1]
+		var b := path_pts[i]
+		var seg := a.distance_to(b)
+		while acc < seg:
+			road_dots.append([a.lerp(b, acc / seg), (float(i - 1) + acc / seg) / 16.0])
+			acc += 15.0
+		acc -= seg
+
+
+## How much of the road the finished lakes light: up to the last lake of an unbroken run from the first.
+func _road_done() -> float:
+	var k := -1
+	for i in Game.lake_count():
+		if not Game.lake_done(i):
+			break
+		k = i
+	return float(maxi(k, 0))
+
+
+## 0..1: how lit the road's lamp at u (in lakes) is; the lit edge is soft, a lamp or two wide.
+func _road_lamp(u: float) -> float:
+	return smoothstep(u - 0.05, u, road_lit)
+
+
+## Lights the road on to `to`, lamp by lamp, over `secs`.
+func _light_road(to: float, secs: float) -> void:
+	var tw := create_tween()
+	tw.tween_method(func(v: float):
+		road_lit = v
+		road_front = v, road_lit, to, secs).set_trans(Tween.TRANS_SINE)
+	tw.tween_callback(func(): road_front = -1.0)
+
+
+## A shell of a random kind and colour, up into the open sky between the lakes.
+func _fw_random(k: float) -> void:
+	var to := Vector2(fw_rng.randf_range(150.0, 570.0), fw_rng.randf_range(330.0, 820.0)) + off
+	if view_size.y < 1450.0 and fw_show_words:
+		# A short screen has the words in the middle: burst above or below them instead.
+		var above := fw_rng.randf() < 0.5
+		to = Vector2(fw_rng.randf_range(130.0, view_size.x - 130.0),
+			fw_rng.randf_range(150.0, 280.0) if above else fw_rng.randf_range(view_size.y - 300.0, view_size.y - 170.0))
+	var from := Vector2(to.x + fw_rng.randf_range(-50.0, 50.0), minf(view_size.y + 30.0, to.y + fw_rng.randf_range(420.0, 560.0)))
+	var kinds := ["peony", "peony", "willow", "crackle", "glitter"]
+	_fw_launch(from, to, kinds[fw_rng.randi() % kinds.size()], k * fw_rng.randf_range(0.85, 1.15))
+
+
+func _fw_launch(from: Vector2, to: Vector2, kind: String, k: float) -> void:
+	var col: Color = FW_COLORS[fw_rng.randi() % FW_COLORS.size()]
+	var col2: Color = col if fw_rng.randf() < 0.5 else FW_COLORS[fw_rng.randi() % FW_COLORS.size()]
+	if kind == "willow":
+		col = Color(1.0, 0.8, 0.45)
+		col2 = Color(1.0, 0.55, 0.22)
+	fw_shells.append({"from": from, "to": to, "p": from, "t": 0.0, "dur": fw_rng.randf_range(0.95, 1.3),
+		"kind": kind, "k": k, "col": col, "col2": col2, "trail": 0.0, "ph": fw_rng.randf() * TAU})
+	Sfx.fw_launch()
+
+
+## Moves everything in the air: shells rise (slowing towards the top, a little wobble, a trail of embers),
+## sparks slow in the air and fall, crackle stars pop at the end; the finale sends up more now and then.
+func _fw_step(delta: float) -> void:
+	var keep: Array = []
+	for sh in fw_shells:
+		sh["t"] = float(sh["t"]) + delta
+		var u := clampf(float(sh["t"]) / float(sh["dur"]), 0.0, 1.0)
+		var e := 1.0 - (1.0 - u) * (1.0 - u)
+		sh["p"] = Vector2(sh["from"]).lerp(sh["to"], e) + Vector2(sin(float(sh["t"]) * 11.0 + float(sh["ph"])) * 1.6, 0.0)
+		sh["trail"] = float(sh["trail"]) - delta
+		if float(sh["trail"]) <= 0.0:
+			sh["trail"] = 0.018
+			fw_sparks.append({"p": sh["p"], "v": Vector2(fw_rng.randf_range(-12, 12), fw_rng.randf_range(4, 22)), "age": 0.0,
+				"life": fw_rng.randf_range(0.3, 0.55), "col": Color(1.0, 0.82, 0.55), "col2": Color(1.0, 0.5, 0.2),
+				"drag": 3.0, "g": 30.0, "streak": 0.0, "kind": "ember", "w": fw_rng.randf() * TAU})
+		if u >= 1.0:
+			_fw_burst(sh)
+		else:
+			keep.append(sh)
+	fw_shells = keep
+	var alive: Array = []
+	for sp in fw_sparks:
+		sp["age"] = float(sp["age"]) + delta
+		if float(sp["age"]) >= float(sp["life"]):
+			if sp["kind"] == "crackle":
+				for c in 2:
+					fw_flashes.append({"p": Vector2(sp["p"]) + Vector2(fw_rng.randf_range(-6, 6), fw_rng.randf_range(-6, 6)),
+						"c": Color(1.0, 0.98, 0.9), "t0": clock + fw_rng.randf() * 0.12, "s": 9.0, "len": 0.09})
+			continue
+		var v: Vector2 = sp["v"] * exp(-float(sp["drag"]) * delta)
+		v.y += float(sp["g"]) * delta
+		sp["v"] = v
+		sp["p"] = Vector2(sp["p"]) + v * delta
+		alive.append(sp)
+	fw_sparks = alive
+	var lit: Array = []
+	for f in fw_flashes:
+		if clock - float(f["t0"]) < float(f["len"]):
+			lit.append(f)
+	fw_flashes = lit
+	var shining: Array = []
+	for gl in fw_glints:
+		if clock - float(gl["t0"]) < 0.7:
+			shining.append(gl)
+	fw_glints = shining
+	if fw_show:
+		fw_next -= delta
+		if fw_next <= 0.0:
+			_fw_random(fw_rng.randf_range(0.75, 1.0))
+			if fw_rng.randf() < 0.3:
+				_fw_random(fw_rng.randf_range(0.6, 0.85))  # sometimes two together
+			fw_next = fw_rng.randf_range(1.1, 2.1)
+
+
+## A shell bursts: a white-hot flash, then its stars. Seen side on, a sphere of stars looks densest at its
+## rim, so each star's speed is the sphere's speed times how side-on it flies.
+func _fw_burst(sh: Dictionary) -> void:
+	var p: Vector2 = sh["p"]
+	var k := float(sh["k"])
+	var kind: String = sh["kind"]
+	var n := 120
+	var speed := 330.0
+	var drag := 1.8
+	var g := 58.0
+	var life := Vector2(1.4, 2.0)
+	var streak := 0.06
+	match kind:
+		"willow":
+			n = 100
+			speed = 250.0
+			drag = 2.4
+			g = 22.0
+			life = Vector2(2.6, 3.3)
+			streak = 0.16
+		"crackle":
+			n = 80
+			speed = 290.0
+			life = Vector2(0.9, 1.3)
+		"glitter":
+			n = 100
+			speed = 300.0
+			life = Vector2(1.6, 2.2)
+	n = int(n * lerpf(0.6, 1.0, clampf(k, 0.0, 1.0)))
+	for i in n:
+		var z := fw_rng.randf_range(-1.0, 1.0)
+		var dir := Vector2.from_angle(fw_rng.randf() * TAU) * sqrt(1.0 - z * z)
+		fw_sparks.append({"p": p, "v": dir * speed * k * fw_rng.randf_range(0.92, 1.05), "age": 0.0,
+			"life": fw_rng.randf_range(life.x, life.y), "col": sh["col"], "col2": sh["col2"], "drag": drag, "g": g,
+			"streak": streak, "kind": kind, "w": fw_rng.randf() * TAU})
+	fw_flashes.append({"p": p, "c": Color(sh["col"]).lerp(Color.WHITE, 0.5), "t0": clock, "s": 190.0 * k, "len": 0.35})
+	# The sound arrives a moment after the light.
+	var big := k
+	get_tree().create_timer(fw_rng.randf_range(0.1, 0.25)).timeout.connect(Sfx.fw_boom.bind(big))  # not tied to the map, which may be gone by then
+	if kind == "crackle":
+		get_tree().create_timer(1.0).timeout.connect(Sfx.fw_crackle)
+
+
+## A lake lighting up in the celebration: its lanterns flash one after another with a star glint, and a
+## fountain of sparks in the lake's light shoots up off the water and falls back.
+func _lake_burst(i: int, col: Color) -> void:
+	var origin: Vector2 = SPOTS[i] + off - LAKE_CENTER * THUMB
+	var lights: Array = Game.lakes[i]["lanterns"]
+	for li in lights.size():
+		var rays: Array = []  # each glint's own few rays, uneven in angle and length, so no two look ruled
+		var base := fw_rng.randf() * TAU
+		for r in fw_rng.randi_range(4, 6):
+			rays.append([base + TAU * r / 5.0 + fw_rng.randf_range(-0.35, 0.35), fw_rng.randf_range(0.55, 1.15)])
+		fw_glints.append({"p": origin + Vector2(lights[li][0], lights[li][1]) * THUMB, "t0": clock + li * 0.08, "c": col,
+			"rays": rays, "spin": fw_rng.randf_range(-0.5, 0.5)})
+	var c: Vector2 = SPOTS[i] + off
+	for k in 46:
+		var from := c + Vector2(fw_rng.randf_range(-30.0, 30.0), fw_rng.randf_range(-40.0, 40.0))
+		fw_sparks.append({"p": from, "v": Vector2(fw_rng.randf_range(-70.0, 70.0), -fw_rng.randf_range(150.0, 280.0)),
+			"age": 0.0, "life": fw_rng.randf_range(0.9, 1.5), "col": col.lerp(Color.WHITE, 0.3), "col2": col,
+			"drag": 1.3, "g": 260.0, "streak": 0.045, "kind": "fountain", "w": fw_rng.randf() * TAU})
+
+
+## Draws the fireworks (added light): lantern glints, flashes, then each star as a short streak along its
+## flight, white-hot at first and settling into its colour (some changing colour late), fading at the end.
+func _fw_draw() -> void:
+	var ci := cele_fx
+	var glow: Texture2D = Game.glow_tex
+	# Lantern glints: a quick four-point star that opens and fades.
+	for gl in fw_glints:
+		var age := clock - float(gl["t0"])
+		if age < 0.0 or age > 0.7:
+			continue
+		var u := age / 0.7
+		var a := minf(u / 0.12, 1.0) * (1.0 - smoothstep(0.35, 1.0, u))  # a quick rise, then a fade (no jump)
+		# Soft, tapering rays of light (stretched glow, no hard lines), uneven and turning slowly as they fade.
+		var arm := 30.0 * (0.6 + 0.6 * sin(PI * u * 0.5))
+		var p: Vector2 = gl["p"]
+		var c: Color = Color(gl["c"]).lerp(Color.WHITE, 0.45)
+		for ray in gl["rays"]:
+			var ang := float(ray[0]) + float(gl["spin"]) * u
+			var reach := arm * float(ray[1])  # from the lantern out to the ray's soft tip
+			ci.draw_set_transform(p + Vector2.from_angle(ang) * reach * 0.5, ang, Vector2(reach * 0.55 / 16.0, 0.16))
+			ci.draw_texture_rect(glow, Rect2(-16, -16, 32, 32), false, Color(c, 0.75 * a))
+		ci.draw_set_transform(Vector2.ZERO)
+		ci.draw_texture_rect(glow, Rect2(p - Vector2(18, 18), Vector2(36, 36)), false, Color(c, 0.65 * a))
+	for f in fw_flashes:
+		var age := clock - float(f["t0"])
+		if age < 0.0:
+			continue
+		var a := pow(1.0 - age / float(f["len"]), 2.0)
+		var r := float(f["s"]) * (0.6 + age * 1.5)
+		ci.draw_texture_rect(glow, Rect2(Vector2(f["p"]) - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(f["c"], 0.6 * a))
+		if float(f["s"]) > 40.0:
+			var sky := 420.0
+			ci.draw_texture_rect(glow, Rect2(Vector2(f["p"]) - Vector2(sky, sky), Vector2(sky, sky) * 2.0), false, Color(f["c"], 0.08 * a))
+	for sp in fw_sparks:
+		var age := float(sp["age"])
+		var u := age / float(sp["life"])
+		var a := 1.0 - smoothstep(0.55, 1.0, u)
+		var w := float(sp["w"])
+		if sp["kind"] == "glitter" and u > 0.35:
+			a *= 0.25 + 0.75 * float(sin(clock * 31.0 + w * 5.0) > 0.1)
+		elif u > 0.6:
+			a *= 0.8 + 0.2 * sin(clock * 37.0 + w)
+		var c: Color = Color(1.0, 0.97, 0.9).lerp(sp["col"], clampf(age / 0.22, 0.0, 1.0)).lerp(sp["col2"], smoothstep(0.45, 0.8, u))
+		var pos: Vector2 = sp["p"]
+		if sp["kind"] == "ember":
+			ci.draw_texture_rect(glow, Rect2(pos - Vector2(3, 3), Vector2(6, 6)), false, Color(c, 0.8 * a))
+			continue
+		var tail: Vector2 = pos - Vector2(sp["v"]) * float(sp["streak"])
+		ci.draw_line(tail, pos, Color(c, a), lerpf(3.0, 1.4, u), true)
+		if u < 0.4:
+			ci.draw_texture_rect(glow, Rect2(pos - Vector2(9, 9), Vector2(18, 18)), false, Color(c, 0.4 * a))
+
+
+## Fireflies round each lake's shore, for the chapter's night.
+func _make_shore_flies() -> void:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 77
+	for i in Game.lake_count():
+		for k in 9:
+			var a := rng.randf() * TAU
+			shore_flies.append({"home": SPOTS[i] + off + Vector2.from_angle(a) * rng.randf_range(70.0, 135.0),
+				"ph": rng.randf(), "per": rng.randf_range(2.4, 4.6), "sx": rng.randf_range(0.18, 0.4), "sy": rng.randf_range(0.15, 0.35)})
 
 
 func _setting(key: String) -> bool:

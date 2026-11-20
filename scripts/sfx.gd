@@ -71,6 +71,9 @@ func _generate() -> void:
 		["peep", _make_peep],
 		["hiss", _make_hiss],
 		["beats", _make_beats],
+		["fw_boom", _make_fw_boom],
+		["fw_launch", _make_fw_launch],
+		["fw_crackle", _make_fw_crackle],
 	]
 	var out := {}
 	var lock := Mutex.new()
@@ -196,6 +199,19 @@ func ignite() -> void:
 
 func fade_out() -> void:
 	_play("chime", 0.5, -20.0)
+
+
+## Fireworks: the thump of a shell going up, the boom of its burst (bigger shells lower), crackling stars.
+func fw_launch() -> void:
+	_play("fw_launch", randf_range(0.9, 1.15), -16.0)
+
+
+func fw_boom(size: float) -> void:
+	_play("fw_boom", randf_range(0.92, 1.08) * lerpf(1.25, 0.85, clampf(size, 0.0, 1.0)), lerpf(-12.0, -4.0, clampf(size, 0.0, 1.0)))
+
+
+func fw_crackle() -> void:
+	_play("fw_crackle", randf_range(0.95, 1.1), -11.0)
 
 
 func chain(pitch: float, level: int) -> void:
@@ -529,6 +545,63 @@ func _make_beats() -> AudioStreamWAV:
 		var env := exp(-k * 28.0) if t < 0.51 else 0.0
 		lp += (rng.randf_range(-1.0, 1.0) - lp) * 0.18  # dull thump of wing on water
 		s[i] = (lp * 2.2 + rng.randf_range(-1.0, 1.0) * 0.25 * exp(-k * 60.0)) * env * 0.6
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_fw_boom() -> AudioStreamWAV:
+	# A sharp crack, a low thump that drops in pitch, and a long dark rumble of filtered noise rolling away.
+	var secs := 1.9
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 61
+	var lp := 0.0
+	var lp2 := 0.0
+	var ph := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var n := rng.randf_range(-1.0, 1.0)
+		lp += (n - lp) * lerpf(0.25, 0.03, minf(t / 0.4, 1.0))
+		lp2 += (lp - lp2) * 0.2
+		ph += TAU * lerpf(70.0, 38.0, minf(t / 0.3, 1.0)) / RATE_HI
+		var thump := sin(ph) * exp(-t * 7.0)
+		var crack := n * exp(-t * 90.0) * 0.6
+		var rumble := lp2 * 3.2 * exp(-t * 2.4) * minf(1.0, t / 0.02)
+		s[i] = thump * 0.9 + crack + rumble
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_fw_launch() -> AudioStreamWAV:
+	# The mortar's dull thump, then the shell's soft rushing hiss as it climbs.
+	var secs := 0.9
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 67
+	var lp := 0.0
+	var prev := 0.0
+	for i in s.size():
+		var t := float(i) / RATE_HI
+		var n := rng.randf_range(-1.0, 1.0)
+		lp += (n - lp) * 0.3
+		var hp := lp - prev
+		prev = lp
+		var thump := sin(TAU * 85.0 * t) * exp(-t * 26.0)
+		var hiss := hp * smoothstep(0.02, 0.12, t) * (1.0 - smoothstep(0.45, secs, t)) * 0.5
+		s[i] = thump + hiss
+	return _to_wav(s, RATE_HI, false)
+
+
+func _make_fw_crackle() -> AudioStreamWAV:
+	# Dozens of tiny bright pops scattered over a second, thickest early.
+	var secs := 1.2
+	var s := _buf(secs, RATE_HI)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 71
+	for c in 70:
+		var at := int(pow(rng.randf(), 1.6) * (secs - 0.02) * RATE_HI)
+		var amp := rng.randf_range(0.3, 1.0)
+		for j in int(0.004 * RATE_HI):
+			if at + j < s.size():
+				s[at + j] += rng.randf_range(-1.0, 1.0) * amp * exp(-float(j) / (0.0008 * RATE_HI))
 	return _to_wav(s, RATE_HI, false)
 
 

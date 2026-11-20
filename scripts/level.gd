@@ -155,6 +155,7 @@ var dock_turn := 0.0  # the autopilot's steering, -1..1
 var dock_speed := 0.0
 var idle_t := 0.0
 var dock_path := PackedVector2Array()  # the way home over open water, ending lined up with the jetty
+var dock_s := 0.0  # how far along dock_path the boat has got; it only ever moves forward
 var dock_check_t := 0.0
 var dock_check_p := Vector2.ZERO
 var crash_fast := false  # a tap during the wreck: the slow motion speeds up to the wreck screen
@@ -163,6 +164,7 @@ var paused_scale := 1.0  # the slow motion's time scale while the pause screen i
 var crash_pos := Vector2.ZERO
 var duration := 30.0  # seconds of daylight, from Game.lake_duration
 var run_time := 0.0
+var water_time := 0.0  # seconds out on the water this visit (every try), saved to the lake's stats on leaving
 var counted := false
 var days_used := 0  # extra daylight taken this try
 var patches_used := 0
@@ -468,6 +470,13 @@ func _next_lake() -> int:
 func _exit_tree() -> void:
 	get_tree().paused = false
 	Engine.time_scale = 1.0
+	_save_water()
+
+
+func _save_water() -> void:
+	if water_time > 0.0:
+		Game.add_water(lake_index, water_time)
+		water_time = 0.0
 
 
 func _safe_top() -> float:
@@ -769,6 +778,8 @@ func _process(delta: float) -> void:
 		_set_growth(clampf((t - ENTER_CAM) / GROW_TIME, 0.0, 1.0))
 		if t >= ENTER_CAM + GROW_TIME:
 			_end_zoom_in()
+	if state in ["play", "complete", "dark", "dying"]:
+		water_time += delta
 	match state:
 		"ready":
 			if not zooming and (_turn_input() != 0 or not touches.is_empty()):
@@ -904,6 +915,8 @@ func _unhandled_input(event: InputEvent) -> void:
 
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_PAUSED or what == NOTIFICATION_WM_CLOSE_REQUEST:
+		_save_water()  # the app may be closed from here without this lake ever leaving the tree
 	if zooming:
 		return
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
@@ -1426,45 +1439,78 @@ func _dock_step(delta: float) -> void:
 	var face := float(st[2]) + PI  # set off facing away from the jetty; comes home facing it
 	if not homing or dock_path.is_empty():
 		homing = true
-		dock_path = _plan_home(moor, face)
-		dock_check_t = 0.0
-		dock_check_p = boat_pos
+		_replan(moor, face)
 	# Held up for a while (pushed off line): find the way again.
 	dock_check_t += delta
 	if dock_check_t > 1.5:
 		if boat_pos.distance_to(dock_check_p) < 12.0 and boat_pos.distance_to(moor) > 12.0:
-			dock_path = _plan_home(moor, face)
+			_replan(moor, face)
 		dock_check_t = 0.0
 		dock_check_p = boat_pos
-	# Follow the way: aim at a point a little ahead along it.
-	var k := 0
+	# Where the boat is along the way: the nearest point on the next few stretches ahead of where it had
+	# got to. It never goes back, so the boat never turns round to chase a point it has already passed
+	# (aiming just past the nearest corner did that: once past a corner, it circled it).
+	var total := 0.0
+	var seg_s: Array = [0.0]
+	for i in dock_path.size() - 1:
+		total += dock_path[i].distance_to(dock_path[i + 1])
+		seg_s.append(total)
 	var best := INF
-	for i in dock_path.size():
-		var dd := boat_pos.distance_squared_to(dock_path[i])
+	var best_s := dock_s
+	for i in dock_path.size() - 1:
+		if float(seg_s[i + 1]) < dock_s - 1.0:
+			continue
+		if float(seg_s[i]) > dock_s + 160.0:
+			break
+		var a := dock_path[i]
+		var b := dock_path[i + 1]
+		var ab := b - a
+		var u := clampf((boat_pos - a).dot(ab) / maxf(ab.length_squared(), 0.001), 0.0, 1.0)
+		var q := a + ab * u
+		var dd := boat_pos.distance_squared_to(q)
 		if dd < best:
 			best = dd
-			k = i
-	var left := 0.0  # how far there is still to go
-	for i in range(k, dock_path.size() - 1):
-		left += dock_path[i].distance_to(dock_path[i + 1])
-	var look := clampf(left * 0.5, 0.0, 46.0)
-	var carrot := dock_path[dock_path.size() - 1]
-	var acc := 0.0
-	for i in range(k, dock_path.size() - 1):
-		var seg := dock_path[i].distance_to(dock_path[i + 1])
-		if acc + seg >= look:
-			carrot = dock_path[i].lerp(dock_path[i + 1], (look - acc) / maxf(seg, 0.001))
-			break
-		acc += seg
+			best_s = maxf(dock_s, float(seg_s[i]) + u * ab.length())
+	dock_s = best_s
+	if best > 80.0 * 80.0:
+		_replan(moor, face)  # pushed well off the way (a bump, a swan): find it again from here
+		return
+	# Aim at a point ahead along the way, at least a turning circle away (a point closer than that it can
+	# only circle). Past the end, the point carries on along the jetty's line, so the last stretch is a
+	# straight glide in, square to the jetty, with nothing to circle.
+	var left := maxf(0.0, total - dock_s)
+	var look := clampf(speed * 0.4, 26.0, 56.0)  # about its turning circle at this speed (speed / TURN_RATE)
+	var carrot := _dock_point(dock_s + look, seg_s, total, face)
 	var d := boat_pos.distance_to(moor)
-	var aim := (carrot - boat_pos).angle() if d > 6.0 else face
+	var aim := (carrot - boat_pos).angle()
+	if left < 3.0 and d >= 8.0:
+		aim = (moor - boat_pos).angle()  # reached the end a little off the line: creep straight to it
 	var diff := wrapf(aim - heading, -PI, PI)
 	dock_turn = clampf(diff * 1.6, -1.0, 1.0)
 	# Easing off as it nears: cruising speed far away, a gentle drift at the end, then still; slower
-	# through a tight turn.
-	dock_speed = clampf(minf(left, d) * 1.2 + 4.0, 0.0, SPEED * 0.85) * (1.0 - 0.6 * clampf(absf(diff) - 0.8, 0.0, 1.0))
-	if d < 4.0:
-		dock_speed = 0.0
+	# through a tight turn, so the turn is tighter too.
+	dock_speed = clampf(left * 1.2 + 4.0, 0.0, SPEED * 0.85) * (1.0 - 0.75 * clampf((absf(diff) - 0.4) / 1.0, 0.0, 1.0))
+	if left < 3.0:
+		dock_speed = 0.0 if d < 8.0 else clampf(d * 1.2, 8.0, 20.0)  # slow enough to turn tightly onto it
+
+
+## A fresh way home from where the boat is now.
+func _replan(moor: Vector2, face: float) -> void:
+	dock_path = _plan_home(moor, face)
+	dock_s = 0.0
+	dock_check_t = 0.0
+	dock_check_p = boat_pos
+
+
+## The point s along the way home; past its end, straight on along the jetty's line.
+func _dock_point(s: float, seg_s: Array, total: float, face: float) -> Vector2:
+	if s >= total:
+		return dock_path[dock_path.size() - 1] + Vector2.from_angle(face) * (s - total)
+	for i in dock_path.size() - 1:
+		if s <= float(seg_s[i + 1]):
+			var seg_len := float(seg_s[i + 1]) - float(seg_s[i])
+			return dock_path[i].lerp(dock_path[i + 1], (s - float(seg_s[i])) / maxf(seg_len, 0.001))
+	return dock_path[dock_path.size() - 1]
 
 
 ## The way home: a search over a grid of open water from the boat to a point back along the jetty's
@@ -1472,6 +1518,9 @@ func _dock_step(delta: float) -> void:
 ## and the path is straightened wherever there is a clear line.
 func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
 	const STEP := 16.0
+	# Already right by the mooring: just creep onto it, rather than going out to line up and coming back.
+	if boat_pos.distance_to(moor) < 60.0 and _clear_line(boat_pos, moor):
+		return PackedVector2Array([boat_pos, moor])
 	var into := Vector2.from_angle(face)
 	var approach := moor - into * 70.0
 	if not _free(approach):
@@ -1550,11 +1599,13 @@ func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
 		while came.has(c):
 			chain.push_front(c)
 			c = came[c]
+		if not chain.is_empty() and cell.call(chain[-1]).distance_to(approach) < STEP:
+			chain.pop_back()  # the goal square itself: the lining-up point (next) is right there
 		for cc in chain:
 			raw.append(cell.call(cc))
 	raw.append(approach)
-	raw.append(moor)
-	# Straighten it: skip ahead wherever the line between two points is clear water.
+	# Straighten it: skip ahead wherever the line between two points is clear water. It always keeps the
+	# point lined up with the jetty, then runs straight in from there.
 	var path := PackedVector2Array([raw[0]])
 	var i := 0
 	while i < raw.size() - 1:
@@ -1563,6 +1614,7 @@ func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
 			j -= 1
 		path.append(raw[j])
 		i = j
+	path.append(moor)
 	return path
 
 
