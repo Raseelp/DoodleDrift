@@ -83,7 +83,7 @@ const EGG_PICK := 24.0
 const EGG_PASS := 46.0
 
 
-static func make(level, at: Vector2, size: float, temper_s: float, seed: int) -> SwanPair:
+static func make(level, at: Vector2, size: float, temper_s: float, seed: int, has_egg := true) -> SwanPair:
 	var s := SwanPair.new()
 	s.lv = level
 	s.rng.seed = seed
@@ -117,7 +117,10 @@ static func make(level, at: Vector2, size: float, temper_s: float, seed: int) ->
 	s.nest_view.nest = true
 	level.add_child(s.nest_view)
 	s.nest_view.set_sit(1.0)
-	s._place_egg(level)
+	if has_egg:
+		s._place_egg(level)
+	else:
+		s.egg_state = "none"  # this lake's goal isn't their egg: none rolled off
 	return s
 
 
@@ -168,6 +171,8 @@ func _ring_point(a: float) -> Vector2:
 
 func _ok(p: Vector2) -> bool:
 	if not Geometry2D.is_point_in_polygon(p, pool):
+		return false
+	if lv._in_isle(p):
 		return false
 	for r in lv.rocks:
 		if p.distance_to(r["c"]) < float(r["r"]) + 12.0:
@@ -313,7 +318,7 @@ func update(delta: float) -> void:
 			air_turn = lerpf(air_turn, turn / maxf(delta, 0.0001) / FLY_TURN, 1.0 - exp(-6.0 * delta))
 			fly_speed = move_toward(fly_speed, FLY_SPEED, 120.0 * delta)
 			var np: Vector2 = cp + Vector2.from_angle(float(cob["dir"])) * fly_speed * delta
-			cob["p"] = Vector2(clampf(np.x, 20.0, Game.LAKE_SIZE.x - 20.0), clampf(np.y, 20.0, Game.LAKE_SIZE.y - 20.0))
+			cob["p"] = Vector2(clampf(np.x, 20.0, lv.lake_w - 20.0), clampf(np.y, 20.0, Game.LAKE_SIZE.y - 20.0))
 			alt = 1.0
 			# Flap, flap, glide; banking into hard turns.
 			flap_t += delta
@@ -620,7 +625,7 @@ func _bank_point(a: float, r0: float, r1: float) -> Vector2:
 	for k in 30:
 		var q := nest + Vector2.from_angle(a + rng.randf_range(-0.6, 0.6)) * rng.randf_range(r0, r1)
 		if Geometry2D.is_point_in_polygon(q, wet) or q.x < 24.0 or q.y < 24.0 \
-				or q.x > Game.LAKE_SIZE.x - 24.0 or q.y > Game.LAKE_SIZE.y - 24.0:
+				or q.x > lv.lake_w - 24.0 or q.y > Game.LAKE_SIZE.y - 24.0:
 			continue
 		var shaded := false
 		for tr in lv.trees:
@@ -653,7 +658,7 @@ func _strike(clock: float, boat: Vector2) -> void:
 ## The boat ran him down: he is knocked, collapses and sinks.
 func _die(clock: float, boat: Vector2) -> void:
 	alive = false
-	if egg_state != "home":
+	if egg_state not in ["home", "none"]:
 		if egg_state in ["carried", "passing", "cob"]:
 			egg_p = lv.boat_pos  # it rolls off the deck where the boat is
 		egg_state = "gone"  # no one to bring it to now
@@ -689,7 +694,7 @@ func _update_dead(delta: float, clock: float, boat: Vector2) -> void:
 			lv.ripples.append({"p": cob["p"], "t": clock, "life": 1.5, "r0": 6.0, "r1": 40.0, "light": false})
 	cob["v"] = Vector2(cob["v"]).move_toward(Vector2.ZERO, 60.0 * delta)
 	var np: Vector2 = Vector2(cob["p"]) + Vector2(cob["v"]) * delta
-	if Geometry2D.is_point_in_polygon(np, pool):
+	if Geometry2D.is_point_in_polygon(np, pool) and not lv._in_isle(np):
 		cob["p"] = np
 	if t > 0.6:
 		cob_view.play("down", 0.6)
@@ -749,9 +754,12 @@ func draw_egg(ci: CanvasItem) -> void:
 	if egg_state == "float":
 		var bob := sin(clock * 2.1) * 1.2
 		var p := egg_p + Vector2(0, bob)
-		for k in 2:
-			var rk := fmod(clock * 0.45 + k * 0.5, 1.0)
-			ci.draw_arc(egg_p, 9.0 + rk * 16.0, 0.0, TAU, 32, Color(1, 1, 1, 0.35 * (1.0 - rk)), 1.2, true)
+		# A soft light on the water under it and three rings spreading wide, so it is easy to spot.
+		ci.draw_texture_rect(Game.glow_tex, Rect2(egg_p - Vector2(30, 30), Vector2(60, 60)), false, Color(1, 1, 1, 0.3 + 0.1 * sin(clock * 2.4)))
+		for k in 3:
+			var rk := fmod(clock * 0.5 + k / 3.0, 1.0)
+			var e := 1.0 - (1.0 - rk) * (1.0 - rk)
+			ci.draw_arc(egg_p, 10.0 + e * 34.0, 0.0, TAU, 40, Color(1, 1, 1, 0.7 * (1.0 - rk)), 2.2 * (1.0 - rk) + 0.8, true)
 		_draw_egg_shape(ci, p, 1.0, 1.0)
 	elif egg_state == "gone":
 		var a := 1.0 - clampf((clock - egg_t) / 1.5, 0.0, 1.0)  # slips under

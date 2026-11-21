@@ -1,5 +1,6 @@
 class_name DuckFamily
 extends RefCounted
+const Batch = preload("res://scripts/batch.gd")
 ## A mallard hen and her ducklings living on a lake, behaving the way a real family does:
 ## - The hen swims slowly from place to place. On the way she stops to feed (dabbling: she tips forward,
 ##   tail up, then rights herself), and now and then rests near the shore and preens.
@@ -491,6 +492,8 @@ func _avoid(p: Vector2, near: float) -> Vector2:
 func _ok(p: Vector2) -> bool:
 	if not Geometry2D.is_point_in_polygon(p, pool):
 		return false
+	if lv._in_isle(p):
+		return false
 	for r in lv.rocks:
 		if p.distance_to(r["c"]) < float(r["r"]) + 6.0:
 			return false
@@ -520,20 +523,58 @@ func _new_target() -> Vector2:
 
 func draw(ci: CanvasItem, shade: Color) -> void:
 	var clock: float = lv.clock
+	# Off screen on a wide lake: nothing to draw.
+	var lo: float = lv.cam_x - lv.off.x - 60.0
+	var hi: float = lo + lv.view_size.x + 120.0
+	var seen := float(hen["p"].x) > lo and float(hen["p"].x) < hi
+	for kid in kids:
+		seen = seen or (float(kid["p"].x) > lo and float(kid["p"].x) < hi)
+	if not seen:
+		return
+	var rid := ci.get_canvas_item()
+	# Wakes first (under the ducks), all in one go.
+	var wb := Batch.new()
+	for kid in kids:
+		if float(kid["dive_until"]) <= clock:
+			_wake(wb, kid["p"], float(kid["dir"]), Vector2(kid["v"]).length(), 5.0)
+	var hs := Vector2(hen["v"]).length()
+	_wake(wb, hen["p"], float(hen["dir"]), hs, 11.0)
+	wb.flush(ci)
+	# Each duck's shape is built once (in its own coordinates) and only placed each frame.
 	for kid in kids:
 		if float(kid["dive_until"]) > clock:
 			continue
 		var sway := sin(clock * 9.0 + float(kid["ph"])) * 0.07 * clampf(Vector2(kid["v"]).length() / 20.0, 0.0, 1.0)
-		_wake(ci, kid["p"], float(kid["dir"]), Vector2(kid["v"]).length(), 5.0)
-		_draw_kid(ci, kid["p"], float(kid["dir"]) + sway, float(kid["size"]), shade)
-	var hs := Vector2(hen["v"]).length()
-	_wake(ci, hen["p"], float(hen["dir"]), hs, 11.0)
+		var ang := float(kid["dir"]) + sway
+		var sz := float(kid["size"])
+		_put(rid, Transform2D(ang, Vector2.ONE * sz, 0.0, Vector2(kid["p"]) + Vector2(2, 2.5)), _shape("kid_shadow", func(sb: Batch): sb.circle(Vector2(-0.5, 0), 4.6, Color(shade, 0.45))))
+		_put(rid, Transform2D(ang, Vector2.ONE * sz, 0.0, kid["p"]), _shape("kid", _build_kid))
 	var sway_h := sin(clock * 6.0 + float(hen["ph"])) * 0.05 * clampf(hs / 20.0, 0.0, 1.0)
-	_draw_hen(ci, hen["p"], float(hen["dir"]) + sway_h, shade, clock)
+	_draw_hen(ci, rid, hen["p"], float(hen["dir"]) + sway_h, shade, clock)
+	RenderingServer.canvas_item_add_set_transform(rid, Transform2D.IDENTITY)
+
+
+var _shapes := {}
+
+
+## A duck part's triangles, built the first time it's asked for.
+func _shape(key: String, build: Callable) -> Array:
+	if not _shapes.has(key):
+		var sb := Batch.new()
+		build.call(sb)
+		_shapes[key] = [sb.idx, sb.verts, sb.cols]
+	return _shapes[key]
+
+
+func _put(rid: RID, xf: Transform2D, arrs: Array) -> void:
+	if (arrs[0] as PackedInt32Array).is_empty():
+		return
+	RenderingServer.canvas_item_add_set_transform(rid, xf)
+	RenderingServer.canvas_item_add_triangle_array(rid, arrs[0], arrs[1], arrs[2])
 
 
 ## A faint V behind a paddling duck.
-func _wake(ci: CanvasItem, p: Vector2, ang: float, spd: float, back: float) -> void:
+func _wake(b: Batch, p: Vector2, ang: float, spd: float, back: float) -> void:
 	if spd < 6.0:
 		return
 	var f := Vector2.from_angle(ang)
@@ -542,56 +583,65 @@ func _wake(ci: CanvasItem, p: Vector2, ang: float, spd: float, back: float) -> v
 	var ln := clampf(spd * 0.3, 4.0, 14.0)
 	var a := clampf(spd / 60.0, 0.08, 0.18)
 	for sd in [-1.0, 1.0]:
-		ci.draw_line(tail, tail - f * ln + s * sd * ln * 0.5, Color(1, 1, 1, a), 1.2, true)
+		b.line(tail, tail - f * ln + s * sd * ln * 0.5, Color(1, 1, 1, a), 1.2)
 
 
-func _draw_hen(ci: CanvasItem, p: Vector2, ang: float, shade: Color, clock: float) -> void:
-	var tip := float(hen["tip"])
+func _draw_hen(ci: CanvasItem, rid: RID, p: Vector2, ang: float, shade: Color, clock: float) -> void:
+	var tip := roundf(float(hen["tip"]) * 4.0) / 4.0  # five steps between swimming and tipped up
 	var alarm := state == "alarm" or state == "flee"
 	var flap := state == "flee"
-	ci.draw_set_transform(p + Vector2(3, 4), ang, Vector2.ONE)
-	ci.draw_colored_polygon(_body(1.0 - 0.35 * tip, 1.0), Color(shade, 0.5))
-	ci.draw_set_transform(p, ang, Vector2.ONE)
+	_put(rid, Transform2D(ang, p + Vector2(3, 4)), _shape("hen_shadow%d" % int(tip * 4.0), func(sb: Batch): sb.poly(_body(1.0 - 0.35 * tip, 1.0), Color(shade, 0.5))))
 	if flap:
 		# Wings out, beating, as she flaps off across the water.
+		RenderingServer.canvas_item_add_set_transform(rid, Transform2D.IDENTITY)
+		var fb := Batch.new()
+		fb.set_transform(p, ang, Vector2.ONE)
 		var beat := absf(sin(clock * 22.0))
 		for sd in [-1.0, 1.0]:
 			var w := PackedVector2Array([Vector2(3, 3 * sd), Vector2(-6, (6 + 12 * beat) * sd), Vector2(-12, (4 + 9 * beat) * sd), Vector2(-7, 3 * sd)])
-			ci.draw_colored_polygon(w, Color("7d5c3c"))
-			ci.draw_line(Vector2(-5, (5 + 9 * beat) * sd), Vector2(-9, (4 + 7 * beat) * sd), Color("3d57a6"), 2.0, true)
-	var body := _body(1.0 - 0.35 * tip, 1.0)
-	ci.draw_colored_polygon(body, Color("9b7a55"))
-	# The darker centres of her back feathers with paler edges: the mallard hen's mottling.
-	ci.draw_colored_polygon(_body(0.78 - 0.3 * tip, 0.62), Color("6f5236"))
-	for mk in marks:
-		var mp: Vector2 = mk[0]
-		if tip > 0.5 and mp.x > -2.0:
-			continue
-		ci.draw_arc(mp, float(mk[1]), PI * 0.6 + float(mk[2]), PI * 1.4 + float(mk[2]), 5, Color("c9ab80"), 0.8, true)
-	# Folded wings along her sides, the blue patch showing near their ends, tail at the back.
-	for sd in [-1.0, 1.0]:
-		ci.draw_line(Vector2(2, 4.6 * sd), Vector2(-10, 3.6 * sd), Color("5e4329"), 1.8, true)
-		ci.draw_line(Vector2(-5.5, 4.7 * sd), Vector2(-8.5, 4.1 * sd), Color("2f4683"), 0.9, true)
-		ci.draw_line(Vector2(-5.2, 5.2 * sd), Vector2(-8.8, 4.6 * sd), Color(1, 1, 1, 0.35), 0.5, true)
-	ci.draw_colored_polygon(PackedVector2Array([Vector2(-11, -2.4), Vector2(-16, 0), Vector2(-11, 2.4)]), Color("4e3a26"))
-	ci.draw_line(Vector2(-12, 0), Vector2(-15.4, 0), Color("cdb894"), 0.8, true)
+			fb.poly(w, Color("7d5c3c"))
+			fb.line(Vector2(-5, (5 + 9 * beat) * sd), Vector2(-9, (4 + 7 * beat) * sd), Color("3d57a6"), 2.0)
+		fb.flush(ci)
+	_put(rid, Transform2D(ang, p), _shape("hen%d" % int(tip * 4.0), _build_hen.bind(tip)))
 	if tip > 0.5:
-		ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 		return  # tipped up feeding: head under the water
 	# Head and bill; she stretches her neck up when alarmed, and turns her head back to preen at rest.
 	var neck := 9.5 + (2.5 if alarm else 0.0)
 	var head := Vector2(neck, 0)
 	if state == "rest" and sin(clock * 0.6 + float(hen["ph"])) > 0.6:
 		head = Vector2(-2.0, 3.5)  # preening: head turned back over her back
-	ci.draw_circle(head, 4.0, Color("8a6a47"), true, -1.0, true)
-	ci.draw_line(head + Vector2(-3.2, 0), head + Vector2(3.4, 0), Color("3e2c1c"), 1.5, true)  # dark crown
+	var key := "head_%s" % ("preen" if head.x < 0.0 else "up" if alarm else "down")
+	_put(rid, Transform2D(ang, p + head.rotated(ang)), _shape(key, _build_head.bind(head.x > 0.0)))
+
+
+## The hen's body (in her own coordinates) at a tip-up step: the mottled back, folded wings and tail.
+func _build_hen(b: Batch, tip: float) -> void:
+	b.poly(_body(1.0 - 0.35 * tip, 1.0), Color("9b7a55"))
+	# The darker centres of her back feathers with paler edges: the mallard hen's mottling.
+	b.poly(_body(0.78 - 0.3 * tip, 0.62), Color("6f5236"))
+	for mk in marks:
+		var mp: Vector2 = mk[0]
+		if tip > 0.5 and mp.x > -2.0:
+			continue
+		b.arc(mp, float(mk[1]), PI * 0.6 + float(mk[2]), PI * 1.4 + float(mk[2]), 5, Color("c9ab80"), 0.8)
+	# Folded wings along her sides, the blue patch showing near their ends, tail at the back.
 	for sd in [-1.0, 1.0]:
-		ci.draw_line(head + Vector2(-1.5, 2.6 * sd), head + Vector2(3.2, 1.6 * sd), Color("4a3726"), 0.7, true)  # eye stripe
-	if head.x > 0.0:
-		ci.draw_colored_polygon(PackedVector2Array([head + Vector2(3.0, -1.5), head + Vector2(7.6, -1.2), head + Vector2(8.2, 0),
-			head + Vector2(7.6, 1.2), head + Vector2(3.0, 1.5)]), Color("d38a3e"))
-		ci.draw_line(head + Vector2(4.2, 0), head + Vector2(6.8, 0), Color("5b4630"), 1.2, true)  # dark saddle on the bill
-	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+		b.line(Vector2(2, 4.6 * sd), Vector2(-10, 3.6 * sd), Color("5e4329"), 1.8)
+		b.line(Vector2(-5.5, 4.7 * sd), Vector2(-8.5, 4.1 * sd), Color("2f4683"), 0.9)
+		b.line(Vector2(-5.2, 5.2 * sd), Vector2(-8.8, 4.6 * sd), Color(1, 1, 1, 0.35), 0.5)
+	b.poly(PackedVector2Array([Vector2(-11, -2.4), Vector2(-16, 0), Vector2(-11, 2.4)]), Color("4e3a26"))
+	b.line(Vector2(-12, 0), Vector2(-15.4, 0), Color("cdb894"), 0.8)
+
+
+## The hen's head (centred on itself), with the bill when it faces forward.
+func _build_head(b: Batch, bill: bool) -> void:
+	b.circle(Vector2.ZERO, 4.0, Color("8a6a47"))
+	b.line(Vector2(-3.2, 0), Vector2(3.4, 0), Color("3e2c1c"), 1.5)  # dark crown
+	for sd in [-1.0, 1.0]:
+		b.line(Vector2(-1.5, 2.6 * sd), Vector2(3.2, 1.6 * sd), Color("4a3726"), 0.7)  # eye stripe
+	if bill:
+		b.poly(PackedVector2Array([Vector2(3.0, -1.5), Vector2(7.6, -1.2), Vector2(8.2, 0), Vector2(7.6, 1.2), Vector2(3.0, 1.5)]), Color("d38a3e"))
+		b.line(Vector2(4.2, 0), Vector2(6.8, 0), Color("5b4630"), 1.2)  # dark saddle on the bill
 
 
 ## The hen's body from above: rounded at the chest, tapering to the tail. len_k shortens it (tipped up).
@@ -606,21 +656,18 @@ func _body(len_k: float, w_k: float) -> PackedVector2Array:
 	return pts
 
 
-func _draw_kid(ci: CanvasItem, p: Vector2, ang: float, size: float, shade: Color) -> void:
-	ci.draw_set_transform(p + Vector2(2, 2.5), ang, Vector2.ONE * size)
-	ci.draw_circle(Vector2(-0.5, 0), 4.6, Color(shade, 0.45), true, -1.0, true)
-	ci.draw_set_transform(p, ang, Vector2.ONE * size)
-	# Downy: dark brown above with yellow patches and a yellow rim, a yellow face with a dark crown.
-	ci.draw_set_transform(p, ang, Vector2(1.15, 0.9) * size)
-	ci.draw_circle(Vector2(-1.0, 0), 4.3, Color("c9a94e"), true, -1.0, true)
-	ci.draw_circle(Vector2(-1.2, 0), 4.0, Color("4a3825"), true, -1.0, true)
-	ci.draw_set_transform(p, ang, Vector2.ONE * size)
+## A duckling (in its own coordinates, size 1). Downy: dark brown above with yellow patches and a yellow
+## rim, a yellow face with a dark crown.
+func _build_kid(b: Batch) -> void:
+	b.set_transform(Vector2.ZERO, 0.0, Vector2(1.15, 0.9))
+	b.circle(Vector2(-1.0, 0), 4.3, Color("c9a94e"))
+	b.circle(Vector2(-1.2, 0), 4.0, Color("4a3825"))
+	b.reset_transform()
 	for sd in [-1.0, 1.0]:
-		ci.draw_circle(Vector2(-2.8, 1.5 * sd), 0.65, Color("e3c665"), true, -1.0, true)
-		ci.draw_circle(Vector2(0.0, 1.8 * sd), 0.6, Color("e3c665"), true, -1.0, true)
-	ci.draw_circle(Vector2(3.6, 0), 2.6, Color("dcbf60"), true, -1.0, true)
-	ci.draw_line(Vector2(1.6, 0), Vector2(5.0, 0), Color("4a3825"), 1.9, true)
+		b.circle(Vector2(-2.8, 1.5 * sd), 0.65, Color("e3c665"))
+		b.circle(Vector2(0.0, 1.8 * sd), 0.6, Color("e3c665"))
+	b.circle(Vector2(3.6, 0), 2.6, Color("dcbf60"))
+	b.line(Vector2(1.6, 0), Vector2(5.0, 0), Color("4a3825"), 1.9)
 	for sd in [-1.0, 1.0]:
-		ci.draw_line(Vector2(3.2, 1.5 * sd), Vector2(5.0, 1.0 * sd), Color("3a2c1e"), 0.5, true)
-	ci.draw_line(Vector2(5.6, 0), Vector2(7.0, 0), Color("3a3026"), 1.2, true)
-	ci.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+		b.line(Vector2(3.2, 1.5 * sd), Vector2(5.0, 1.0 * sd), Color("3a2c1e"), 0.5)
+	b.line(Vector2(5.6, 0), Vector2(7.0, 0), Color("3a3026"), 1.2)

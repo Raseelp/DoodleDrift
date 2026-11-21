@@ -17,7 +17,7 @@ config/description="Light the lanterns with your trail before the water settles.
 run/main_scene="res://main.tscn"
 config/quit_on_go_back=false
 config/features=PackedStringArray("4.7")
-config/icon="res://icon.svg"
+config/icon="res://art/icon.png"
 
 [autoload]
 

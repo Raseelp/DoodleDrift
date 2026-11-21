@@ -157,13 +157,19 @@ var splashes: Array = []
 var floaters: Array = []
 var fish_timer := 3.0
 var crash_kind := ""
-# After the last lantern: the player can still steer; let go and the boat brings itself home to its
-# mooring off the end of the jetty, gliding in nose first and stopping there (_dock_step).
-const DOCK_IDLE := 0.5  # seconds without steering before it heads home
+# After the last lantern the boat brings itself home to its mooring off the end of the jetty (the player
+# no longer steers), gliding in nose first and stopping there (_dock_step).
 var homing := false
 var dock_turn := 0.0  # the autopilot's steering, -1..1
+var dock_parked := false  # no way home without touching anything: it eases to a stop where it is
+var dock_tries := 0  # fresh ways planned because it was held up; too many and it parks
+var dock_blocked_t := -10.0  # the last time something was right in its way
+var dock_stall_t := 0.0  # when it last made headway
+# The autopilot keeps this much farther from shores, islands and rocks than the boat strictly needs.
+const DOCK_PAD := 16.0
+var inner_safe := PackedVector2Array()
+var isle_safe: Array = []
 var dock_speed := 0.0
-var idle_t := 0.0
 var dock_path := PackedVector2Array()  # the way home over open water, ending lined up with the jetty
 var dock_s := 0.0  # how far along dock_path the boat has got; it only ever moves forward
 var dock_check_t := 0.0
@@ -207,14 +213,25 @@ var zooming := false
 var zoom_in_t := -1.0
 var skip_armed := false  # a touch began during the zoom in; only its lift skips
 var newly_unlocked := -1  # the lake this win opened, for the map to show
+# Islands: land inside the lake. isle_block is where the boat's centre can't go, isle_core the grass
+# inside each island's ring of sand.
+var isles: Array = []
+var isle_block: Array = []
+var isle_core: Array = []
 var tree_layer: Node2D
+var tree_shake_t := -10.0  # a tree was struck: the trees redraw while its canopy shakes
+var tracks_tri: Array = []  # the pickup's tyre tracks and footprints, built once
 var air_node: Node2D
 var light_layer: CanvasLayer
 var ui_layer: CanvasLayer
 
 # Nodes
+const Batch = preload("res://scripts/batch.gd")
 var view_size := Vector2.ZERO
-var off := Vector2.ZERO
+var off := Vector2.ZERO  # where the lake's left edge (camera at 0) sits on screen
+# Wide lakes pan sideways: the camera follows the boat across (never up or down), looking a little ahead.
+var lake_w := 720.0
+var cam_x := 0.0  # how far the view has panned right, in lake pixels (0 .. lake_w - 720)
 var top_inset := 0.0
 var world: Node2D
 var detail_node: Node2D
@@ -231,9 +248,12 @@ func _ready() -> void:
 	pal = lake["pal"]
 	view_size = get_viewport_rect().size
 	off = ((view_size - Game.LAKE_SIZE) * 0.5).floor()
+	lake_w = Game.lake_width(lake_index)
+	cam_x = Game.start_cam_x(lake_index)
 	top_inset = _safe_top()
 	_build_geometry()
 	_build_nodes()
+	_apply_cam()
 	_build_ui()
 	var s: Array = lake["start"]
 	boat_pos = Vector2(s[0], s[1])
@@ -278,7 +298,8 @@ func _set_shown(k: float, tint: Color) -> void:
 
 func _set_growth(g: float) -> void:
 	growth = g
-	tree_layer.queue_redraw()
+	for tn in tree_layer.get_children():
+		tn.queue_redraw()
 
 
 ## A tree's size while they grow: it pops up with a little overshoot, starting later the farther it is
@@ -325,6 +346,43 @@ func _headlight() -> float:
 			v *= 0.3
 		return v
 	return 1.0
+
+
+## The view: the world and the light layer slide left as the camera pans right.
+func _apply_cam() -> void:
+	world.position = off - Vector2(cam_x, 0.0)
+	light_layer.offset = off - Vector2(cam_x, 0.0)
+
+
+## The camera follows the boat sideways, a little ahead of where it is heading; held still while zooming
+## in from (or out to) the map, which expect it where it is.
+func _cam_step(delta: float) -> void:
+	if lake_w <= Game.LAKE_SIZE.x or zooming:
+		return
+	var lead := cos(move_dir) * 110.0 * clampf(speed / SPEED, 0.0, 1.0)
+	var want := clampf(boat_pos.x + lead - Game.LAKE_SIZE.x * 0.5, 0.0, lake_w - Game.LAKE_SIZE.x)
+	cam_x = lerpf(cam_x, want, 1.0 - exp(-delta * 2.6))
+	_apply_cam()
+
+
+## On a wide lake the swans' 3D pictures only render while they are on screen (or nearly): each is a whole
+## 3D scene drawn every frame.
+func _swan_views() -> void:
+	if lake_w <= Game.LAKE_SIZE.x or not swans.alive:
+		return
+	var lo := cam_x - off.x - 90.0
+	var hi := lo + view_size.x + 180.0
+	for pair in [[swans.cob_view, Vector2(swans.cob["p"])], [swans.nest_view, swans.nest]]:
+		var v: SubViewport = pair[0]
+		var x: float = Vector2(pair[1]).x
+		var want := SubViewport.UPDATE_ALWAYS if x > lo and x < hi else SubViewport.UPDATE_DISABLED
+		if v.render_target_update_mode != want:
+			v.render_target_update_mode = want
+
+
+## A lake point on screen (for the HUD), with the camera's pan.
+func _to_screen(p: Vector2) -> Vector2:
+	return p + off - Vector2(cam_x, 0.0)
 
 
 func _end_zoom_in() -> void:
@@ -381,7 +439,7 @@ func _rig_fits(hitch: Vector2, dir: float, bend: float, bank: PackedVector2Array
 			for w in [-13.0, 13.0]:
 				var e: Vector2 = q + across * w
 				if Geometry2D.is_point_in_polygon(e, bank) or e.x < 16.0 or e.y < 16.0 \
-						or e.x > Game.LAKE_SIZE.x - 16.0 or e.y > Game.LAKE_SIZE.y - 16.0:
+						or e.x > lake_w - 16.0 or e.y > Game.LAKE_SIZE.y - 16.0:
 					return false
 	return true
 
@@ -472,6 +530,7 @@ func _zoom_to_map(next: bool) -> void:
 	_set_hud_visible(false)
 	if overlay != null:
 		_ignore_mouse(overlay)
+	Game.exit_cam_x = cam_x  # the map pulls back from where the view is now
 	map_requested.emit(self, _next_lake() if next else -1, newly_unlocked)
 
 
@@ -515,6 +574,12 @@ func _safe_top() -> float:
 func _build_geometry() -> void:
 	water = Game.water_poly(lake_index)
 	inner = Game.offset_largest(water, -(BOAT_RADIUS + 2.0))
+	inner_safe = Game.offset_largest(water, -(BOAT_RADIUS + 2.0 + DOCK_PAD))
+	for poly in Game.island_polys(lake_index):
+		isle_safe.append(Game.offset_largest(poly, BOAT_RADIUS + 2.0 + DOCK_PAD))
+		isles.append(poly)
+		isle_block.append(Game.offset_largest(poly, BOAT_RADIUS + 2.0))
+		isle_core.append(Game.offset_largest(poly, -10.0))
 	sand_polys = Geometry2D.offset_polygon(water, 10.0, Geometry2D.JOIN_ROUND)
 	mid_polys = Geometry2D.offset_polygon(water, -18.0, Geometry2D.JOIN_ROUND)
 	deep_polys = Geometry2D.offset_polygon(water, -48.0, Geometry2D.JOIN_ROUND)
@@ -588,8 +653,8 @@ func _build_geometry() -> void:
 	var start := Vector2(lake["start"][0], lake["start"][1])
 	for fi in int(lake.get("ducks", 0)):
 		for attempt in 60:
-			var q := Vector2(drng.randf_range(60, 660), drng.randf_range(220, 1180))
-			var clear := Geometry2D.is_point_in_polygon(q, bank) and q.distance_to(start) > 220.0 and not _hits_rock(q)
+			var q := Vector2(drng.randf_range(60, lake_w - 60.0), drng.randf_range(220, 1180))
+			var clear := Geometry2D.is_point_in_polygon(q, bank) and q.distance_to(start) > 220.0 and not _hits_rock(q) and not _in_isle(q)
 			for l in lanterns:
 				if q.distance_to(l["p"]) < 70.0:
 					clear = false
@@ -601,12 +666,12 @@ func _build_geometry() -> void:
 				break
 	if lake.has("swan"):
 		var sw: Array = lake["swan"]
-		swans = SwanPair.make(self, Vector2(sw[0], sw[1]), float(sw[2]), float(sw[3]), 9001 * (lake_index + 1))
+		swans = SwanPair.make(self, Vector2(sw[0], sw[1]), float(sw[2]), float(sw[3]), 9001 * (lake_index + 1), Game.egg_goal(lake_index))
 
 	_place_trees(rng)
 
 	for k in 30:
-		motes.append({"p": Vector2(rng.randf_range(-off.x, view_size.x - off.x),
+		motes.append({"p": Vector2(rng.randf_range(-off.x, view_size.x - off.x) + cam_x,
 			rng.randf_range(-off.y, view_size.y - off.y)), "ph": rng.randf() * TAU,
 			"v": Vector2(rng.randf_range(-9, 9), rng.randf_range(4, 12)), "rot": rng.randf() * TAU})
 
@@ -614,9 +679,10 @@ func _build_geometry() -> void:
 func _place_trees(rng: RandomNumberGenerator) -> void:
 	var grown := Game.offset_largest(water, 44.0)
 	var lo := -off - Vector2(30, 30)
-	var hi := view_size - off + Vector2(30, 30)
+	var hi := view_size - off + Vector2(30 + lake_w - Game.LAKE_SIZE.x, 30)
+	var want := int(85.0 * lake_w / Game.LAKE_SIZE.x)
 	var tries := 0
-	while trees.size() < 85 and tries < 2500:
+	while trees.size() < want and tries < 2500 * want / 85:
 		tries += 1
 		var p := Vector2(rng.randf_range(lo.x, hi.x), rng.randf_range(lo.y, hi.y))
 		var r := rng.randf_range(13.0, 30.0)
@@ -652,6 +718,37 @@ func _place_trees(rng: RandomNumberGenerator) -> void:
 		for k in rng.randi_range(0, 2):
 			parts.append([Vector2.from_angle(rng.randf() * TAU) * r * 0.55, r * rng.randf_range(0.5, 0.75)])
 		trees.append({"p": p, "r": r, "parts": parts})
+	# Islands get their own trees, clear of their sand.
+	for core in isle_core:
+		var grove := Game.offset_largest(core, -14.0)
+		if grove.size() < 3:
+			continue
+		var box := Rect2(grove[0], Vector2.ZERO)
+		for q in grove:
+			box = box.expand(q)
+		var want_i := clampi(int(absf(Game.poly_area(grove)) / 1500.0), 1, 30)
+		var got_i := 0
+		for k in want_i * 30:
+			if got_i >= want_i:
+				break
+			var p := Vector2(rng.randf_range(box.position.x, box.end.x), rng.randf_range(box.position.y, box.end.y))
+			var r := rng.randf_range(11.0, 22.0)
+			if not Geometry2D.is_point_in_polygon(p, grove):
+				continue
+			if swans and p.distance_to(swans.nest) < r + 44.0:
+				continue
+			var ok := true
+			for t in trees:
+				if p.distance_to(t["p"]) < (r + float(t["r"])) * 0.62:
+					ok = false
+					break
+			if not ok:
+				continue
+			var parts: Array = [[Vector2.ZERO, r]]
+			for j in rng.randi_range(0, 2):
+				parts.append([Vector2.from_angle(rng.randf() * TAU) * r * 0.55, r * rng.randf_range(0.5, 0.75)])
+			trees.append({"p": p, "r": r, "parts": parts})
+			got_i += 1
 	trees.sort_custom(func(a, b): return a["p"].y < b["p"].y)
 	var mid := Vector2.ZERO
 	for q in water:
@@ -673,8 +770,9 @@ func _build_nodes() -> void:
 	add_child(world)
 
 	var land := Polygon2D.new()
-	land.polygon = PackedVector2Array([-off, Vector2(view_size.x - off.x, -off.y),
-		view_size - off, Vector2(-off.x, view_size.y - off.y)])
+	var land_r := view_size.x - off.x + lake_w - Game.LAKE_SIZE.x
+	land.polygon = PackedVector2Array([-off, Vector2(land_r, -off.y),
+		Vector2(land_r, view_size.y - off.y), Vector2(-off.x, view_size.y - off.y)])
 	var lm := ShaderMaterial.new()
 	lm.shader = LandShader
 	lm.set_shader_parameter("base", pal["land"])
@@ -694,6 +792,39 @@ func _build_nodes() -> void:
 	wm.set_shader_parameter("strength", 0.06 if lake_index == 4 else 0.09)
 	ripple_poly.material = wm
 	world.add_child(ripple_poly)
+
+	# Islands over the ripples: a ring of sand with a wet edge, then grass (the same ground as the banks).
+	if not isles.is_empty():
+		var isle_node := DrawNode.new()
+		isle_node.draw_fn = func(n: Node2D) -> void:
+			var wet: Color = pal["sand"].lightened(0.2)
+			wet.a = 0.55
+			for isl in isles:
+				_aa_poly(n, isl, pal["sand"])
+				var edge: PackedVector2Array = isl.duplicate()
+				edge.append(isl[0])
+				n.draw_polyline(edge, wet, 2.0, true)
+		world.add_child(isle_node)
+		for core in isle_core:
+			var grass := Polygon2D.new()
+			grass.polygon = core
+			grass.material = lm
+			world.add_child(grass)
+
+	# Rocks never move: drawn once, over the ripples (not again every frame with the details).
+	if not rocks.is_empty():
+		var rock_node := DrawNode.new()
+		rock_node.draw_fn = func(n: Node2D) -> void:
+			var shade: Color = pal["deep"].darkened(0.45)
+			shade.a = 0.55
+			for r in rocks:
+				var sh := PackedVector2Array()
+				for p in r["poly"]:
+					sh.append(p + Vector2(7, 9))
+				_aa_poly(n, sh, shade)
+				_aa_poly(n, r["poly"], pal["rock"])
+				_aa_poly(n, r["hi"], pal["rock_hi"])
+		world.add_child(rock_node)
 
 	_build_reeds(world)
 
@@ -718,10 +849,17 @@ func _build_nodes() -> void:
 		boat_sprite.scale = Vector2.ONE * BOAT_SPRITE_SCALE  # the boat is about 70 px long on the lake
 		world.add_child(boat_sprite)
 
-	var tree_node := DrawNode.new()
-	tree_layer = tree_node
-	tree_node.draw_fn = _draw_trees
-	world.add_child(tree_node)
+	# Trees in columns 360 px wide, so the ones off screen are skipped; all the shadows first, then the
+	# canopies, so no column's shadow falls over its neighbour's trees.
+	tree_layer = Node2D.new()
+	world.add_child(tree_layer)
+	var cols_n := int(ceil((lake_w + 2.0 * off.x + 60.0) / 360.0))
+	for pass_k in 2:
+		for c in cols_n:
+			var x0 := -off.x - 30.0 + c * 360.0
+			var tn := DrawNode.new()
+			tn.draw_fn = _draw_trees.bind(x0, x0 + 360.0, pass_k == 0)
+			tree_layer.add_child(tn)
 	air_node = DrawNode.new()  # birds in flight, above the boat and the trees
 	air_node.draw_fn = func(n: Node2D) -> void:
 		if swans:
@@ -737,21 +875,22 @@ func _build_nodes() -> void:
 	light_layer.offset = off
 	add_child(light_layer)
 	# The water's ripple lines lit where the headlight falls on them (water only, so never on land).
-	var glint := Polygon2D.new()
-	glint.polygon = water
 	glint_mat = ShaderMaterial.new()
 	glint_mat.shader = WaterGlintShader
 	glint_mat.set_shader_parameter("len", BEAM_LEN)
 	glint_mat.set_shader_parameter("wide", BEAM_WIDE)
 	glint_mat.set_shader_parameter("col", Color(1.0, 0.95, 0.84))
-	glint.material = glint_mat
 	light_node = DrawNode.new()
 	var add := CanvasItemMaterial.new()
 	add.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
 	light_node.material = add
 	light_node.draw_fn = _draw_light
 	light_layer.add_child(light_node)
-	light_node.add_child(glint)  # fades in and out with the rest of the light
+	for piece in _water_pieces():
+		var glint := Polygon2D.new()
+		glint.polygon = piece
+		glint.material = glint_mat
+		light_node.add_child(glint)  # fades in and out with the rest of the light
 
 
 func _build_ui() -> void:
@@ -871,6 +1010,12 @@ func _process(delta: float) -> void:
 			_dock_step(delta)
 			_move_boat(delta, true)  # still bringing itself home behind the results
 
+	_cam_step(delta)
+	if state in ["ready", "play"]:
+		_dock_grid_build(1)  # a row a frame: ready long before the last lantern
+	if clock - tree_shake_t < 2.1:
+		for tn in tree_layer.get_children():
+			tn.queue_redraw()
 	_run_events()
 	_rig_step(delta)
 	_reward_step()
@@ -968,8 +1113,8 @@ func _notification(what: int) -> void:
 
 func _move_boat(delta: float, steering: bool) -> void:
 	var want := float(_turn_input()) * TURN_RATE if steering else 0.0
-	if steering and homing:
-		want = dock_turn * TURN_RATE
+	if state in ["complete", "results"]:
+		want = dock_turn * TURN_RATE if steering and homing else 0.0  # the autopilot steers now, not the player
 	turn_vel = move_toward(turn_vel, want, TURN_RATE / TURN_EASE * delta)
 	heading += turn_vel * delta
 	var target := 0.0
@@ -980,9 +1125,9 @@ func _move_boat(delta: float, steering: bool) -> void:
 			target *= BOOST_MULT
 		accel = 140.0
 	elif steering and state in ["complete", "results"]:
-		# Done: sailing on freely while steered, or heading home on its own.
-		target = dock_speed if homing else (REED_SPEED if _in_reeds(boat_pos) else SPEED)
-		accel = 90.0
+		# Done: heading home on its own (or parked).
+		target = dock_speed if homing else 0.0
+		accel = 90.0 if target >= speed else 170.0  # it eases off quicker than it speeds up
 	speed = move_toward(speed, target, accel * delta)
 	if speed < 0.5:
 		return
@@ -994,6 +1139,11 @@ func _move_boat(delta: float, steering: bool) -> void:
 			_scrape(near)
 	var step := speed * delta
 	var np := boat_pos + Vector2.from_angle(move_dir) * step
+	if not _free(np) and state in ["complete", "results"]:
+		# The autopilot never bumps its way round: it slows right down and plans afresh (_dock_step).
+		speed = move_toward(speed, 0.0, 400.0 * delta)
+		dock_blocked_t = clock
+		return
 	if not _free(np):
 		var moved := false
 		var hit_rock := _hits_rock(np)
@@ -1078,6 +1228,8 @@ func _vis_heading() -> float:
 func _free(p: Vector2) -> bool:
 	if not Geometry2D.is_point_in_polygon(p, inner):
 		return false
+	if _in_isle(p):
+		return false
 	if jet and float(jet.nearest(p)[0]) < JETTY_PAD:
 		return false
 	for r in rocks:
@@ -1103,8 +1255,9 @@ func _lantern_push(np: Vector2, delta: float) -> Vector2:
 		if tangent.dot(fwd) < 0.0:
 			tangent = -tangent
 		var turn := clampf(pen, 0.0, 1.0) * 6.0 * delta
-		move_dir = lerp_angle(move_dir, tangent.angle(), turn)
-		heading = lerp_angle(heading, tangent.angle(), turn)
+		if state not in ["complete", "results"]:  # the autopilot keeps its own smooth line past them
+			move_dir = lerp_angle(move_dir, tangent.angle(), turn)
+			heading = lerp_angle(heading, tangent.angle(), turn)
 		var cand := np + away * minf(pen * pen, 1.0) * 220.0 * delta
 		if cand.distance_to(lp) < LANTERN_HARD:
 			cand = lp + away * LANTERN_HARD
@@ -1113,20 +1266,72 @@ func _lantern_push(np: Vector2, delta: float) -> Vector2:
 	return np
 
 
+## The lake's water in pieces with the islands left out (for the headlight's glint, which must never shine
+## on an island's land). A polygon can't have holes, so the water is first cut into strips through the
+## middle of every island; no strip then holds a whole island, and cutting the islands out leaves no holes.
+func _water_pieces() -> Array:
+	if isles.is_empty():
+		return [water]
+	var xs: Array = [-1.0e5, 1.0e5]
+	for isl in isles:
+		var c := Vector2.ZERO
+		for q in isl:
+			c += q
+		xs.append(c.x / maxf(1.0, isl.size()))
+	xs.sort()
+	var pieces: Array = []
+	for k in xs.size() - 1:
+		var strip := PackedVector2Array([Vector2(xs[k], -1.0e4), Vector2(xs[k + 1], -1.0e4), Vector2(xs[k + 1], 1.0e4), Vector2(xs[k], 1.0e4)])
+		var rest: Array = Geometry2D.intersect_polygons(water, strip)
+		for isl in isles:
+			var cut: Array = []
+			for r in rest:
+				cut.append_array(Geometry2D.clip_polygons(r, isl))
+			rest = cut
+		# Holes come out wound the other way from the pieces round them: keep only the pieces.
+		var big: PackedVector2Array = PackedVector2Array()
+		for r in rest:
+			if absf(Game.poly_area(r)) > absf(Game.poly_area(big)):
+				big = r
+		for r in rest:
+			if Geometry2D.is_polygon_clockwise(r) == Geometry2D.is_polygon_clockwise(big):
+				pieces.append(r)
+	return pieces
+
+
+## Whether a point is too close to an island for the boat's centre (inside an island's blocked ring).
+func _in_isle(p: Vector2) -> bool:
+	for poly in isle_block:
+		if Geometry2D.is_point_in_polygon(p, poly):
+			return true
+	return false
+
+
 func _shore_info(p: Vector2) -> Array:
+	# The nearest edge of the lake's shore or of an island; the normal points out into the water.
 	var best := INF
 	var cp := p
 	var seg := 0
-	var n := inner.size()
-	for i in n:
-		var q := Geometry2D.get_closest_point_to_segment(p, inner[i], inner[(i + 1) % n])
-		var d := p.distance_squared_to(q)
-		if d < best:
-			best = d
-			cp = q
-			seg = i
-	var nrm := (inner[(seg + 1) % n] - inner[seg]).normalized().orthogonal()
-	if not Geometry2D.is_point_in_polygon(cp + nrm * 3.0, inner):
+	var on: PackedVector2Array = inner
+	var on_isle := false
+	var outlines: Array = [inner]
+	outlines.append_array(isle_block)
+	for oi in outlines.size():
+		var poly: PackedVector2Array = outlines[oi]
+		var n := poly.size()
+		for i in n:
+			var q := Geometry2D.get_closest_point_to_segment(p, poly[i], poly[(i + 1) % n])
+			var d := p.distance_squared_to(q)
+			if d < best:
+				best = d
+				cp = q
+				seg = i
+				on = poly
+				on_isle = oi > 0
+	var n2 := on.size()
+	var nrm := (on[(seg + 1) % n2] - on[seg]).normalized().orthogonal()
+	var inside := Geometry2D.is_point_in_polygon(cp + nrm * 3.0, on)
+	if inside != (not on_isle):  # into the lake's water, or out of the island
 		nrm = -nrm
 	return [sqrt(best), nrm, cp]
 
@@ -1240,6 +1445,9 @@ func _beach_step(delta: float) -> void:
 
 
 func _on_sand(p: Vector2) -> bool:
+	for poly in isle_core:
+		if Geometry2D.is_point_in_polygon(p, poly):
+			return false  # up past an island's sand, on its grass
 	for poly in sand_polys:
 		if Geometry2D.is_point_in_polygon(p, poly):
 			return true
@@ -1390,6 +1598,7 @@ func _draw_rig_lights(n: Node2D) -> void:
 
 ## A boat runs into a tree: it shakes and drops a shower of leaves.
 func _hit_tree(t: Dictionary, dir: Vector2, v: float) -> void:
+	tree_shake_t = clock
 	Sfx.bump()
 	Sfx.rustle()
 	Game.vibrate(50)
@@ -1742,32 +1951,35 @@ func _run_events() -> void:
 	events = keep
 
 
-## After the last lantern: while the player steers, nothing to do. Once they let go, it finds a way home
-## over open water (round rocks, the jetty, the shore's bends, lanterns and reed beds) to its mooring
-## just off the jetty's end, follows it smoothly, lines up with the jetty on the way in so it glides in
-## nose first, slows as it nears and stops there, square to the jetty.
+## After the last lantern the boat takes itself home (the player no longer steers): it finds a way over
+## open water, keeping a margin from the shore, islands and rocks (and clear of lanterns and reed beds),
+## to its mooring just off the jetty's end, follows it smoothly, lines up with the jetty on the way in so
+## it glides in nose first, slows as it nears and stops there, square to the jetty. If something is in its
+## way it slows and finds another way; if there is no way that touches nothing, it eases to a stop and
+## stays there.
 func _dock_step(delta: float) -> void:
-	if _turn_input() != 0:
-		idle_t = 0.0
-		homing = false
-		dock_path = PackedVector2Array()
-		return
-	idle_t += delta
-	if idle_t < DOCK_IDLE and not homing:
-		return  # just let go: a moment's coasting before it takes over
 	var st: Array = lake["start"]
 	var moor := Vector2(st[0], st[1])
 	var face := float(st[2]) + PI  # set off facing away from the jetty; comes home facing it
-	if not homing or dock_path.is_empty():
-		homing = true
+	homing = true
+	if dock_parked:
+		dock_turn = 0.0
+		dock_speed = 0.0
+		return
+	if dock_path.is_empty():
 		_replan(moor, face)
-	# Held up for a while (pushed off line): find the way again.
-	dock_check_t += delta
-	if dock_check_t > 1.5:
-		if boat_pos.distance_to(dock_check_p) < 12.0 and boat_pos.distance_to(moor) > 12.0:
-			_replan(moor, face)
-		dock_check_t = 0.0
-		dock_check_p = boat_pos
+		if dock_parked:
+			return
+	# Something right in its way (the step ahead blocked): a fresh way from here, a few times at most.
+	if clock - dock_blocked_t < 0.05 and clock - dock_check_t > 0.5:
+		dock_tries += 1
+		dock_check_t = clock
+		if dock_tries > 4:
+			dock_parked = true
+			return
+		_replan(moor, face)
+		if dock_parked:
+			return
 	# Where the boat is along the way: the nearest point on the next few stretches ahead of where it had
 	# got to. It never goes back, so the boat never turns round to chase a point it has already passed
 	# (aiming just past the nearest corner did that: once past a corner, it circled it).
@@ -1796,6 +2008,19 @@ func _dock_step(delta: float) -> void:
 	if best > 80.0 * 80.0:
 		_replan(moor, face)  # pushed well off the way (a bump, a swan): find it again from here
 		return
+	# Held up for a while (pushed off line, or a swan in the way): find the way again; parks if it can't.
+	if boat_pos.distance_to(dock_check_p) > 12.0:
+		dock_check_p = boat_pos
+		dock_stall_t = clock
+	elif clock - dock_stall_t > 1.5 and boat_pos.distance_to(moor) > 12.0:
+		dock_stall_t = clock
+		dock_tries += 1
+		if dock_tries > 4:
+			dock_parked = true
+			return
+		_replan(moor, face)
+		if dock_parked:
+			return
 	# Aim at a point ahead along the way, at least a turning circle away (a point closer than that it can
 	# only circle). Past the end, the point carries on along the jetty's line, so the last stretch is a
 	# straight glide in, square to the jetty, with nothing to circle.
@@ -1813,14 +2038,20 @@ func _dock_step(delta: float) -> void:
 	dock_speed = clampf(left * 1.2 + 4.0, 0.0, SPEED * 0.85) * (1.0 - 0.75 * clampf((absf(diff) - 0.4) / 1.0, 0.0, 1.0))
 	if left < 3.0:
 		dock_speed = 0.0 if d < 8.0 else clampf(d * 1.2, 8.0, 20.0)  # slow enough to turn tightly onto it
+	# Land or a rock not far ahead on its present line: slow down, so it turns tighter and misses it.
+	var probe := boat_pos + Vector2.from_angle(move_dir) * clampf(speed * 0.6, 24.0, 80.0)
+	if not _free(probe) or not _free(boat_pos.lerp(probe, 0.5)):
+		dock_speed = minf(dock_speed, 30.0)
 
 
 ## A fresh way home from where the boat is now.
 func _replan(moor: Vector2, face: float) -> void:
 	dock_path = _plan_home(moor, face)
 	dock_s = 0.0
-	dock_check_t = 0.0
 	dock_check_p = boat_pos
+	dock_stall_t = clock
+	if dock_path.is_empty():
+		dock_parked = true  # no way home that touches nothing: stay put
 
 
 ## The point s along the way home; past its end, straight on along the jetty's line.
@@ -1846,84 +2077,37 @@ func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
 	var approach := moor - into * 70.0
 	if not _free(approach):
 		approach = moor - into * 40.0
-	var cols := int(Game.LAKE_SIZE.x / STEP)
-	var rows := int(Game.LAKE_SIZE.y / STEP)
-	var cell := func(c: Vector2i) -> Vector2: return Vector2(c) * STEP + Vector2(STEP, STEP) * 0.5
+	# The search runs on a grid of the lake's water built ahead of time (_dock_grid_build), in the engine:
+	# done here in script it took a noticeable moment, right as the last lantern lit.
+	_dock_grid_build(1 << 20)
+	var reg := dock_grid.region
 	var near_cell := func(p: Vector2) -> Vector2i:
-		var best := Vector2i(clampi(int(p.x / STEP), 0, cols - 1), clampi(int(p.y / STEP), 0, rows - 1))
+		var c0 := Vector2i(int(p.x / STEP), int(p.y / STEP))
+		var best := Vector2i(clampi(c0.x, 0, reg.size.x - 1), clampi(c0.y, 0, reg.size.y - 1))
 		var bd := INF
 		for dy in range(-4, 5):
 			for dx in range(-4, 5):
-				var c := Vector2i(int(p.x / STEP) + dx, int(p.y / STEP) + dy)
-				if c.x < 0 or c.y < 0 or c.x >= cols or c.y >= rows:
+				var c := c0 + Vector2i(dx, dy)
+				if not reg.has_point(c) or dock_grid.is_point_solid(c):
 					continue
-				var q: Vector2 = cell.call(c)
-				if _free(q) and q.distance_to(p) < bd:
+				var q := dock_grid.get_point_position(c)
+				if q.distance_to(p) < bd:
 					bd = q.distance_to(p)
 					best = c
 		return best
 	var start: Vector2i = near_cell.call(boat_pos)
 	var goal: Vector2i = near_cell.call(approach)
-	var open_cells: Dictionary = {}
-	var extra: Dictionary = {}  # per cell: free (0+ cost) or blocked (-1)
-	var cost_of := func(c: Vector2i) -> float:
-		if extra.has(c):
-			return extra[c]
-		var q: Vector2 = cell.call(c)
-		var v := -1.0
-		if _free(q):
-			v = 0.0
-			for l in lanterns:
-				var ld := q.distance_to(l["p"])
-				if ld < 60.0:
-					v += (60.0 - ld) * 0.6
-			if _in_reeds(q):
-				v += 12.0
-		extra[c] = v
-		return v
-	var g := {start: 0.0}
-	var came := {}
-	open_cells[start] = boat_pos.distance_to(cell.call(goal))
-	var found := false
-	var guard := 0
-	while not open_cells.is_empty() and guard < 6000:
-		guard += 1
-		var cur: Vector2i = open_cells.keys()[0]
-		var cf: float = open_cells[cur]
-		for c in open_cells:
-			if float(open_cells[c]) < cf:
-				cf = open_cells[c]
-				cur = c
-		open_cells.erase(cur)
-		if cur == goal:
-			found = true
-			break
-		for dy in range(-1, 2):
-			for dx in range(-1, 2):
-				if dx == 0 and dy == 0:
-					continue
-				var nb := cur + Vector2i(dx, dy)
-				if nb.x < 0 or nb.y < 0 or nb.x >= cols or nb.y >= rows:
-					continue
-				var cc: float = cost_of.call(nb)
-				if cc < 0.0:
-					continue
-				var ng: float = float(g[cur]) + STEP * (1.414 if dx != 0 and dy != 0 else 1.0) + cc
-				if not g.has(nb) or ng < float(g[nb]):
-					g[nb] = ng
-					came[nb] = cur
-					open_cells[nb] = ng + Vector2(nb).distance_to(Vector2(goal)) * STEP
+	if dock_grid.is_point_solid(start) or dock_grid.is_point_solid(goal):
+		return PackedVector2Array()
+	var chain := dock_grid.get_id_path(start, goal)
+	if chain.is_empty():
+		return PackedVector2Array()  # no way through open water
 	var raw := PackedVector2Array([boat_pos])
-	if found:
-		var chain: Array = []
-		var c: Vector2i = goal
-		while came.has(c):
-			chain.push_front(c)
-			c = came[c]
-		if not chain.is_empty() and cell.call(chain[-1]).distance_to(approach) < STEP:
-			chain.pop_back()  # the goal square itself: the lining-up point (next) is right there
-		for cc in chain:
-			raw.append(cell.call(cc))
+	var cells: Array = chain.duplicate()
+	if not cells.is_empty() and dock_grid.get_point_position(cells[-1]).distance_to(approach) < STEP:
+		cells.pop_back()  # the goal square itself: the lining-up point (next) is right there
+	for cc in cells:
+		raw.append(dock_grid.get_point_position(cc))
 	raw.append(approach)
 	# Straighten it: skip ahead wherever the line between two points is clear water. It always keeps the
 	# point lined up with the jetty, then runs straight in from there.
@@ -1931,7 +2115,7 @@ func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
 	var i := 0
 	while i < raw.size() - 1:
 		var j := raw.size() - 1
-		while j > i + 1 and not _clear_line(raw[i], raw[j]):
+		while j > i + 1 and not _grid_line(raw[i], raw[j]):
 			j -= 1
 		path.append(raw[j])
 		i = j
@@ -1939,15 +2123,91 @@ func _plan_home(moor: Vector2, face: float) -> PackedVector2Array:
 	return path
 
 
-func _clear_line(a: Vector2, b: Vector2) -> bool:
+## Whether the straight line a to b is open water clear of lanterns; given the mooring, it must also keep
+## the autopilot's margin from land and rocks (except right by its two ends, where the boat may already be
+## close, or the mooring is).
+func _clear_line(a: Vector2, b: Vector2, moor := Vector2.INF) -> bool:
 	var n := int(a.distance_to(b) / 8.0) + 1
 	for k in n + 1:
 		var q := a.lerp(b, float(k) / n)
 		if not _free(q):
 			return false
+		if moor != Vector2.INF and q.distance_to(a) > 36.0 and q.distance_to(b) > 36.0 and not _dock_safe(q, moor):
+			return false
 		for l in lanterns:
-			if q.distance_to(l["p"]) < 44.0:
+			if q.distance_to(l["p"]) < (58.0 if moor != Vector2.INF else 44.0):
 				return false
+	return true
+
+
+## Whether the straight line a to b crosses only roomy squares of the autopilot's grid: no walls, nothing
+## close to land, lanterns or reeds (except right by its two ends, where the boat may already be close, or
+## the mooring is). Read off the grid, so straightening the way home costs next to nothing.
+func _grid_line(a: Vector2, b: Vector2) -> bool:
+	var reg := dock_grid.region
+	var n := int(a.distance_to(b) / 6.0) + 1
+	for k in n + 1:
+		var q := a.lerp(b, float(k) / n)
+		var c := Vector2i(int(q.x / 16.0), int(q.y / 16.0))
+		if not reg.has_point(c) or dock_grid.is_point_solid(c):
+			return false
+		if dock_grid.get_point_weight_scale(c) > 1.0 and q.distance_to(a) > 36.0 and q.distance_to(b) > 36.0:
+			return false
+	return true
+
+
+## The autopilot's grid over the lake (16 px squares): land, rocks and the jetty are walls; lanterns,
+## reed beds and squares close to land cost extra, so the way home keeps clear of them. Nothing on it moves,
+## so it is built a couple of rows a frame while the lake is played, and finished at once if needed.
+var dock_grid: AStarGrid2D
+var dock_grid_row := 0
+func _dock_grid_build(rows_n: int) -> void:
+	const STEP := 16.0
+	if dock_grid == null:
+		dock_grid = AStarGrid2D.new()
+		dock_grid.region = Rect2i(0, 0, int(lake_w / STEP), int(Game.LAKE_SIZE.y / STEP))
+		dock_grid.cell_size = Vector2(STEP, STEP)
+		dock_grid.offset = Vector2(STEP, STEP) * 0.5
+		dock_grid.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_ONLY_IF_NO_OBSTACLES
+		dock_grid.update()
+	var reg := dock_grid.region
+	if dock_grid_row >= reg.size.y:
+		return
+	var st: Array = lake["start"]
+	var moor := Vector2(st[0], st[1])
+	var end_row := mini(dock_grid_row + rows_n, reg.size.y)
+	for y in range(dock_grid_row, end_row):
+		for x in reg.size.x:
+			var c := Vector2i(x, y)
+			var q := dock_grid.get_point_position(c)
+			if not _free(q):
+				dock_grid.set_point_solid(c, true)
+				continue
+			var v := 0.0 if _dock_safe(q, moor) else 30.0  # close to land or a rock: only if there's no other way
+			for l in lanterns:
+				var ld := q.distance_to(l["home"])
+				if ld < 60.0:
+					v += (60.0 - ld) * 0.6
+			if _in_reeds(q):
+				v += 12.0
+			if v > 0.0:
+				dock_grid.set_point_weight_scale(c, 1.0 + v / STEP)
+	dock_grid_row = end_row
+
+
+## Room to spare for the autopilot: farther than the boat needs from the shore, islands, rocks and the
+## jetty (the jetty only away from the mooring, which is right beside it).
+func _dock_safe(p: Vector2, moor: Vector2) -> bool:
+	if not Geometry2D.is_point_in_polygon(p, inner_safe):
+		return false
+	for poly in isle_safe:
+		if Geometry2D.is_point_in_polygon(p, poly):
+			return false
+	for r in rocks:
+		if p.distance_to(r["c"]) < float(r["r"]) + BOAT_RADIUS + DOCK_PAD:
+			return false
+	if jet and p.distance_to(moor) > 110.0 and float(jet.nearest(p)[0]) < JETTY_PAD + DOCK_PAD:
+		return false
 	return true
 
 
@@ -1958,7 +2218,7 @@ func _end(kind: String, wait := 1.8) -> void:
 	finished_dusk = dusk
 	end_timer = wait
 	if kind != "complete":
-		touches.clear()  # after the last lantern the player keeps steering: a held finger still counts
+		touches.clear()  # (after the last lantern the boat steers itself; touches are simply ignored)
 
 
 func _update_effects(delta: float) -> void:
@@ -2003,6 +2263,7 @@ func _update_effects(delta: float) -> void:
 		f.update(delta)
 	if swans:
 		swans.update(delta)
+		_swan_views()
 	_update_shards(delta)
 	var fk: Array = []
 	for f in floaters:
@@ -2024,8 +2285,8 @@ func _update_effects(delta: float) -> void:
 		if clock - float(f["t"]) < 1.6:
 			keep.append(f)
 	flashes = keep
-	var lo := -off - Vector2(20, 20)
-	var hi := view_size - off + Vector2(20, 20)
+	var lo := -off - Vector2(20, 20) + Vector2(cam_x, 0.0)
+	var hi := view_size - off + Vector2(20, 20) + Vector2(cam_x, 0.0)
 	for m in motes:
 		var p: Vector2 = m["p"]
 		p += (m["v"] + Vector2(sin(clock * 0.7 + m["ph"]) * 8.0, 0.0)) * delta
@@ -2068,7 +2329,7 @@ func _draw_parts(n: Node2D, light_pass: bool) -> void:
 			var r := sz * 4.0
 			n.draw_texture_rect(glow, Rect2(Vector2(q["p"]) - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(c, (1.0 - k) * 0.9))
 		else:
-			n.draw_circle(q["p"], sz, Color(c, c.a * (1.0 - k)), true, -1.0, true)
+			n.draw_texture_rect(_dot(), Rect2(Vector2(q["p"]) - Vector2(sz, sz), Vector2(sz, sz) * 2.0), false, Color(c, c.a * (1.0 - k)))
 
 
 func _float(text: String, at: Vector2) -> void:
@@ -2078,7 +2339,7 @@ func _float(text: String, at: Vector2) -> void:
 ## The goals as they stand now (all lanterns lit): the time goal (or the swans' egg) and the loop limit.
 func _goals_now() -> int:
 	var got := Game.MARK_ALL
-	if lake.has("swan"):
+	if Game.egg_goal(lake_index):
 		if swans and swans.egg_state == "home":
 			got |= Game.MARK_TIME  # this lake's second goal is the swans' egg, home in the nest
 	elif finished_dusk <= 0.75 and not day_taken:
@@ -2262,6 +2523,9 @@ func _perfect_moment(from: Vector2) -> void:
 	for l in lanterns:
 		c += Vector2(l["p"])
 	c /= maxf(1.0, lanterns.size())
+	# On a wide lake the lanterns' middle can be off screen: keep the word (about 400 px wide) in view.
+	var view_l := cam_x - off.x + 230.0
+	c.x = clampf(c.x, view_l, maxf(view_l, view_l + view_size.x - 460.0))
 	_reward("PERFECT", "perfect", c, 99)
 	Sfx.chord(float(lake["pitch"]) * 2.0)
 	Game.vibrate(120)
@@ -2433,8 +2697,8 @@ func _draw_rewards(n: Node2D) -> void:
 
 func _spawn_fish() -> void:
 	for k in 12:
-		var p := Vector2(randf_range(60, 660), randf_range(220, 1180))
-		if Geometry2D.is_point_in_polygon(p, inner) and not _hits_rock(p) and p.distance_to(boat_pos) > 90.0:
+		var p := Vector2(randf_range(60, lake_w - 60.0), randf_range(220, 1180))
+		if Geometry2D.is_point_in_polygon(p, inner) and not _in_isle(p) and not _hits_rock(p) and p.distance_to(boat_pos) > 90.0:
 			splashes.append({"p": p, "t": clock})
 			ripples.append({"p": p, "t": clock, "life": 1.6, "r0": 3.0, "r1": 28.0, "light": false})
 			ripples.append({"p": p, "t": clock + 0.25, "life": 1.4, "r0": 3.0, "r1": 18.0, "light": false})
@@ -2538,6 +2802,12 @@ func _draw_water(n: Node2D) -> void:
 		_aa_poly(n, p, pal["mid"])
 	for p in deep_polys:
 		_aa_poly(n, p, pal["deep"])
+	# Round each island the water shallows: deep, then mid, then shallow up to its sand.
+	for isl in isles:
+		for ring in [[48.0, pal["mid"]], [18.0, pal["shallow"]]]:
+			for p in Geometry2D.offset_polygon(isl, float(ring[0]), Geometry2D.JOIN_ROUND):
+				for q in Geometry2D.intersect_polygons(p, water):  # only on the water, never over the bank
+					_aa_poly(n, q, ring[1])
 	var edge := water.duplicate()
 	edge.append(water[0])
 	var wet: Color = pal["sand"].lightened(0.2)
@@ -2546,6 +2816,19 @@ func _draw_water(n: Node2D) -> void:
 
 
 ## Filled polygon with an anti-aliased rim (the mobile renderer has no 2D MSAA).
+## A solid round dot with a soft 1 px edge (made once): particles drawn as rects of it batch together.
+var _dot_tex: Texture2D
+func _dot() -> Texture2D:
+	if _dot_tex == null:
+		var img := Image.create(32, 32, false, Image.FORMAT_RGBA8)
+		for y in 32:
+			for x in 32:
+				var d := Vector2(x + 0.5, y + 0.5).distance_to(Vector2(16, 16))
+				img.set_pixel(x, y, Color(1, 1, 1, clampf(16.0 - d, 0.0, 1.0)))
+		_dot_tex = ImageTexture.create_from_image(img)
+	return _dot_tex
+
+
 func _aa_poly(n: Node2D, poly: PackedVector2Array, col: Color) -> void:
 	if poly.size() < 3:
 		return
@@ -2555,34 +2838,60 @@ func _aa_poly(n: Node2D, poly: PackedVector2Array, col: Color) -> void:
 	n.draw_polyline(rim, col, 1.4, true)
 
 
-func _draw_trees(n: Node2D) -> void:
+func _draw_trees(n: Node2D, x0: float, x1: float, shadows: bool) -> void:
 	var shadow: Color = pal["shadow"]
 	shadow.a = 0.5
+	# Every circle goes into one triangle list (one draw call): drawn one by one they cost a draw call each,
+	# thousands on a wide lake. Each circle is a fan with a 1 px fading rim for smooth edges.
+	var verts := PackedVector2Array()
+	var cols := PackedColorArray()
+	var idx := PackedInt32Array()
 	var sizes := PackedFloat32Array()
 	for t in trees:
 		sizes.append(_tree_size(t))
 	for i in trees.size():
 		var g := sizes[i]
-		if g <= 0.0:
-			continue
 		var t: Dictionary = trees[i]
-		for part in t["parts"]:
-			n.draw_circle(t["p"] + (part[0] + Vector2(8, 10)) * g, part[1] * g, shadow, true, -1.0, true)
-	for i in trees.size():
-		var g := sizes[i]
-		if g <= 0.0:
+		var tx := float(t["p"].x)
+		if g <= 0.0 or tx < x0 or tx >= x1:
+			continue  # this column's own trees only
+		if shadows:
+			for part in t["parts"]:
+				_tri_circle(verts, cols, idx, t["p"] + (part[0] + Vector2(8, 10)) * g, part[1] * g, shadow)
 			continue
-		var t: Dictionary = trees[i]
 		# Struck by a boat: the canopy shakes, hard at first, dying away.
 		var shake := Vector2.ZERO
 		var st := clock - float(t.get("hit", -10.0))
 		if st < 2.0:
 			shake = Vector2(sin(st * 31.0), cos(st * 23.0)) * 4.0 * exp(-st * 2.6)
 		for part in t["parts"]:
-			n.draw_circle(t["p"] + part[0] * g + shake * (0.5 + part[1] / 30.0), part[1] * g, pal["tree"], true, -1.0, true)
+			_tri_circle(verts, cols, idx, t["p"] + part[0] * g + shake * (0.5 + part[1] / 30.0), part[1] * g, pal["tree"])
 		for part in t["parts"]:
 			var r: float = part[1] * g
-			n.draw_circle(t["p"] + part[0] * g + shake * (0.5 + part[1] / 30.0) + Vector2(-r * 0.22, -r * 0.24), r * 0.62, pal["tree_hi"], true, -1.0, true)
+			_tri_circle(verts, cols, idx, t["p"] + part[0] * g + shake * (0.5 + part[1] / 30.0) + Vector2(-r * 0.22, -r * 0.24), r * 0.62, pal["tree_hi"])
+	if not idx.is_empty():
+		RenderingServer.canvas_item_add_triangle_array(n.get_canvas_item(), idx, verts, cols)
+
+
+## A filled circle for a triangle list: a fan, then a 1 px rim fading to clear (antialiasing).
+func _tri_circle(verts: PackedVector2Array, cols: PackedColorArray, idx: PackedInt32Array, c: Vector2, r: float, col: Color) -> void:
+	if r <= 0.5:
+		return
+	var seg := clampi(int(r * 0.6), 10, 22)
+	var base := verts.size()
+	var clear := Color(col, 0.0)
+	verts.append(c)
+	cols.append(col)
+	for k in seg:
+		var d := Vector2.from_angle(TAU * k / seg)
+		verts.append(c + d * (r - 0.5))
+		cols.append(col)
+		verts.append(c + d * (r + 0.5))
+		cols.append(clear)
+	for k in seg:
+		var a := base + 1 + k * 2
+		var b := base + 1 + ((k + 1) % seg) * 2
+		idx.append_array([base, a, b, a, a + 1, b + 1, a, b + 1, b])
 
 
 func _draw_details(n: Node2D) -> void:
@@ -2590,15 +2899,20 @@ func _draw_details(n: Node2D) -> void:
 	shade.a = 0.55
 
 	# Tyre tracks and footprints first, under the rig: someone drove in and walked to the jetty.
-	for tr in rig_tracks:
-		var line: PackedVector2Array = tr
-		for k in range(1, line.size()):
-			var fade := 1.0 - float(k) / line.size()
-			n.draw_line(line[k - 1], line[k], Color(0.2, 0.16, 0.1, 0.2 * fade + 0.04), 2.6, true)
-	for st in rig_steps:
-		n.draw_set_transform(st[0], float(st[1]), Vector2(1.0, 0.62))
-		n.draw_circle(Vector2.ZERO, 2.3, Color(0.2, 0.16, 0.1, 0.22), true, -1.0, true)
-	n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	# They never change: built once into one triangle list (one draw call, not one per segment and step).
+	if tracks_tri.is_empty():
+		var bt := Batch.new()
+		for tr in rig_tracks:
+			var line: PackedVector2Array = tr
+			for k in range(1, line.size()):
+				var fade := 1.0 - float(k) / line.size()
+				bt.line(line[k - 1], line[k], Color(0.2, 0.16, 0.1, 0.2 * fade + 0.04), 2.6)
+		for st in rig_steps:
+			bt.set_transform(st[0], float(st[1]), Vector2(1.0, 0.62))
+			bt.circle(Vector2.ZERO, 2.3, Color(0.2, 0.16, 0.1, 0.22))
+		tracks_tri = [bt.idx, bt.verts, bt.cols]
+	if not (tracks_tri[0] as PackedInt32Array).is_empty():
+		RenderingServer.canvas_item_add_triangle_array(n.get_canvas_item(), tracks_tri[0], tracks_tri[1], tracks_tri[2])
 	# The pickup parked beside the jetty with its empty trailer.
 	if rig_tex:
 		var sc := LAKE_PX_PER_M / (RIG_RENDER / RIG_VIEW_M)
@@ -2612,14 +2926,6 @@ func _draw_details(n: Node2D) -> void:
 
 	if jet:
 		jet.draw_water(n, clock)  # the water moving round the pilings, under the deck
-
-	for r in rocks:
-		var sh := PackedVector2Array()
-		for p in r["poly"]:
-			sh.append(p + Vector2(7, 9))
-		_aa_poly(n, sh, shade)
-		_aa_poly(n, r["poly"], pal["rock"])
-		_aa_poly(n, r["hi"], pal["rock_hi"])
 
 	for r in ripples:
 		if r["light"]:
@@ -2685,7 +2991,7 @@ func _draw_details(n: Node2D) -> void:
 		for m in motes:
 			var a := 0.55 + 0.25 * sin(clock + float(m["ph"]))
 			n.draw_set_transform(m["p"], float(m["rot"]), Vector2(1.7, 0.85))
-			n.draw_circle(Vector2.ZERO, 2.6, Color(petal, a))
+			n.draw_texture_rect(_dot(), Rect2(-Vector2(2.6, 2.6), Vector2(5.2, 5.2)), false, Color(petal, a))
 		n.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 	_draw_parts(n, false)
@@ -3013,22 +3319,55 @@ func _draw_shards(n: Node2D) -> void:
 	RenderingServer.canvas_item_add_triangle_array(n.get_canvas_item(), idx, verts, cols)
 
 
+## On a wide lake, a small lantern on the left or right edge of the screen (on a faint glow) at the height of
+## each dark lantern off screen that way, and a small egg for the swans' egg: quiet, but there to find.
+func _draw_edge_glow(n: Node2D, light: Color) -> void:
+	if lake_w <= Game.LAKE_SIZE.x or state not in ["ready", "play"]:
+		return
+	var left_x := cam_x - off.x
+	var right_x := left_x + view_size.x
+	# The swans' egg out on the water off screen: a small dim egg on that edge, with a faint white glow.
+	if swans and swans.egg_state == "float":
+		var ep: Vector2 = swans.egg_p
+		var ed := left_x - ep.x if ep.x < left_x else ep.x - right_x
+		if ed > 10.0:
+			var ex := 14.0 if ep.x < left_x else view_size.x - 14.0
+			var ey := clampf(ep.y + off.y, top_inset + BAR_H + 90.0, view_size.y - 90.0)
+			var ea := 0.4 + 0.12 * sin(clock * 1.6)
+			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(ex - 30.0, ey - 50.0), Vector2(60.0, 100.0)), false, Color(1, 1, 1, ea * 0.4))
+			Game.draw_icon(n, "egg", Vector2(ex, ey), 20.0, Color(1, 1, 1, ea))
+	# Each dark lantern off screen: a small lantern on that edge at its height, on a faint glow. Markers on
+	# the same edge are kept apart so they never sit on top of each other.
+	var sides := {-1: [], 1: []}
+	for l in lanterns:
+		if l["lit"]:
+			continue
+		var p: Vector2 = l["p"]
+		var dist := left_x - p.x if p.x < left_x else p.x - right_x
+		if dist < 20.0:
+			continue  # on screen
+		var side := -1 if p.x < left_x else 1
+		sides[side].append([clampf(p.y + off.y, top_inset + BAR_H + 90.0, view_size.y - 90.0), dist, float(l["bob"])])
+	for side in sides:
+		var marks: Array = sides[side]
+		marks.sort_custom(func(a, b): return float(a[0]) < float(b[0]))
+		for k in range(1, marks.size()):
+			marks[k][0] = maxf(float(marks[k][0]), float(marks[k - 1][0]) + 34.0)
+		var x := 0.0 if side < 0 else view_size.x
+		for mk in marks:
+			var y := float(mk[0])
+			var near := clampf(1.2 - float(mk[1]) / 700.0, 0.5, 1.0)  # a little stronger when it's close
+			var a := (0.24 + 0.07 * sin(clock * 1.2 + float(mk[2]))) * near
+			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(x - 55.0, y - 130.0), Vector2(110.0, 260.0)), false, Color(light, a))
+			Game.draw_icon(n, "lantern", Vector2(x - side * 17.0, y), 24.0, Color(light, (0.66 + 0.12 * sin(clock * 1.2 + float(mk[2]))) * near))
+
+
 func _draw_ui(n: Node2D) -> void:
 	var light: Color = pal["light"]
 	var font: Font = Game.heading_font
+	_draw_edge_glow(n, light)
 	var cy := top_inset + BAR_H * 0.5
 	var par := int(lake["par"])
-
-	# Lanterns, left: one icon per lantern, lit ones glow in the lake's light colour.
-	const LI := 44.0
-	const LGAP := 10.0
-	for k in lanterns.size():
-		var l: Dictionary = lanterns[k]
-		var c := Vector2(HUD_EDGE + LI * 0.5 + k * (LI + LGAP), cy)
-		var on: bool = l["lit"] and clock >= float(l["lit_t"])
-		if on:
-			n.draw_texture_rect(Game.glow_tex, Rect2(c - Vector2(34, 34), Vector2(68, 68)), false, Color(light, 0.55))
-		Game.draw_icon(n, "lantern", c, LI / 1.1, light if on else Color(1, 1, 1, 0.42))
 
 	# Loops, right of centre next to pause: icon and count, red once over the limit.
 	var over := loops_used > par
@@ -3041,15 +3380,34 @@ func _draw_ui(n: Node2D) -> void:
 
 	# Seconds of light left, in the bar next to the loops: the sun's, or the headlight battery's.
 	var batt := battery >= 0.0
-	var off := bar_hold + bar_lag  # combo seconds the bar and timer are still easing in
-	var shown_batt := maxf(0.0, battery - off)
-	var shown_dusk := clampf((elapsed + off) / duration, 0.0, 1.0) if off > 0.0 else dusk
+	var easing := bar_hold + bar_lag  # combo seconds the bar and timer are still easing in
+	var shown_batt := maxf(0.0, battery - easing)
+	var shown_dusk := clampf((elapsed + easing) / duration, 0.0, 1.0) if easing > 0.0 else dusk
 	var charge := clampf(shown_batt / maxf(0.001, battery_max), 0.0, 1.0)
 	var warn := batt and battery < WARN and state == "play"
 	var blink := 0.45 + 0.55 * absf(sin(clock * 7.0)) if warn else 1.0
 	var secs := "%d s" % (ceili(shown_batt) if batt else ceili((1.0 - shown_dusk) * duration))
 	var sw := font.get_string_size(secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
 	var sun_x := lx - 8 - 34 - 32 - sw
+
+	# Lanterns, left: one icon per lantern, lit ones glow in the lake's light colour. They shrink to fit in
+	# front of the time (and the egg) however many there are; the room is measured with the lake's longest
+	# time so they don't change size as the seconds count down.
+	var sw_most := font.get_string_size("%d s" % ceili(maxf(duration, battery_max)), HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
+	var room_r := lx - 8 - 34 - 32 - sw_most - 8 - 34 - 14
+	if swans and Game.egg_goal(lake_index):
+		room_r -= 26 + 30
+	var nl := maxi(1, lanterns.size())
+	var li := clampf((room_r - HUD_EDGE) / (nl * 1.23 - 0.23), 16.0, 44.0)
+	var lgap := li * 0.23
+	for k in lanterns.size():
+		var l: Dictionary = lanterns[k]
+		var c := Vector2(HUD_EDGE + li * 0.5 + k * (li + lgap), cy)
+		var on: bool = l["lit"] and clock >= float(l["lit_t"])
+		if on:
+			var g := 34.0 * li / 44.0
+			n.draw_texture_rect(Game.glow_tex, Rect2(c - Vector2(g, g), Vector2(g, g) * 2.0), false, Color(light, 0.55))
+		Game.draw_icon(n, "lantern", c, li / 1.1, light if on else Color(1, 1, 1, 0.42))
 	var day_col := light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk))
 	if batt:
 		day_col = Color("cfe6ff").lerp(Color("ff7a5a"), 1.0 - smoothstep(0.1, 0.3, charge))
@@ -3067,7 +3425,7 @@ func _draw_ui(n: Node2D) -> void:
 		n.draw_string_outline(font, chip_p, chip, HORIZONTAL_ALIGNMENT_LEFT, -1, 30, 6, Color(0.05, 0.08, 0.1, 0.7 * chip_a))
 		n.draw_string(font, chip_p, chip, HORIZONTAL_ALIGNMENT_LEFT, -1, 30, Color(chip_col, chip_a))
 	# The swans' egg: dim while it's out there, white aboard, in the lake's light once it's home.
-	if swans:
+	if swans and Game.egg_goal(lake_index):
 		var es: String = swans.egg_state
 		var egg_col := light if es == "home" else Color("ff9a8a") if es == "broken" else (Color.WHITE if es in ["carried", "passing", "cob"] else Color(1, 1, 1, 0.38))
 		Game.draw_icon(n, "egg", Vector2(sun_x - 8 - 34 - 26 - 15, cy), 30, egg_col)
@@ -3114,7 +3472,7 @@ func _draw_ui(n: Node2D) -> void:
 		return
 	n.draw_rect(Rect2(0, by, w * day_f, 10), day_col)
 	_draw_bar_fx(n, w * day_f, by, Color("ffd796"))
-	var has_dusk := swans == null  # where the egg is the second goal there is no "before dusk" mark
+	var has_dusk := not Game.egg_goal(lake_index)  # where the egg is the second goal there is no "before dusk" mark
 	var dusk_x := w * 0.75 if has_dusk else -1000.0
 	var dusk_a := 0.35 if late else 0.95
 	if has_dusk:
@@ -3209,7 +3567,7 @@ func _draw_tutorial(n: Node2D, font: Font, by: float, light: Color, a: float) ->
 	for l in lanterns:
 		if Vector2(l["p"]).distance_to(boat_pos) < Vector2(best_l["p"]).distance_to(boat_pos):
 			best_l = l
-	var lp: Vector2 = _glass_pos(best_l) + Vector2(0, 6) + off
+	var lp: Vector2 = _to_screen(_glass_pos(best_l) + Vector2(0, 6))
 	var toward_centre := -1.0 if lp.x > w * 0.5 else 1.0
 	n.draw_arc(lp, 26.0, 0.0, TAU, 40, Color(0, 0, 0, 0.45 * a), 5.0, true)
 	n.draw_arc(lp, 26.0, 0.0, TAU, 40, Color(light, a), 2.5, true)
@@ -3325,7 +3683,7 @@ func _pause() -> void:
 	var goals := [["lantern", "%d/%d" % [lit_now, lanterns.size()]],
 		[Game.battery_icon(battery / maxf(0.001, battery_max)), "%d s" % ceili(battery)] if battery >= 0.0 else ["sun", "%d s" % ceili((1.0 - dusk) * duration)],
 		["loop", "%d/%d" % [loops_used, par]]]
-	if swans:
+	if swans and Game.egg_goal(lake_index):
 		goals.append(["egg", "Home" if swans.egg_state == "home" else "Aboard" if swans.egg_state in ["carried", "passing", "cob"] else "Broken" if swans.egg_state == "broken" else "Lost" if swans.egg_state == "gone" else "Out"])
 	var g_row := HBoxContainer.new()
 	g_row.alignment = BoxContainer.ALIGNMENT_CENTER

@@ -165,6 +165,8 @@ func _ready() -> void:
 			"water": poly,
 			"mid": Geometry2D.offset_polygon(poly, -40.0, Geometry2D.JOIN_ROUND),
 			"deep": Geometry2D.offset_polygon(poly, -100.0, Geometry2D.JOIN_ROUND),
+			"isles": Game.island_polys(i),
+			"isle_cores": _isle_cores(i),
 		})
 	var spots := PackedVector2Array()
 	for s in SPOTS:
@@ -303,7 +305,7 @@ func _start_arrival() -> void:
 	still_lit = []
 	for l in arrive_level.lanterns:
 		still_lit.append(bool(l["lit"]))
-	arrive_cam = _full_cam(arrive_from)
+	arrive_cam = _full_cam(arrive_from, Game.exit_cam_x)
 	position = arrive_cam[0]
 	scale = Vector2.ONE * float(arrive_cam[1])
 	if reveal >= 0:
@@ -424,11 +426,27 @@ func _rig_at(s: float) -> Array:
 	return [hitch, heading, wrapf((hitch - axle).angle() - heading, -PI, PI)]
 
 
-## The camera (map offset and zoom) that makes lake i's picture exactly fill the screen the way the
-## lake itself does: the moment the map hands over to the lake, or takes over from it.
-func _full_cam(i: int) -> Array:
+## A lake's islands' grass, inside their sand (for its picture).
+func _isle_cores(i: int) -> Array:
+	var out: Array = []
+	for isl in Game.island_polys(i):
+		out.append_array(Geometry2D.offset_polygon(isl, -16.0, Geometry2D.JOIN_ROUND))
+	return out
+
+
+## How much farther out a lake's name and goals sit beside a wide lake's picture.
+func _label_dx(i: int) -> float:
+	return (Game.lake_width(i) - Game.LAKE_SIZE.x) * THUMB * 0.5
+
+
+## The camera (map offset and zoom) that makes lake i's picture exactly fill the screen the way the lake
+## itself does, with its view panned to cam_x (the jetty's part by default; wide lakes pan sideways): the
+## moment the map hands over to the lake, or takes over from it.
+func _full_cam(i: int, cam_x := -1.0) -> Array:
 	var z := 1.0 / THUMB
-	return [off - (SPOTS[i] + off - LAKE_CENTER * THUMB) * z, z]
+	if cam_x < 0.0:
+		cam_x = Game.start_cam_x(i)
+	return [off - Vector2(cam_x, 0.0) - (SPOTS[i] + off - Game.lake_center(i) * THUMB) * z, z]
 
 
 ## Moves the camera between two views, zooming smoothly about lake i (even speed in and out).
@@ -969,9 +987,9 @@ func _build_ui() -> void:
 		l.add_theme_font_size_override("font_size", 27)
 		l.size = Vector2(230, 40)
 		if left_side:
-			l.position = Vector2(spot.x + 90, spot.y - 34)
+			l.position = Vector2(spot.x + 90 + _label_dx(i), spot.y - 34)
 		else:
-			l.position = Vector2(spot.x - 90 - 230, spot.y - 34)
+			l.position = Vector2(spot.x - 90 - 230 - _label_dx(i), spot.y - 34)
 			l.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 		l.modulate.a = 1.0 if Game.is_unlocked(i) else 0.4
 		map_labels.append(l)
@@ -1385,7 +1403,7 @@ func _draw_map(n: Node2D) -> void:
 		if i != (focus if focus >= 0 else last_focus):
 			alpha *= 1.0 - 0.7 * focus_f
 		var spot: Vector2 = SPOTS[i] + off
-		var origin := spot - LAKE_CENTER * THUMB
+		var origin := spot - Game.lake_center(i) * THUMB
 		var bob := sin(clock * 0.9 + i) * 2.0 * (still_amp if i == still_lake else 1.0)
 		origin.y += bob
 		var th: Dictionary = thumbs[i]
@@ -1399,6 +1417,10 @@ func _draw_map(n: Node2D) -> void:
 			n.draw_colored_polygon(p, Color(pal["mid"], alpha))
 		for p in th["deep"]:
 			n.draw_colored_polygon(p, Color(pal["deep"], alpha))
+		for isl in th["isles"]:
+			n.draw_colored_polygon(isl, Color(pal["sand"], alpha))
+		for core in th["isle_cores"]:
+			n.draw_colored_polygon(core, Color(pal["land"], alpha))
 		# Lanterns: small storm lanterns, at exactly the size and place of the lake's own lanterns, so the
 		# camera can dive straight into them (dots until the lantern pictures are ready at start-up).
 		var done := Game.lake_done(i)
@@ -1433,7 +1455,7 @@ func _draw_map(n: Node2D) -> void:
 		var left_side := spot.x < 360.0 + off.x
 		var m := int(Game.marks[i])
 		for k in (3 if focus_f < 1.0 else 0):
-			var x := spot.x + 108 + k * 38 if left_side else spot.x - 108 - (2 - k) * 38
+			var x := spot.x + 108 + _label_dx(i) + k * 38 if left_side else spot.x - 108 - _label_dx(i) - (2 - k) * 38
 			var gp := Vector2(x, spot.y + 26)
 			var kind: String = ["lantern", Game.time_goal(i)[0], "loop"][k]
 			var on := m & (1 << k) != 0
@@ -1568,7 +1590,7 @@ func _draw_glow(n: Node2D) -> void:
 		n.draw_texture_rect(glow, Rect2(spot - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(c, 0.22 * lit + 0.4 * fl))
 		# After dark each lantern lays a warm, flickering pool of light on the water around it.
 		if dark > 0.0 and lit > 0.0:
-			var origin := spot - LAKE_CENTER * THUMB + Vector2(0, sin(clock * 0.9 + i) * 2.0 * (still_amp if i == still_lake else 1.0))
+			var origin := spot - Game.lake_center(i) * THUMB + Vector2(0, sin(clock * 0.9 + i) * 2.0 * (still_amp if i == still_lake else 1.0))
 			var lights: Array = Game.lakes[i]["lanterns"]
 			for li in lights.size():
 				var lp := origin + Vector2(lights[li][0], lights[li][1]) * THUMB
@@ -2039,9 +2061,9 @@ func _cele_best_label(i: int) -> void:
 	l.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.5))
 	l.size = Vector2(230, 30)
 	if left_side:
-		l.position = Vector2(spot.x + 90, spot.y + 50)
+		l.position = Vector2(spot.x + 90 + _label_dx(i), spot.y + 50)
 	else:
-		l.position = Vector2(spot.x - 90 - 230, spot.y + 50)
+		l.position = Vector2(spot.x - 90 - 230 - _label_dx(i), spot.y + 50)
 		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	l.modulate.a = 0.0
@@ -2493,7 +2515,7 @@ func _fw_burst(sh: Dictionary) -> void:
 ## A lake lighting up in the celebration: its lanterns flash one after another with a star glint, and a
 ## fountain of sparks in the lake's light shoots up off the water and falls back.
 func _lake_burst(i: int, col: Color) -> void:
-	var origin: Vector2 = SPOTS[i] + off - LAKE_CENTER * THUMB
+	var origin: Vector2 = SPOTS[i] + off - Game.lake_center(i) * THUMB
 	var lights: Array = Game.lakes[i]["lanterns"]
 	for li in lights.size():
 		var rays: Array = []  # each glint's own few rays, uneven in angle and length, so no two look ruled
@@ -2584,12 +2606,16 @@ func _draw_teaser(n: Node2D, i: int, th: Dictionary, a: float) -> void:
 	var pal: Dictionary = lake["pal"]
 	var path := _teaser_path(th)
 	var pairs := _pairs(lake)
-	if lake.has("swan"):
-		if lake.has("reeds") and not (lake["reeds"] as Array).is_empty():
-			_teaser_reeds(n, th, Color(pal["reed"]), a)  # Reed Bend: its reeds (its swans are met at Stones)
-			return
+	var first_swans := -1  # swans are on every lake now; they are first met (and teased) on the first one
+	for k in Game.lake_count():
+		if Game.lakes[k].has("swan"):
+			first_swans = k
+			break
+	if i == first_swans:
 		var sp: Array = _path_at(path, fmod(clock * 22.0, _path_len(path)))
 		_teaser_swan(n, sp[0], sp[1], a)
+	elif lake.has("swan") and lake.has("reeds") and not (lake["reeds"] as Array).is_empty():
+		_teaser_reeds(n, th, Color(pal["reed"]), a)  # Reed Bend: its reeds
 	elif pairs.size() >= 2:
 		for pr in pairs:
 			# Twin lanterns: each pair glows and fades together, in step.
@@ -2609,14 +2635,35 @@ func _draw_teaser(n: Node2D, i: int, th: Dictionary, a: float) -> void:
 ## A loop round the lake's inside for things to travel along: its deep water, or the middle if there's
 ## none deep enough.
 func _teaser_path(th: Dictionary) -> PackedVector2Array:
+	if th.has("tpath"):
+		return th["tpath"]
+	var out: PackedVector2Array = th["water"]
 	for key in ["deep", "mid"]:
 		var best := PackedVector2Array()
 		for p in th[key]:
 			if p.size() > best.size():
 				best = p
 		if best.size() > 8:
-			return best
-	return th["water"]
+			out = best
+			break
+	# Round the islands, never over them: their shores (with room to spare) are cut out of the way, and
+	# the biggest piece of open water left is followed.
+	for isl in th["isles"]:
+		for room in Geometry2D.offset_polygon(isl, 60.0, Geometry2D.JOIN_ROUND):
+			var pieces := Geometry2D.clip_polygons(out, room)
+			var best := PackedVector2Array()
+			var best_a := 0.0
+			for q in pieces:
+				var a := absf(Game.poly_area(q))
+				if not Geometry2D.is_polygon_clockwise(q) == Geometry2D.is_polygon_clockwise(out):
+					continue  # a hole left by an island in open water: the outline already goes round it
+				if a > best_a:
+					best_a = a
+					best = q
+			if best.size() > 8:
+				out = best
+	th["tpath"] = out
+	return out
 
 
 func _path_len(poly: PackedVector2Array) -> float:

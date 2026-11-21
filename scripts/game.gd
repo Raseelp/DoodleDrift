@@ -101,7 +101,7 @@ func _build_lakes() -> void:
 		{
 			"name": "First Light",
 			"hint": "Light every lantern before dark.",
-			"par": 1, "pitch": 1.0, "motes": "petals",
+			"par": "auto", "pitch": 1.0, "motes": "petals",
 			"pal": _pal({
 				"land": "7d9a72", "land_dark": "6c8964", "tree": "56755a", "tree_hi": "86a67c",
 				"shadow": "3f5a48", "sand": "e3d3b0", "shallow": "86b8b2", "mid": "5f9ba3",
@@ -109,11 +109,17 @@ func _build_lakes() -> void:
 				"light": "ffd08a", "pair": "a5ece0", "night": "a08cbc", "mote": "f4bccb",
 				"wood": "9a7b58",
 			}),
-			"water": [[90, 420], [200, 230], [380, 190], [560, 250], [650, 430], [660, 700],
-				[620, 960], [520, 1140], [340, 1200], [170, 1130], [80, 920], [60, 650]],
-			"lanterns": [[330, 600, 0], [430, 690, 0], [320, 790, 0]],
-			"rocks": [], "reeds": [],
-			"start": [360, 1098, -PI / 2], "jetty": [362, 1218, 362, 1128, ""], "rig": -1, "ducks": 1,
+			# The Lantern Isles: a hook of wooded land reaches down from the north shore with the swans' nest
+			# on its shore and a quiet lagoon tucked behind it; a cove in the north-west hides behind a long
+			# island and a line of stones (in by the narrow west passage or the gap in the stones); a sandbar
+			# off the south shore makes a back channel; the east bay has an islet and a bed of reeds.
+			"width": 1440, "goal": "dusk",
+			"water": [[70, 760], [85, 520], [150, 330], [280, 220], [450, 195], [590, 225], [650, 300], [640, 420], [675, 540], [750, 615], [860, 640], [960, 600], [1010, 520], [1000, 430], [950, 470], [890, 500], [820, 480], [785, 400], [790, 290], [880, 210], [1060, 185], [1230, 200], [1350, 270], [1410, 430], [1405, 640], [1370, 850], [1290, 1050], [1150, 1180], [980, 1215], [860, 1180], [760, 1135], [650, 1160], [540, 1215], [380, 1225], [230, 1180], [120, 1060], [80, 920]],
+			"islands": [[[195, 610], [255, 505], [375, 445], [470, 430], [505, 480], [455, 560], [330, 640], [230, 680]], [[700, 920], [800, 890], [930, 900], [960, 940], [880, 965], [760, 970]], [[1150, 560], [1210, 530], [1250, 580], [1210, 630], [1160, 620]]],
+			"lanterns": [[180, 850, 0], [330, 320, 0], [900, 360, 0], [560, 760, 0], [830, 1060, 0], [1250, 370, 0], [1295, 790, 0], [1060, 960, 0]],
+			"rocks": [[492, 405, 17], [512, 360, 16], [578, 238, 16], [1120, 300, 15]], "reeds": [[1300, 800, 78]],
+			"swan": [735, 625, 150.0, 1.4],
+			"start": [300, 1098, -PI / 2], "jetty": [300, 1218, 300, 1128, ""], "rig": -1, "ducks": 2,
 		},
 		{
 			"name": "Two Coves",
@@ -192,6 +198,63 @@ func _build_lakes() -> void:
 			"start": [172, 730, 0.0], "jetty": [58, 730, 142, 730, ""], "rig": 1, "night": true, "ducks": 1,
 		},
 	]
+	for i in lakes.size():
+		if str(lakes[i]["par"]) == "auto":
+			lakes[i]["par"] = auto_par(i)
+
+
+## A fair loop limit worked out from where the lanterns are: lanterns that one loop of a comfortable size
+## (about 300 px across) could take together, with clear water between them, are grouped greedily; the
+## number of groups is the fewest loops a tidy run needs, and the limit gives a little room on top of
+## that (one more loop, and one more for every four groups).
+const PAR_LOOP := 150.0  # the farthest a lantern may be from the middle of its group
+func auto_par(i: int) -> int:
+	var left: Array = []
+	for l in lakes[i]["lanterns"]:
+		left.append(Vector2(l[0], l[1]))
+	var groups := 0
+	while not left.is_empty():
+		var best: Array = []
+		for s0 in left:
+			var group: Array = [s0]
+			var others := left.duplicate()
+			others.sort_custom(func(a, b): return s0.distance_to(a) < s0.distance_to(b))
+			for o in others:
+				if o == s0:
+					continue
+				var trial := group.duplicate()
+				trial.append(o)
+				var mid := Vector2.ZERO
+				for q in trial:
+					mid += q
+				mid /= trial.size()
+				var fits := true
+				for q in trial:
+					if q.distance_to(mid) > PAR_LOOP or not _open_line(i, q, mid):
+						fits = false
+						break
+				if fits:
+					group = trial
+			if group.size() > best.size():
+				best = group
+		for q in best:
+			left.erase(q)
+		groups += 1
+	return groups + 1 + groups / 4
+
+
+## Whether the straight way between two points stays on open water (no shore, no island).
+func _open_line(i: int, a: Vector2, b: Vector2) -> bool:
+	var water := water_poly(i)
+	var steps := maxi(1, int(a.distance_to(b) / 16.0))
+	for k in steps + 1:
+		var q := a.lerp(b, float(k) / steps)
+		if not Geometry2D.is_point_in_polygon(q, water):
+			return false
+		for isl in island_polys(i):
+			if Geometry2D.is_point_in_polygon(q, isl):
+				return false
+	return true
 
 
 ## The boat model (waits for the background load the first time), or null if the file is missing.
@@ -233,10 +296,35 @@ func is_night(i: int) -> bool:
 	return bool(lakes[i].get("night", false))
 
 
+## A lake's width in lake pixels: one screen (720) unless it is a wide lake that pans sideways.
+func lake_width(i: int) -> float:
+	return float(lakes[i].get("width", LAKE_SIZE.x))
+
+
+## The middle of a lake's picture (lake pixels): the map centres it on its spot.
+func lake_center(i: int) -> Vector2:
+	return Vector2(lake_width(i) * 0.5, 705.0)
+
+
+## Where the camera starts on a lake (its left edge, lake pixels): the jetty's part of it.
+func start_cam_x(i: int) -> float:
+	return clampf(float(lakes[i]["start"][0]) - LAKE_SIZE.x * 0.5, 0.0, lake_width(i) - LAKE_SIZE.x)
+
+
+## Where the camera was when the lake was left, for the map's zoom out (set by the lake).
+var exit_cam_x := 0.0
+
+
+## Whether a lake's second goal is the swans' egg (else before dusk, or battery to spare at night). Swans
+## can be on any lake; only lakes marked "egg" (or older lakes with swans and no goal set) ask for it.
+func egg_goal(i: int) -> bool:
+	return lakes[i].has("swan") and String(lakes[i].get("goal", "egg")) == "egg"
+
+
 ## The time goal's icon and name for a lake.
 func time_goal(i: int) -> Array:
-	# A lake with swans swaps this goal for returning their egg (daylight still ends the run).
-	if lakes[i].has("swan"):
+	# A lake with an egg goal swaps this goal for returning their egg (daylight still ends the run).
+	if egg_goal(i):
 		return ["egg", "Return the egg"]
 	return ["battery", "Battery to spare"] if is_night(i) else ["sun", "Before dusk"]
 
@@ -258,7 +346,7 @@ func eggs_returned() -> Array:
 	var got := 0
 	var all := 0
 	for i in lakes.size():
-		if lakes[i].has("swan"):
+		if egg_goal(i):
 			all += 1
 			if int(marks[i]) & MARK_TIME != 0:
 				got += 1
@@ -289,6 +377,23 @@ func water_poly(i: int) -> PackedVector2Array:
 		poly[k] = poly[k] + normal * w
 	_water_cache[i] = poly
 	return poly
+
+
+## A lake's islands, each a smoothed outline (cached). Land inside the lake: the boat goes round them.
+func island_polys(i: int) -> Array:
+	if _isle_cache.has(i):
+		return _isle_cache[i]
+	var out: Array = []
+	for isl in lakes[i].get("islands", []):
+		var coarse := PackedVector2Array()
+		for p in isl:
+			coarse.append(Vector2(p[0], p[1]))
+		out.append(smooth_closed(coarse, 6))
+	_isle_cache[i] = out
+	return out
+
+
+var _isle_cache := {}
 
 
 func smooth_closed(pts: PackedVector2Array, sub: int) -> PackedVector2Array:
