@@ -35,8 +35,6 @@ const BOOST_COUNT := 3
 const BOOST_WINDOW := 7.0
 const BOOST_TIME := 4.5
 const BOOST_MULT := 1.4
-const CHAIN_WINDOW := 4.5
-const CHAIN_BONUS := 3.0
 const FADE_TIME := 28.0
 const CATCH_TIME := 0.55  # the flame catching after the ember lands
 const DRIFT := Vector2(18, 12)
@@ -139,8 +137,20 @@ var lamp_flare := -10.0  # when the boat's lamp last sent an ember
 var spray_t := 0.0
 var boost_until := -10.0
 var light_times: Array = []
-var chain := 0
 var last_loop_t := -10.0
+# Rewards shown in the lake itself: one word at a time where it happened (a combo's xN, a close call, swift
+# water, perfect); a combo's seconds fly as sparks to the sun (or the battery) and are added as they land.
+var reward := {}
+var reward_sparks: Array = []
+var reward_pending: Array = []  # [when, seconds]
+var reward_chip_t := -10.0
+var reward_chip_secs := 0
+var hud_sun_screen := Vector2.ZERO  # the daylight (or battery) icon on screen, where the sparks fly
+var bar_hold := 0.0  # seconds already counted but not shown on the bar yet (still flying up)
+var bar_lag := 0.0  # seconds landed that the bar is still easing in
+var bar_sparks: Array = []  # sparkles thrown off the bar's end as it fills, in screen space
+var bar_end := Vector2.ZERO
+var near_track := {}  # close calls: per thing, whether the boat was on course for it and its closest pass
 var families: Array = []  # mallard hens and their ducklings (ducks.gd)
 var swans: SwanPair = null  # a pair of mute swans guarding their nest (swans.gd), one pair at most
 var splashes: Array = []
@@ -296,7 +306,8 @@ func leave_step(t: float, tint: Color) -> void:
 
 
 func _day_tint() -> Color:
-	var t := 1.0 if night else dusk_start + (1.0 - dusk_start) * dusk
+	var shown := clampf((elapsed + bar_hold + bar_lag) / duration, 0.0, 1.0)
+	var t := 1.0 if night else dusk_start + (1.0 - dusk_start) * shown
 	var c := Color.WHITE.lerp(pal["night"], smoothstep(0.0, 1.0, t) * 0.92)
 	return c.darkened(0.3) if night else c
 
@@ -715,6 +726,7 @@ func _build_nodes() -> void:
 	air_node.draw_fn = func(n: Node2D) -> void:
 		if swans:
 			swans.draw_cob_air(n)
+		_draw_rewards(n)
 	world.add_child(air_node)
 
 	modulate_node = CanvasModulate.new()
@@ -861,6 +873,9 @@ func _process(delta: float) -> void:
 
 	_run_events()
 	_rig_step(delta)
+	_reward_step()
+	if state == "play":
+		_close_calls()
 	_update_effects(delta)
 	if boat3d:
 		var shown := 1.0
@@ -1018,6 +1033,7 @@ func _move_boat(delta: float, steering: bool) -> void:
 			return
 		if hit_rock or hit_jetty:
 			speed *= 0.86
+			near_track.clear()  # touched it: not a close call
 		else:
 			_scrape(shore)
 		if bump_cool <= 0.0:
@@ -1616,23 +1632,16 @@ func _on_loop(poly: PackedVector2Array) -> void:
 
 	loops_used += 1
 	Sfx.loop_closed(1.0)
-	if Game.dev_on("chains"):
-		chain = chain + 1 if clock - last_loop_t <= CHAIN_WINDOW else 1
-		if chain >= 2:
-			elapsed = maxf(0.0, elapsed - CHAIN_BONUS)
-			_float("Chain x%d  ·  the sun waits" % chain, boat_pos)
-			Sfx.chain(float(lake["pitch"]), chain)
-	if accepted.size() >= 3:
-		_float("Bright loop", boat_pos + Vector2(0, 34))
+	var combo := accepted.size()
 	last_loop_t = clock
-	if Game.dev_on("boost"):
+	if true:  # swift water: three lanterns in quick succession
 		for k in accepted.size():
 			light_times.append(clock)
 		light_times = light_times.filter(func(t): return clock - float(t) <= BOOST_WINDOW)
 		if light_times.size() >= BOOST_COUNT and clock > boost_until:
 			boost_until = clock + BOOST_TIME
 			light_times.clear()
-			_float("Swift water", boat_pos - Vector2(0, 40))
+			_reward("SWIFT WATER", "swift", boat_pos, 1)
 			Sfx.boost(float(lake["pitch"]))
 	accepted.sort_custom(func(a, b): return lanterns[a]["p"].x < lanterns[b]["p"].x)
 	var last_t := clock
@@ -1646,9 +1655,24 @@ func _on_loop(poly: PackedVector2Array) -> void:
 		embers.append({"i": i, "t0": launch, "from": Vector2.ZERO, "launched": false})
 		last_t = at
 
+	if combo >= 2:
+		# A combo: one loop round several lanterns. xN where it closed, and N seconds of daylight (or battery).
+		# On the last lantern the seconds count at once (the lake ends now), and the bar still shows them land.
+		var c := Vector2.ZERO
+		for q in poly:
+			c += q
+		c /= maxf(1.0, poly.size())
+		_reward("×%d" % combo, "combo", c, combo)
+		_give_time(float(combo), c)
+		Sfx.chain(float(lake["pitch"]), combo - 1)
+		Game.vibrate(20 + 12 * combo)
+
 	if _lit_count() == lanterns.size():
 		events.append({"at": last_t + 0.55, "kind": "chord"})
 		_end("complete", last_t - clock + 2.8)
+		if _goals_now() == Game.MARK_ALL | Game.MARK_TIME | Game.MARK_LOOPS:
+			var last_p: Vector2 = lanterns[accepted[accepted.size() - 1]]["p"]
+			get_tree().create_timer(maxf(0.1, last_t - clock + 0.85), false).timeout.connect(_perfect_moment.bind(last_p))
 
 
 func _partner(i: int) -> int:
@@ -2051,6 +2075,362 @@ func _float(text: String, at: Vector2) -> void:
 	floaters.append({"text": text, "p": at, "t": clock})
 
 
+## The goals as they stand now (all lanterns lit): the time goal (or the swans' egg) and the loop limit.
+func _goals_now() -> int:
+	var got := Game.MARK_ALL
+	if lake.has("swan"):
+		if swans and swans.egg_state == "home":
+			got |= Game.MARK_TIME  # this lake's second goal is the swans' egg, home in the nest
+	elif finished_dusk <= 0.75 and not day_taken:
+		got |= Game.MARK_TIME
+	if loops_used <= int(lake["par"]):
+		got |= Game.MARK_LOOPS
+	return got
+
+
+## Shows a reward's word where it happened. One at a time: a bigger one takes over, a smaller one (or the
+## same kind again within 0.8 s) waits its turn and is dropped; what it earns is given either way.
+func _reward(text: String, kind: String, at: Vector2, power: int) -> void:
+	if not reward.is_empty():
+		var age := clock - float(reward["t"])
+		if age < 1.5 and (power < int(reward["power"]) or (kind == reward["kind"] and age < 0.8)):
+			return
+	reward = {"text": text, "kind": kind, "p": at, "t": clock, "power": power}
+
+
+## A combo's seconds: sparks fly from the loop to the sun (or the battery) and the time is added as they land.
+func _give_time(secs: float, from: Vector2) -> void:
+	for k in 8:
+		reward_sparks.append({"from": from, "t0": clock + k * 0.05})
+	var held := _add_time(secs)
+	bar_hold += held
+	reward_pending.append([clock + 0.85, secs, held])
+
+
+## Adds the seconds (at night to the headlight's battery, by day the sun winds back); returns what it gave.
+func _add_time(secs: float) -> float:
+	if battery >= 0.0 and not (night and not day_taken):
+		battery += secs
+		return secs
+	var before := elapsed
+	elapsed = maxf(0.0, elapsed - secs)
+	dusk = clampf(elapsed / duration, 0.0, 1.0)
+	if battery >= 0.0:
+		battery += before - elapsed
+	return before - elapsed
+
+
+func _reward_step() -> void:
+	var keep: Array = []
+	for rp in reward_pending:
+		if clock < float(rp[0]):
+			keep.append(rp)
+			continue
+		var secs := float(rp[1])
+		var held := float(rp[2])
+		bar_hold = maxf(0.0, bar_hold - held)
+		bar_lag += held
+		reward_chip_t = clock
+		reward_chip_secs = int(secs)
+		Sfx.chime(float(lake["pitch"]) * 2.0)
+		for k in 14:
+			_bar_spark(randf_range(90.0, 260.0))
+	reward_pending = keep
+	# The bar eases the landed seconds in, throwing sparkles off its end while it moves.
+	var dt := get_process_delta_time()
+	bar_lag = 0.0 if bar_lag < 0.02 else bar_lag * exp(-dt * 3.2)
+	if bar_lag > 0.1 and randf() < 0.6:
+		_bar_spark(randf_range(40.0, 120.0))
+	if battery >= 0.0:
+		battery_max = maxf(battery_max, battery - bar_hold - bar_lag)
+	bar_sparks = bar_sparks.filter(func(s): return clock - float(s["t0"]) < float(s["life"]))
+	reward_sparks = reward_sparks.filter(func(s): return clock - float(s["t0"]) < 0.8)
+	if not reward.is_empty() and clock - float(reward["t"]) > 1.8:
+		reward = {}
+
+
+func _bar_spark(spd: float) -> void:
+	bar_sparks.append({"p": bar_end, "v": Vector2.from_angle(randf() * TAU) * spd, "t0": clock, "life": randf_range(0.45, 0.9), "r": randf_range(4.0, 9.0)})
+
+
+## The bar's end while it fills: a bright glow there and the sparkles it throws off (screen space).
+func _draw_bar_fx(n: Node2D, x: float, by: float, col: Color) -> void:
+	bar_end = Vector2(x, by + 5.0)
+	var off := bar_lag + bar_hold
+	var glow := clampf(bar_lag / 1.5, 0.0, 1.0)
+	if glow > 0.0:
+		var g := 26.0 + 30.0 * glow
+		n.draw_texture_rect(Game.glow_tex, Rect2(bar_end - Vector2(g, g * 0.6), Vector2(g * 2.0, g * 1.2)), false, Color(col, 0.8 * glow))
+	if off > 0.0:
+		n.draw_rect(Rect2(0, by, x, 10), Color(1, 1, 1, 0.25 * glow))  # the filling bar flushes brighter
+	for s in bar_sparks:
+		var t := clock - float(s["t0"])
+		var k := t / float(s["life"])
+		var p: Vector2 = Vector2(s["p"]) + Vector2(s["v"]) * t + Vector2(0, 320.0) * t * t
+		var r := float(s["r"]) * (1.0 - k * 0.6)
+		n.draw_texture_rect(Game.glow_tex, Rect2(p - Vector2(r, r), Vector2(r, r) * 2.0), false, Color(col, 1.0 - k))
+		n.draw_texture_rect(Game.glow_tex, Rect2(p - Vector2(r, r) * 0.35, Vector2(r, r) * 0.7), false, Color(1, 1, 1, 1.0 - k))
+
+
+## Close calls: at speed, on course to hit a rock, the jetty or the charging cob within half a second, and
+## slipping past with under 1 m (7 px) to spare; or rushing past ducks just outside what would startle them.
+func _close_calls() -> void:
+	if speed < SPEED * 0.8:
+		near_track.clear()
+		return
+	var fwd := Vector2.from_angle(move_dir)
+	for i in rocks.size():
+		var r: Dictionary = rocks[i]
+		var rel: Vector2 = Vector2(r["c"]) - boat_pos
+		var rr := float(r["r"])
+		var key := i
+		if rel.length() > rr + 160.0:
+			near_track.erase(key)
+			continue
+		var tr: Dictionary = near_track.get(key, {"armed": false, "minc": INF})
+		var along := rel.dot(fwd)
+		if along > 0.0 and along < speed * 0.5 + rr and absf(rel.cross(fwd)) < rr + BOAT_RADIUS * 0.8:
+			tr["armed"] = true  # it was heading straight for it
+		tr["minc"] = minf(float(tr["minc"]), rel.length() - rr - BOAT_RADIUS)
+		near_track[key] = tr
+		if along < -rr - 8.0:  # passed it
+			if bool(tr["armed"]) and float(tr["minc"]) < 7.0:
+				_close_call()
+			near_track.erase(key)
+	if jet:
+		var jn: Array = jet.nearest(boat_pos)
+		var clear := float(jn[0]) - JETTY_PAD
+		var toward := fwd.dot(-Vector2(jn[1]))
+		var tr: Dictionary = near_track.get("jetty", {"armed": false, "minc": INF})
+		if clear < 140.0:
+			if toward > 0.5 and clear < speed * 0.5:
+				tr["armed"] = true
+			tr["minc"] = minf(float(tr["minc"]), clear)
+			near_track["jetty"] = tr
+			if toward < -0.1 and clear > 10.0:  # moving away from it again
+				if bool(tr["armed"]) and float(tr["minc"]) < 7.0:
+					_close_call()
+				near_track.erase("jetty")
+		else:
+			near_track.erase("jetty")
+	if swans and swans.alive and swans.state in ["takeoff", "fly"]:
+		var d: float = Vector2(swans.cob["p"]).distance_to(boat_pos)
+		var tr: Dictionary = near_track.get("cob", {"armed": false, "minc": INF})
+		if d < 140.0:
+			tr["armed"] = true
+		tr["minc"] = minf(float(tr["minc"]), d - swans.STRIKE)
+		near_track["cob"] = tr
+		if bool(tr["armed"]) and d > swans.STRIKE + 40.0 and float(tr["minc"]) < 7.0 and float(tr["minc"]) > 0.0:
+			_close_call()
+			near_track.erase("cob")
+	elif near_track.has("cob"):
+		near_track.erase("cob")
+	for k in families.size():
+		var fam = families[k]
+		if fam.state in ["alarm", "flee", "search"]:
+			continue
+		var key := 1000 + k
+		var nearest := Vector2(fam.hen["p"]).distance_to(boat_pos)
+		for kid in fam.kids:
+			nearest = minf(nearest, Vector2(kid["p"]).distance_to(boat_pos))
+		var tr: Dictionary = near_track.get(key, {"armed": false, "minc": INF})
+		if nearest < fam.STARTLE + 10.0:
+			tr["armed"] = true
+			tr["minc"] = minf(float(tr["minc"]), nearest)
+			near_track[key] = tr
+		elif bool(tr["armed"]):
+			if float(tr["minc"]) >= fam.STARTLE:
+				_close_call()  # right past them, just outside what startles them
+			near_track.erase(key)
+
+
+func _close_call() -> void:
+	_reward("CLOSE CALL", "close", boat_pos, 1)
+	Sfx.loop_closed(0.5)
+	Game.vibrate(14)
+
+
+## Every goal met as the last lantern lights: a gold wave across the water from it, every lantern flares
+## together, and "Perfect" rises over the lake.
+func _perfect_moment(from: Vector2) -> void:
+	for k in 3:
+		ripples.append({"p": from, "t": clock + k * 0.18, "life": 2.4, "r0": 20.0, "r1": 520.0 + k * 60.0, "light": true})
+	for l in lanterns:
+		for k in 10:
+			_part(_glass_pos(l), Vector2.from_angle(randf() * TAU) * randf_range(30, 90), randf_range(0.6, 1.2), randf_range(1.8, 3.0), pal["light"], true)
+	var c := Vector2.ZERO
+	for l in lanterns:
+		c += Vector2(l["p"])
+	c /= maxf(1.0, lanterns.size())
+	_reward("PERFECT", "perfect", c, 99)
+	Sfx.chord(float(lake["pitch"]) * 2.0)
+	Game.vibrate(120)
+
+
+## The results' mark for a perfect lake: a gold medal slammed down beside the title once the goals are in,
+## a sunburst turning slowly behind it, the lantern embossed in its face and a red "PERFECT" banner across
+## it. On impact: a white flash, a shockwave ring, a burst of sparks and a small shake of the whole screen.
+func _perfect_seal(center: Vector2, delay: float) -> Tween:
+	const R := 60.0
+	const S := 0.85  # its size once landed
+	var seal := Control.new()
+	seal.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	seal.position = center
+	seal.modulate.a = 0.0
+	seal.set_meta("spin", 0.0)
+	seal.set_meta("hit", -1.0)  # seconds since it landed
+	var lantern_tex := Game.icon("lantern")
+	var font: Font = Game.title_font
+	var burst: Array = []
+	for k in 16:
+		burst.append([Vector2.from_angle(TAU * k / 16.0 + randf_range(-0.15, 0.15)) * randf_range(140.0, 260.0), randf_range(4.0, 8.0)])
+	var rim := PackedVector2Array()
+	var face := PackedVector2Array()
+	for i in 96:
+		var a := TAU * i / 96.0
+		rim.append(Vector2.from_angle(a) * (R + 3.5 * cos(a * 24.0)))
+		face.append(Vector2.from_angle(a) * (R - 8.0))
+	seal.draw.connect(func():
+		var spin: float = seal.get_meta("spin")
+		var hit: float = seal.get_meta("hit")
+		# Sunburst: alternating long and short rays turning slowly.
+		for k in 20:
+			var a := spin + TAU * k / 20.0
+			var ray := R + (34.0 if k % 2 == 0 else 20.0)
+			var half := 0.07
+			seal.draw_colored_polygon(PackedVector2Array([Vector2.from_angle(a - half) * (R - 4.0), Vector2.from_angle(a) * ray, Vector2.from_angle(a + half) * (R - 4.0)]), Color(1.0, 0.82, 0.42, 0.55 if k % 2 == 0 else 0.3))
+		seal.draw_texture_rect(Game.glow_tex, Rect2(-Vector2(R, R) * 1.9, Vector2(R, R) * 3.8), false, Color(1.0, 0.8, 0.45, 0.35))
+		# Scalloped gold rim, the face, a stitched inner ring and a lighter upper half.
+		seal.draw_colored_polygon(rim, Color("a8701f"))
+		seal.draw_colored_polygon(face, Color("f0bb5c"))
+		seal.draw_arc(Vector2.ZERO, R - 8.0, PI * 1.1, PI * 1.9, 32, Color(1.0, 0.93, 0.7, 0.8), 3.0, true)
+		for d in 28:
+			var a := TAU * d / 28.0
+			seal.draw_arc(Vector2.ZERO, R - 15.0, a, a + TAU / 56.0, 3, Color("9a6418"), 2.0, true)
+		var isz := 58.0
+		seal.draw_texture_rect(lantern_tex, Rect2(Vector2(-isz * 0.5, -isz * 0.5 - 6.0) + Vector2(1.5, 2.0), Vector2(isz, isz)), false, Color(1.0, 0.95, 0.75, 0.6))
+		seal.draw_texture_rect(lantern_tex, Rect2(Vector2(-isz * 0.5, -isz * 0.5 - 6.0), Vector2(isz, isz)), false, Color("7a4b12"))
+		# The banner: notched tails folded behind, then the band with the word.
+		var by := R * 0.55
+		var bw := 96.0
+		var bh := 21.0
+		for sgn in [-1.0, 1.0]:
+			var sx: float = sgn
+			var tail := PackedVector2Array([Vector2(sx * (bw - 20.0), by - bh + 10.0), Vector2(sx * (bw + 26.0), by - bh + 10.0), Vector2(sx * (bw + 12.0), by + 6.0), Vector2(sx * (bw + 26.0), by + bh + 10.0), Vector2(sx * (bw - 20.0), by + bh + 10.0)])
+			seal.draw_colored_polygon(tail, Color("7d2418"))
+			seal.draw_colored_polygon(PackedVector2Array([Vector2(sx * bw, by + bh), Vector2(sx * (bw - 14.0), by + bh + 10.0), Vector2(sx * (bw - 14.0), by + bh)]), Color("4e140c"))
+		seal.draw_rect(Rect2(-bw, by - bh, bw * 2.0, bh * 2.0), Color("c23b28"))
+		seal.draw_rect(Rect2(-bw, by - bh, bw * 2.0, 5.0), Color(1.0, 0.6, 0.5, 0.45))
+		seal.draw_rect(Rect2(-bw, by + bh - 4.0, bw * 2.0, 4.0), Color(0.3, 0.05, 0.02, 0.4))
+		var tw_s := font.get_string_size("PERFECT", HORIZONTAL_ALIGNMENT_LEFT, -1, 26).x
+		seal.draw_string_outline(font, Vector2(-tw_s * 0.5, by + 9.0), "PERFECT", HORIZONTAL_ALIGNMENT_LEFT, -1, 26, 5, Color(0.35, 0.06, 0.03, 0.9))
+		seal.draw_string(font, Vector2(-tw_s * 0.5, by + 9.0), "PERFECT", HORIZONTAL_ALIGNMENT_LEFT, -1, 26, Color("fff0cf"))
+		# A glint that sweeps across the banner every few seconds.
+		var gk := fmod(spin * 3.0, 3.0)
+		if gk < 1.0:
+			var gp := Vector2(lerpf(-bw, bw, gk), by - 4.0)
+			var gs := 16.0 * sin(PI * gk)
+			seal.draw_texture_rect(Game.glow_tex, Rect2(gp - Vector2(gs, gs), Vector2(gs, gs) * 2.0), false, Color(1, 1, 1, 0.9))
+			seal.draw_line(gp - Vector2(gs * 1.4, 0), gp + Vector2(gs * 1.4, 0), Color(1, 1, 1, 0.8), 2.0, true)
+			seal.draw_line(gp - Vector2(0, gs), gp + Vector2(0, gs), Color(1, 1, 1, 0.8), 2.0, true)
+		# The impact: flash, shockwave and sparks.
+		if hit >= 0.0 and hit < 0.9:
+			var k := hit / 0.9
+			seal.draw_circle(Vector2.ZERO, R, Color(1, 1, 1, maxf(0.0, 0.85 - hit * 4.0)), true, -1.0, true)
+			seal.draw_arc(Vector2.ZERO, R + 10.0 + 150.0 * (1.0 - pow(1.0 - k, 3.0)), 0.0, TAU, 64, Color(1.0, 0.88, 0.6, 0.8 * (1.0 - k)), 6.0 * (1.0 - k) + 1.0, true)
+			for b in burst:
+				var bp: Vector2 = Vector2(b[0]) * (1.0 - pow(1.0 - k, 2.0)) + Vector2(0, 90.0) * k * k
+				var br := float(b[1]) * (1.0 - k)
+				seal.draw_texture_rect(Game.glow_tex, Rect2(bp - Vector2(br, br) * 1.6, Vector2(br, br) * 3.2), false, Color(1.0, 0.85, 0.5, 1.0 - k))
+				seal.draw_circle(bp, br * 0.45, Color(1, 1, 1, 1.0 - k), true, -1.0, true))
+	overlay.add_child(seal)
+	var spin_tw := seal.create_tween().set_loops()
+	spin_tw.tween_method(func(v: float):
+		seal.set_meta("spin", v)
+		seal.queue_redraw(), 0.0, TAU, 40.0)
+	var tw := seal.create_tween()
+	tw.tween_interval(delay)
+	tw.tween_property(seal, "modulate:a", 1.0, 0.12)
+	tw.parallel().tween_property(seal, "scale", Vector2.ONE * S, 0.28).from(Vector2.ONE * 2.4).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+	tw.parallel().tween_property(seal, "rotation", -0.2, 0.28).from(-0.75).set_ease(Tween.EASE_IN)
+	tw.tween_callback(func():
+		Sfx.chime(float(lake["pitch"]) * 2.0)
+		Game.vibrate(60)
+		var shake := overlay.create_tween()
+		for o in [Vector2(9, -6), Vector2(-7, 5), Vector2(4, -3), Vector2.ZERO]:
+			shake.tween_property(overlay, "position", o, 0.045))
+	tw.tween_method(func(v: float): seal.set_meta("hit", v), 0.0, 0.9, 0.9)
+	tw.parallel().tween_property(seal, "scale", Vector2.ONE * S * 1.08, 0.09).set_trans(Tween.TRANS_SINE)
+	tw.parallel().tween_property(seal, "scale", Vector2.ONE * S, 0.25).set_delay(0.09).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	return tw
+
+
+## The reward word in the lake, and a combo's sparks on their way up to the sun (or battery).
+func _draw_rewards(n: Node2D) -> void:
+	var to_world := n.get_global_transform_with_canvas().affine_inverse()
+	var sun_w: Vector2 = to_world * hud_sun_screen
+	var spark_col := Color("bcd8ff") if battery >= 0.0 else Color("ffd796")
+	for s in reward_sparks:
+		var u := clampf((clock - float(s["t0"])) / 0.75, 0.0, 1.0)
+		if clock < float(s["t0"]):
+			continue
+		var e := u * u * (3.0 - 2.0 * u)
+		var a: Vector2 = s["from"]
+		var mid := (a + sun_w) * 0.5 + Vector2(60, 0)
+		for tk in 4:
+			var te := clampf(e - tk * 0.05, 0.0, 1.0)
+			var tp := a.lerp(mid, te).lerp(mid.lerp(sun_w, te), te)
+			var tr := 15.0 - tk * 3.0
+			n.draw_texture_rect(Game.glow_tex, Rect2(tp - Vector2(tr, tr), Vector2(tr, tr) * 2.0), false, Color(spark_col, 0.9 - tk * 0.2))
+		var p := a.lerp(mid, e).lerp(mid.lerp(sun_w, e), e)
+		n.draw_texture_rect(Game.glow_tex, Rect2(p - Vector2(5, 5), Vector2(10, 10)), false, Color(1, 1, 1, 0.95))
+	if reward.is_empty():
+		return
+	var age := clock - float(reward["t"])
+	var kind: String = reward["kind"]
+	var life := 1.8
+	var pop := 1.0 + 0.3 * exp(-age * 9.0) * cos(age * 14.0)  # springs in a little big, then settles
+	var a := minf(1.0, age * 8.0) * (1.0 - smoothstep(life - 0.5, life, age))
+	var at: Vector2 = Vector2(reward["p"]) - Vector2(0, 36.0 * (1.0 - exp(-age * 2.5)))
+	var font: Font = Game.title_font
+	if kind == "combo":
+		# x smaller than the number, in lantern gold, outlined, on a soft glow, with a few sparkles.
+		var num := String(reward["text"]).substr(1)
+		var g := 70.0 * pop
+		n.draw_texture_rect(Game.glow_tex, Rect2(at - Vector2(g, g * 0.75), Vector2(g * 2.0, g * 1.5)), false, Color(1.0, 0.8, 0.45, 0.45 * a))
+		n.draw_set_transform(at, 0.0, Vector2.ONE * pop)
+		var xw := 30.0
+		var nw := font.get_string_size(num, HORIZONTAL_ALIGNMENT_LEFT, -1, 74).x
+		var x0 := -(xw + nw) * 0.5
+		var outline := Color(0.25, 0.14, 0.03, 0.85 * a)
+		var xc := Vector2(x0 + 11.0, -6.0)
+		for pass_k in 2:
+			var wdt := 13.0 if pass_k == 0 else 7.0
+			var col_x := outline if pass_k == 0 else Color(1.0, 0.86, 0.55, a)
+			n.draw_line(xc + Vector2(-9, -9), xc + Vector2(9, 9), col_x, wdt, true)
+			n.draw_line(xc + Vector2(9, -9), xc + Vector2(-9, 9), col_x, wdt, true)
+		n.draw_string_outline(font, Vector2(x0 + xw, 22), num, HORIZONTAL_ALIGNMENT_LEFT, -1, 74, 11, outline)
+		n.draw_string(font, Vector2(x0 + xw, 22), num, HORIZONTAL_ALIGNMENT_LEFT, -1, 74, Color(1.0, 0.84, 0.5, a))
+		n.draw_string(font, Vector2(x0 + xw, 19), num, HORIZONTAL_ALIGNMENT_LEFT, -1, 74, Color(1.0, 0.97, 0.85, 0.35 * a))  # a lighter top edge
+		for k in 4:
+			var sa := TAU * k / 4.0 + age * 1.5
+			var sp := Vector2.from_angle(sa) * (50.0 + 20.0 * age)
+			var sr := 7.0 * (1.0 - smoothstep(0.0, 1.0, age))
+			n.draw_texture_rect(Game.glow_tex, Rect2(sp - Vector2(sr, sr), Vector2(sr, sr) * 2.0), false, Color(1, 0.95, 0.8, a))
+		n.draw_set_transform(Vector2.ZERO)
+	else:
+		var size := 54 if kind == "perfect" else 26
+		var col := Color(1.0, 0.84, 0.5, a) if kind == "perfect" else Color(1, 1, 1, a)
+		if kind == "perfect":
+			n.draw_texture_rect(Game.glow_tex, Rect2(at - Vector2(170, 70) * pop, Vector2(340, 140) * pop), false, Color(1.0, 0.8, 0.45, 0.5 * a))
+		n.draw_set_transform(at, 0.0, Vector2.ONE * pop)
+		var t: String = reward["text"]
+		var w := font.get_string_size(t, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
+		n.draw_string_outline(font, Vector2(-w * 0.5, size * 0.35), t, HORIZONTAL_ALIGNMENT_LEFT, -1, size, 8, Color(0.05, 0.08, 0.1, 0.75 * a))
+		n.draw_string(font, Vector2(-w * 0.5, size * 0.35), t, HORIZONTAL_ALIGNMENT_LEFT, -1, size, col)
+		n.draw_set_transform(Vector2.ZERO)
+
+
 func _spawn_fish() -> void:
 	for k in 12:
 		var p := Vector2(randf_range(60, 660), randf_range(220, 1180))
@@ -2238,8 +2618,6 @@ func _draw_details(n: Node2D) -> void:
 		for p in r["poly"]:
 			sh.append(p + Vector2(7, 9))
 		_aa_poly(n, sh, shade)
-		var foam := 7.0 + sin(clock * 1.4 + float(r["phase"])) * 1.8
-		n.draw_arc(r["c"], float(r["r"]) + foam, 0.0, TAU, 40, Color(1, 1, 1, 0.13), 2.0, true)
 		_aa_poly(n, r["poly"], pal["rock"])
 		_aa_poly(n, r["hi"], pal["rock_hi"])
 
@@ -2663,18 +3041,31 @@ func _draw_ui(n: Node2D) -> void:
 
 	# Seconds of light left, in the bar next to the loops: the sun's, or the headlight battery's.
 	var batt := battery >= 0.0
-	var charge := clampf(battery / maxf(0.001, battery_max), 0.0, 1.0)
+	var off := bar_hold + bar_lag  # combo seconds the bar and timer are still easing in
+	var shown_batt := maxf(0.0, battery - off)
+	var shown_dusk := clampf((elapsed + off) / duration, 0.0, 1.0) if off > 0.0 else dusk
+	var charge := clampf(shown_batt / maxf(0.001, battery_max), 0.0, 1.0)
 	var warn := batt and battery < WARN and state == "play"
 	var blink := 0.45 + 0.55 * absf(sin(clock * 7.0)) if warn else 1.0
-	var secs := "%d s" % (ceili(battery) if batt else ceili((1.0 - dusk) * duration))
+	var secs := "%d s" % (ceili(shown_batt) if batt else ceili((1.0 - shown_dusk) * duration))
 	var sw := font.get_string_size(secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28).x
 	var sun_x := lx - 8 - 34 - 32 - sw
 	var day_col := light.lerp(Color("ff8a66"), smoothstep(0.7, 1.0, dusk))
 	if batt:
 		day_col = Color("cfe6ff").lerp(Color("ff7a5a"), 1.0 - smoothstep(0.1, 0.3, charge))
 		day_col.a = blink
-	Game.draw_icon(n, Game.battery_icon(charge) if batt else "sun", Vector2(sun_x - 8 - 17, cy), 34, day_col)
+	hud_sun_screen = n.get_global_transform_with_canvas() * Vector2(sun_x - 8 - 17, cy)
+	var land := clampf(1.0 - (clock - reward_chip_t) / 0.5, 0.0, 1.0)  # the icon swells as the time lands
+	Game.draw_icon(n, Game.battery_icon(charge) if batt else "sun", Vector2(sun_x - 8 - 17, cy), 34.0 * (1.0 + 0.35 * land), day_col)
 	n.draw_string(font, Vector2(sun_x, cy + 10), secs, HORIZONTAL_ALIGNMENT_LEFT, -1, 28, Color.WHITE)
+	var chip_a := clampf((clock - reward_chip_t) * 6.0, 0.0, 1.0) * (1.0 - smoothstep(1.0, 1.6, clock - reward_chip_t))
+	if chip_a > 0.0:
+		var chip := "+%d s" % reward_chip_secs
+		var cw := font.get_string_size(chip, HORIZONTAL_ALIGNMENT_LEFT, -1, 30).x
+		var chip_col := Color("bcd8ff") if batt else Color("ffd796")
+		var chip_p := Vector2(sun_x - 8 - 34 - 18 - cw, cy + 11 - 8.0 * (clock - reward_chip_t))
+		n.draw_string_outline(font, chip_p, chip, HORIZONTAL_ALIGNMENT_LEFT, -1, 30, 6, Color(0.05, 0.08, 0.1, 0.7 * chip_a))
+		n.draw_string(font, chip_p, chip, HORIZONTAL_ALIGNMENT_LEFT, -1, 30, Color(chip_col, chip_a))
 	# The swans' egg: dim while it's out there, white aboard, in the lake's light once it's home.
 	if swans:
 		var es: String = swans.egg_state
@@ -2686,13 +3077,14 @@ func _draw_ui(n: Node2D) -> void:
 	# and BEST (gold pointer, where your best time on this lake finished).
 	var by := top_inset + BAR_H
 	var w := view_size.x
-	var day_f := clampf(dusk, 0.0, 1.0)
+	var day_f := shown_dusk
 	var late := dusk > 0.75 or day_taken
 	n.draw_rect(Rect2(0, by, w, 10), HUD_PLATE)
 	n.draw_rect(Rect2(0, by, w, 10), Color(1, 1, 1, 0.14))
 	if batt:
 		# The battery: full from the left, draining back; on a night lake the SPARE mark is the time goal.
 		n.draw_rect(Rect2(0, by, w * charge, 10), day_col)
+		_draw_bar_fx(n, w * charge, by, Color("bcd8ff"))
 		if night and not day_taken:
 			var spare_x := w * 0.25
 			var spare_a := 0.35 if late else 0.95
@@ -2721,6 +3113,7 @@ func _draw_ui(n: Node2D) -> void:
 		_draw_popups(n, font, by, light)
 		return
 	n.draw_rect(Rect2(0, by, w * day_f, 10), day_col)
+	_draw_bar_fx(n, w * day_f, by, Color("ffd796"))
 	var has_dusk := swans == null  # where the egg is the second goal there is no "before dusk" mark
 	var dusk_x := w * 0.75 if has_dusk else -1000.0
 	var dusk_a := 0.35 if late else 0.95
@@ -3067,16 +3460,7 @@ func _go(i: int) -> void:
 func _show_results() -> void:
 	var lit := _lit_count()
 	var total := lanterns.size()
-	var got := 0
-	if lit == total:
-		got |= Game.MARK_ALL
-		if lake.has("swan"):
-			if swans and swans.egg_state == "home":
-				got |= Game.MARK_TIME  # this lake's second goal is the swans' egg, home in the nest
-		elif finished_dusk <= 0.75 and not day_taken:
-			got |= Game.MARK_TIME
-		if loops_used <= int(lake["par"]):
-			got |= Game.MARK_LOOPS
+	var got := _goals_now() if lit == total else 0
 	if got & Game.MARK_ALL and lake_index + 1 < Game.lake_count() and not Game.is_unlocked(lake_index + 1):
 		newly_unlocked = lake_index + 1
 		Game.set_rig_pending(newly_unlocked)  # the pickup drives there once the map is on screen
@@ -3149,6 +3533,10 @@ func _show_victory(got: int, prev_best: float, last: bool) -> void:
 		["loop", "%d loop%s" % [par, "" if par == 1 else "s"], got & Game.MARK_LOOPS != 0]]
 	var x0 := (view_size.x - (3.0 * ITEM_W + 2.0 * GAP)) * 0.5
 	var gy := view_size.y * 0.33
+	if got == Game.MARK_ALL | Game.MARK_TIME | Game.MARK_LOOPS:
+		title.position.x = -70.0  # room on the right for the medal
+		var seal_x := minf(view_size.x * 0.5 - 70.0 + title.get_minimum_size().x * 0.5 + 92.0, view_size.x - 118.0)
+		seq.append(_perfect_seal(Vector2(seal_x, view_size.y * 0.15 + 42.0), 2.1))
 	var tw := overlay.create_tween()
 	seq.append(tw)
 	tw.tween_interval(0.5)

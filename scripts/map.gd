@@ -1616,8 +1616,6 @@ func _draw_glow(n: Node2D) -> void:
 
 
 const DEV_ITEMS := [
-	["chains", "Chain loops", "Quick loops one after another give the sun +3 s."],
-	["boost", "Speed boost", "3 lanterns within 7 s gives 4.5 s of swift water."],
 	["life", "Moving life", "Ducks cut your trail, fish jump, lanterns drift."],
 	["fading", "Fading lanterns", "Lit lanterns go out again after 28 s."],
 	["crash", "Crashes end the run", "Hitting a rock, or the shore head-on, ends the lake."],

@@ -22,8 +22,8 @@ var stats: Array = []  # per lake: tries, wins, fails, crashes, revives, best, l
 var sound_on := true
 var music_on := true
 var vibration_on := true
-var dev := {"chains": true, "life": true, "fading": false,
-	"crash": true, "boost": true, "unlock_all": false, "boat3d": true}
+var dev := {"life": true, "fading": false,
+	"crash": true, "unlock_all": false, "boat3d": true}
 ## Daylight tuning from the Dev panel: a multiplier on the automatic time, or a fixed time (0 = automatic).
 var day_mult := 1.0
 var day_fixed := 0
