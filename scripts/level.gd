@@ -609,8 +609,8 @@ func _build_geometry() -> void:
 		while tufts.size() < count and tries < count * 20:
 			tries += 1
 			var p := c + Vector2.from_angle(rng.randf() * TAU) * sqrt(rng.randf()) * (rad - 8.0)
-			if not Geometry2D.is_point_in_polygon(p, inner):
-				continue
+			if not Geometry2D.is_point_in_polygon(p, inner) or _on_isle(p, 8.0):
+				continue  # reeds grow in the water, right up to an island's sand but not on it
 			var crowded := false
 			for t in tufts:
 				if p.distance_to(t["p"]) < 15.0:
@@ -651,7 +651,19 @@ func _build_geometry() -> void:
 	drng.seed = 5003 * (lake_index + 1)
 	var bank := Game.offset_largest(water, -40.0)
 	var start := Vector2(lake["start"][0], lake["start"][1])
-	for fi in int(lake.get("ducks", 0)):
+	# On a lake with a duck route, the families start spread evenly round it.
+	var droute: Array = lake.get("duck_route", [])
+	var nfam := int(lake.get("ducks", 0))
+	if not droute.is_empty():
+		for fi in nfam:
+			var ri := int(float(fi) * droute.size() / maxf(1.0, nfam))
+			var f := DuckFamily.make(self, Vector2(droute[ri][0], droute[ri][1]), drng.randi_range(3, 5), drng.randi())
+			f.route = droute
+			f.route_i = ri
+			f.target = f._new_target()
+			families.append(f)
+		nfam = 0
+	for fi in nfam:
 		for attempt in 60:
 			var q := Vector2(drng.randf_range(60, lake_w - 60.0), drng.randf_range(220, 1180))
 			var clear := Geometry2D.is_point_in_polygon(q, bank) and q.distance_to(start) > 220.0 and not _hits_rock(q) and not _in_isle(q)
@@ -1297,6 +1309,18 @@ func _water_pieces() -> Array:
 			if Geometry2D.is_polygon_clockwise(r) == Geometry2D.is_polygon_clockwise(big):
 				pieces.append(r)
 	return pieces
+
+
+## Whether a point is on an island or within pad of its edge.
+func _on_isle(p: Vector2, pad: float) -> bool:
+	for isl in isles:
+		if Geometry2D.is_point_in_polygon(p, isl):
+			return true
+		var n: int = isl.size()
+		for i in n:
+			if p.distance_to(Geometry2D.get_closest_point_to_segment(p, isl[i], isl[(i + 1) % n])) < pad:
+				return true
+	return false
 
 
 ## Whether a point is too close to an island for the boat's centre (inside an island's blocked ring).
@@ -4268,7 +4292,7 @@ func _show_game_over(kind: String) -> void:
 		offer.add_child(ask)
 		var note := Label.new()
 		var left_n := MAX_REVIVES - (patches_used if wreck else days_used)
-		note.text = "Watch a short ad  ·  %d of %d left" % [left_n, MAX_REVIVES]
+		note.text = "%d of %d left" % [left_n, MAX_REVIVES]  # free: the game has no ads
 		note.add_theme_font_size_override("font_size", 22)
 		note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		note.position = Vector2(0, view_size.y * 0.67 + 46)

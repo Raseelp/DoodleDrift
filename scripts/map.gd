@@ -2611,7 +2611,14 @@ func _draw_teaser(n: Node2D, i: int, th: Dictionary, a: float) -> void:
 		if Game.lakes[k].has("swan"):
 			first_swans = k
 			break
-	if i == first_swans:
+	var forced := String(lake.get("teaser", ""))  # a lake can name its own new thing
+	if forced == "ducks":
+		var total := _path_len(path)
+		var head := fmod(clock * 16.0, total)
+		for k in 4:
+			var dp: Array = _path_at(path, fposmod(head - (k * 26.0 + (8.0 if k > 0 else 0.0)) * TEASE_K, total))
+			_teaser_duck(n, dp[0], dp[1], k == 0, a)
+	elif i == first_swans:
 		var sp: Array = _path_at(path, fmod(clock * 22.0, _path_len(path)))
 		_teaser_swan(n, sp[0], sp[1], a)
 	elif lake.has("swan") and lake.has("reeds") and not (lake["reeds"] as Array).is_empty():

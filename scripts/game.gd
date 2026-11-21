@@ -123,8 +123,8 @@ func _build_lakes() -> void:
 		},
 		{
 			"name": "Two Coves",
-			"hint": "",
-			"par": 2, "pitch": 1.1225, "motes": "petals",
+			"hint": "Ducks cut your trail.\nClose your loop before they cross.",
+			"par": "auto", "pitch": 1.1225, "motes": "petals",
 			"pal": _pal({
 				"land": "93ab6c", "land_dark": "829a5e", "tree": "66824c", "tree_hi": "a0bb7b",
 				"shadow": "4b6440", "sand": "ecdcb0", "shallow": "8cc5b8", "mid": "63a9a8",
@@ -132,12 +132,26 @@ func _build_lakes() -> void:
 				"light": "ffd77a", "pair": "a5ece0", "night": "a691b6", "mote": "f6e6a6",
 				"wood": "a07e56",
 			}),
-			"water": [[110, 300], [260, 190], [470, 195], [620, 300], [630, 470], [520, 610],
-				[600, 760], [640, 950], [560, 1140], [360, 1210], [170, 1150], [80, 960],
-				[130, 780], [210, 630], [90, 470]],
-			"lanterns": [[300, 380, 0], [440, 455, 0], [290, 905, 0], [445, 965, 0]],
-			"rocks": [], "reeds": [],
-			"start": [470, 612, PI], "jetty": [592, 612, 500, 612, "L"], "rig": 1, "ducks": 2,
+			# Two coves joined by narrows, a reed island splitting them into a north and a south channel.
+			# Duck families commute between the coves on a set loop (east by the north channel, back west
+			# by the south one), resting at each end, so their crossings can be learned and timed. The
+			# jetty is mid south shore under the narrows; the swans nest in the east cove's far corner and
+			# their egg floats out between, so it comes home across the duck route.
+			"width": 1440, "goal": "egg", "teaser": "ducks",
+			"water": [[70, 700], [90, 450], [180, 270], [360, 200], [540, 230], [640, 330], [690, 440],
+				[760, 450], [820, 330], [940, 230], [1130, 200], [1300, 250], [1390, 420], [1400, 680],
+				[1340, 930], [1200, 1110], [1000, 1170], [880, 1110], [820, 990], [760, 1060], [680, 1060],
+				[620, 990], [560, 1110], [380, 1190], [200, 1130], [90, 950]],
+			"islands": [[[650, 650], [720, 605], [795, 635], [800, 715], [725, 765], [655, 725]],
+				[[1070, 520], [1130, 480], [1190, 510], [1180, 580], [1110, 600], [1060, 570]]],
+			"lanterns": [[250, 420, 0], [300, 860, 0], [500, 640, 0], [610, 520, 0], [820, 850, 0],
+				[1000, 880, 0], [1280, 720, 0], [1180, 380, 0]],
+			"rocks": [], "reeds": [[725, 685, 125], [1320, 800, 70]],
+			"swan": [1330, 330, 160.0, 1.1],
+			# The ducks' loop: [x, y, seconds resting there]
+			"duck_route": [[300, 700, 6.0], [470, 560, 0.0], [640, 515, 0.0], [820, 525, 0.0], [1000, 610, 0.0],
+				[1150, 760, 6.0], [1000, 900, 0.0], [820, 880, 0.0], [640, 870, 0.0], [470, 830, 0.0]],
+			"start": [720, 968, -PI / 2], "jetty": [720, 1078, 720, 998, ""], "rig": 1, "ducks": 3,
 		},
 		{
 			"name": "Stones",

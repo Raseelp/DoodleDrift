@@ -41,6 +41,10 @@ var call_t := -10.0  # her last gathering call
 var peep_any := -10.0  # the family's last peep (so a scattered brood doesn't peep all at once)
 var until := 0.0
 var target := Vector2.ZERO
+# On a lake with a duck route the family swims it in order, round and round, resting where it says
+# (lake "duck_route": [x, y, seconds resting]); elsewhere they wander.
+var route: Array = []
+var route_i := 0
 var alarm_t := -10.0  # her last alarm call
 var hit_cool := -10.0
 var snap_t := -10.0
@@ -104,6 +108,13 @@ func update(delta: float) -> void:
 			var to := target - hp
 			if _lost_count() > 0:
 				state = "search"
+			elif to.length() < 18.0 and not route.is_empty():
+				var rest := float(route[route_i][2])
+				if rest > 0.0:
+					state = "rest"
+					until = clock + rest * rng.randf_range(0.85, 1.15)
+				else:
+					target = _new_target()
 			elif to.length() < 18.0:
 				var r := rng.randf()
 				if r < 0.45:
@@ -504,6 +515,9 @@ func _ok(p: Vector2) -> bool:
 
 ## Somewhere else on the water to swim to, not too near the boat.
 func _new_target() -> Vector2:
+	if not route.is_empty():
+		route_i = (route_i + 1) % route.size()
+		return Vector2(route[route_i][0], route[route_i][1]) + Vector2(rng.randf_range(-14.0, 14.0), rng.randf_range(-14.0, 14.0))
 	var hp: Vector2 = hen["p"]
 	for attempt in 40:
 		var q: Vector2
