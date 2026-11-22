@@ -10,7 +10,7 @@ config_version=5
 
 [application]
 
-config/name="Finding Light"
+config/name="Doodle Drift"
 config/description="Light the lanterns with your trail before the water settles."
 run/main_scene="res://main.tscn"
 config/quit_on_go_back=false

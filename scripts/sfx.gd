@@ -52,33 +52,12 @@ func _exit_tree() -> void:
 
 func _generate() -> void:
 	# Each sound is made on its own worker (the phone's cores in parallel); this thread waits for them.
+	# Only what Doodle Drift plays (the rest were Finding Light's lake sounds; _play skips missing keys).
 	var makers := [
 		["chime", _make_chime],
 		["whoosh", _make_whoosh],
 		["bump", _make_bump],
 		["tap", _make_tap],
-		["pad", _make_pad],
-		["shimmer", _make_shimmer],
-		["bells", _make_bells],
-		["hull", _make_hull],
-		["reeds", _make_reeds],
-		["bird", _make_bird],
-		["frog", _make_frog],
-		["owl", _make_owl],
-		["quack", _make_quack],
-		["stamp", _make_stamp],
-		["snap", _make_snap],
-		["peep", _make_peep],
-		["hiss", _make_hiss],
-		["beats", _make_beats],
-		["fw_boom", _make_fw_boom],
-		["fw_launch", _make_fw_launch],
-		["fw_crackle", _make_fw_crackle],
-		["grind", _make_grind],
-		["horn", _make_horn],
-		["clunk", _make_clunk],
-		["rustle", _make_rustle],
-		["swan_call", _make_swan_call],
 	]
 	var out := {}
 	var lock := Mutex.new()
@@ -96,11 +75,11 @@ func _on_generated(out: Dictionary) -> void:
 	_ready_flag = true
 	if _thread.is_started():
 		_thread.wait_to_finish()
-	_layers[0].stream = S["pad"]
-	_layers[1].stream = S["shimmer"]
-	_layers[2].stream = S["bells"]
-	_hull.stream = S["hull"]
-	_reeds.stream = S["reeds"]
+	_layers[0].stream = S.get("pad")
+	_layers[1].stream = S.get("shimmer")
+	_layers[2].stream = S.get("bells")
+	_hull.stream = S.get("hull")
+	_reeds.stream = S.get("reeds")
 	if _ambience_pitch > 0.0:
 		var p := _ambience_pitch
 		_ambience_pitch = -1.0

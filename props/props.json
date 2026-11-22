@@ -1,0 +1,58 @@
+{
+	"eraser": {
+		"kind": "slide",
+		"len": 50.0,
+		"px": 128,
+		"scale": 0.5,
+		"wid": 41.2
+	},
+	"pencil": {
+		"kind": "roll",
+		"len": 175.0,
+		"px": 256,
+		"scale": 0.8578,
+		"wid": 7.1
+	},
+	"pencil_blue": {
+		"kind": "roll",
+		"len": 175.3,
+		"px": 256,
+		"scale": 0.8633,
+		"wid": 7.4
+	},
+	"pencil_white": {
+		"kind": "roll",
+		"len": 166.0,
+		"px": 256,
+		"scale": 0.8137,
+		"wid": 9.1
+	},
+	"ruler": {
+		"kind": "slide",
+		"len": 204.0,
+		"px": 320,
+		"scale": 0.7969,
+		"wid": 20.5
+	},
+	"scissors": {
+		"kind": "slide",
+		"len": 175.0,
+		"px": 256,
+		"scale": 0.858,
+		"wid": 97.5
+	},
+	"set_square": {
+		"kind": "slide",
+		"len": 159.1,
+		"px": 256,
+		"scale": 1.1788,
+		"wid": 77.7
+	},
+	"sharpener": {
+		"kind": "slide",
+		"len": 30.3,
+		"px": 128,
+		"scale": 0.2968,
+		"wid": 25.1
+	}
+}
