@@ -9,14 +9,14 @@
 config_version=5
 
 [application]
-boot_splash/show_image=false
-boot_splash/bg_color=Color(0.113725, 0.164706, 0.192157, 1)
 
 config/name="Finding Light"
 config/description="Light the lanterns with your trail before the water settles."
 run/main_scene="res://main.tscn"
 config/quit_on_go_back=false
 config/features=PackedStringArray("4.7")
+boot_splash/bg_color=Color(0.113725, 0.164706, 0.192157, 1)
+boot_splash/show_image=false
 config/icon="res://art/icon.png"
 
 [autoload]
@@ -41,7 +41,6 @@ pointing/emulate_touch_from_mouse=true
 [rendering]
 
 textures/canvas_textures/default_texture_filter=3
-
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
 textures/vram_compression/import_etc2_astc=true

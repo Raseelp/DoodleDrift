@@ -219,8 +219,7 @@ func _build_lakes() -> void:
 
 ## A fair loop limit worked out from where the lanterns are: lanterns that one loop of a comfortable size
 ## (about 300 px across) could take together, with clear water between them, are grouped greedily; the
-## number of groups is the fewest loops a tidy run needs, and the limit gives a little room on top of
-## that (one more loop, and one more for every four groups).
+## number of groups is the fewest loops a tidy run needs, and that is the limit: no spare loops.
 const PAR_LOOP := 150.0  # the farthest a lantern may be from the middle of its group
 func auto_par(i: int) -> int:
 	var left: Array = []
@@ -254,7 +253,7 @@ func auto_par(i: int) -> int:
 		for q in best:
 			left.erase(q)
 		groups += 1
-	return groups + 1 + groups / 4
+	return groups
 
 
 ## Whether the straight way between two points stays on open water (no shore, no island).

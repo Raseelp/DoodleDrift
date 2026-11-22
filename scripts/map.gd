@@ -28,7 +28,6 @@ var map_ui: Control  # title, lake names and the gear; hidden while zoomed in on
 var settings: Control
 var celebrating := false
 var cele_test := false  # this celebration is a replay from the dev panel
-var ch2_label: Label = null  # what chapter two asks for, under the chapter's name
 var _thumb_xf := Transform2D()  # the lake picture being drawn: its own coordinates to the map
 const TEASE_K := 2.4  # teaser figures drawn larger than life, so they read at the picture's small size
 var _tease_swan: SubViewport = null  # the 3D swan gliding on her lake's picture (made in _ready)
@@ -350,7 +349,7 @@ func _build_road() -> void:
 		var steps := maxi(3, int(absf(da) / 0.18))
 		for k in range(1, steps):
 			var a := a0 + da * float(k) / steps
-			road.append(c + Vector2(cos(a) * KEEP_OUT.x * 1.05, sin(a) * KEEP_OUT.y * 1.05))
+			road.append(c + Vector2(cos(a) * _keep_out(inside).x * 1.05, sin(a) * _keep_out(inside).y * 1.05))
 		i = j
 	road = _smooth_road(road)
 	road_len = PackedFloat32Array([0.0])
@@ -393,7 +392,7 @@ func _smooth_road(pts: PackedVector2Array) -> PackedVector2Array:
 ## Which lake a point on the map is inside the keep-out of, or -1.
 func _lake_at(p: Vector2) -> int:
 	for k in Game.lake_count():
-		var d: Vector2 = (p - (SPOTS[k] + off)) / KEEP_OUT
+		var d: Vector2 = (p - (SPOTS[k] + off)) / _keep_out(k)
 		if d.length_squared() < 1.0:
 			return k
 	return -1
@@ -432,6 +431,11 @@ func _isle_cores(i: int) -> Array:
 	for isl in Game.island_polys(i):
 		out.append_array(Geometry2D.offset_polygon(isl, -16.0, Geometry2D.JOIN_ROUND))
 	return out
+
+
+## How far the road (and the pickup) keeps from lake k's middle: wider round a wide lake's picture.
+func _keep_out(k: int) -> Vector2:
+	return KEEP_OUT + Vector2(_label_dx(k), 0.0)
 
 
 ## How much farther out a lake's name and goals sit beside a wide lake's picture.
@@ -796,7 +800,7 @@ func _nearest_lake(p: Vector2) -> Vector2:
 	var bd := INF
 	for k in Game.lake_count():
 		var c: Vector2 = SPOTS[k] + off
-		var d := ((p - c) / KEEP_OUT).length()
+		var d := ((p - c) / _keep_out(k)).length()
 		if d < bd:
 			bd = d
 			best = c
@@ -807,7 +811,7 @@ func _nearest_lake(p: Vector2) -> Vector2:
 func _lake_room(p: Vector2) -> float:
 	var r := INF
 	for k in Game.lake_count():
-		r = minf(r, ((p - (SPOTS[k] + off)) / KEEP_OUT).length())
+		r = minf(r, ((p - (SPOTS[k] + off)) / _keep_out(k)).length())
 	return r
 
 
@@ -994,22 +998,6 @@ func _build_ui() -> void:
 		l.modulate.a = 1.0 if Game.is_unlocked(i) else 0.4
 		map_labels.append(l)
 		map_ui.add_child(l)
-	# What opens chapter two, from the start, so it's never a surprise (after the lake names: their order
-	# in map_labels matters).
-	var eggs: Array = Game.eggs_returned()
-	ch2_label = Label.new()
-	if Game.goals_earned() >= Game.CH2_GOALS and int(eggs[0]) >= int(eggs[1]):
-		ch2_label.text = "Chapter two is ready"
-	else:
-		ch2_label.text = "Chapter two: %d goals and every egg   ·   %d/%d, eggs %d/%d" % [Game.CH2_GOALS, Game.goals_earned(),
-			Game.lake_count() * 3, int(eggs[0]), int(eggs[1])]
-	ch2_label.add_theme_font_size_override("font_size", 18)
-	ch2_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	ch2_label.modulate.a = 0.55
-	ch2_label.position = Vector2(0, top_inset + off.y * 0.5 + 222)
-	ch2_label.size = Vector2(view_size.x, 30)
-	map_labels.append(ch2_label)
-	map_ui.add_child(ch2_label)
 	# Labels take the day's ink colour; in daylight the dark drop shadow becomes a faint light one.
 	for lb in map_labels:
 		lb.add_theme_color_override("font_color", ink)
@@ -2011,7 +1999,7 @@ func _celebrate() -> void:
 	cele_fx.draw.connect(_fw_draw)
 	cele_ui.add_child(cele_fx)
 	road_lit = 0.0
-	for lb in [map_labels[0], map_labels[1], ch2_label]:
+	for lb in [map_labels[0], map_labels[1]]:
 		create_tween().tween_property(lb, "modulate:a", 0.0, 0.8)
 	if shore_flies.is_empty():
 		_make_shore_flies()
@@ -2276,7 +2264,6 @@ func _on_cele_input(e: InputEvent) -> void:
 	create_tween().tween_property(self, "cele_icons_a", 1.0, 0.6)
 	create_tween().tween_property(map_labels[0], "modulate:a", 1.0, 0.6)
 	create_tween().tween_property(map_labels[1], "modulate:a", 0.75, 0.6)
-	create_tween().tween_property(ch2_label, "modulate:a", 0.55, 0.6)
 	fw_show = false
 	fw_show_words = false
 	create_tween().tween_property(self, "cele_night", 0.0, 2.5).set_trans(Tween.TRANS_SINE)  # back to this spot's own time of day

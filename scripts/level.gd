@@ -3350,18 +3350,19 @@ func _draw_edge_glow(n: Node2D, light: Color) -> void:
 		return
 	var left_x := cam_x - off.x
 	var right_x := left_x + view_size.x
-	# The swans' egg out on the water off screen: a small dim egg on that edge, with a faint white glow.
+	# The swans' egg out on the water off screen: an egg on that edge, on a dark disc with a white glow.
 	if swans and swans.egg_state == "float":
 		var ep: Vector2 = swans.egg_p
 		var ed := left_x - ep.x if ep.x < left_x else ep.x - right_x
 		if ed > 10.0:
-			var ex := 14.0 if ep.x < left_x else view_size.x - 14.0
+			var ex := 26.0 if ep.x < left_x else view_size.x - 26.0
 			var ey := clampf(ep.y + off.y, top_inset + BAR_H + 90.0, view_size.y - 90.0)
-			var ea := 0.4 + 0.12 * sin(clock * 1.6)
-			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(ex - 30.0, ey - 50.0), Vector2(60.0, 100.0)), false, Color(1, 1, 1, ea * 0.4))
-			Game.draw_icon(n, "egg", Vector2(ex, ey), 20.0, Color(1, 1, 1, ea))
-	# Each dark lantern off screen: a small lantern on that edge at its height, on a faint glow. Markers on
-	# the same edge are kept apart so they never sit on top of each other.
+			var ea := 0.85 + 0.15 * sin(clock * 2.0)
+			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(ex - 46.0, ey - 70.0), Vector2(92.0, 140.0)), false, Color(1, 1, 1, 0.35 * ea))
+			n.draw_circle(Vector2(ex, ey), 19.0, Color(0.03, 0.07, 0.09, 0.6), true, -1.0, true)  # a dark disc so it reads on water and grass
+			Game.draw_icon(n, "egg", Vector2(ex, ey), 26.0, Color(1, 1, 1, ea))
+	# Each dark lantern off screen: a lantern on that edge at its height, on a dark disc and a soft glow,
+	# gently pulsing. Markers on the same edge are kept apart so they never sit on top of each other.
 	var sides := {-1: [], 1: []}
 	for l in lanterns:
 		if l["lit"]:
@@ -3376,14 +3377,16 @@ func _draw_edge_glow(n: Node2D, light: Color) -> void:
 		var marks: Array = sides[side]
 		marks.sort_custom(func(a, b): return float(a[0]) < float(b[0]))
 		for k in range(1, marks.size()):
-			marks[k][0] = maxf(float(marks[k][0]), float(marks[k - 1][0]) + 34.0)
+			marks[k][0] = maxf(float(marks[k][0]), float(marks[k - 1][0]) + 44.0)
 		var x := 0.0 if side < 0 else view_size.x
 		for mk in marks:
 			var y := float(mk[0])
-			var near := clampf(1.2 - float(mk[1]) / 700.0, 0.5, 1.0)  # a little stronger when it's close
-			var a := (0.24 + 0.07 * sin(clock * 1.2 + float(mk[2]))) * near
-			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(x - 55.0, y - 130.0), Vector2(110.0, 260.0)), false, Color(light, a))
-			Game.draw_icon(n, "lantern", Vector2(x - side * 17.0, y), 24.0, Color(light, (0.66 + 0.12 * sin(clock * 1.2 + float(mk[2]))) * near))
+			var near := clampf(1.3 - float(mk[1]) / 900.0, 0.75, 1.0)  # a little stronger when it's close
+			var pulse := 0.5 + 0.5 * sin(clock * 2.2 + float(mk[2]))
+			n.draw_texture_rect(Game.glow_tex, Rect2(Vector2(x - 60.0, y - 120.0), Vector2(120.0, 240.0)), false, Color(light, (0.32 + 0.12 * pulse) * near))
+			var c := Vector2(x - side * 24.0, y)
+			n.draw_circle(c, 20.0, Color(0.03, 0.07, 0.09, 0.6), true, -1.0, true)  # a dark disc so it reads on water and grass
+			Game.draw_icon(n, "lantern", c, 30.0, Color(light, (0.9 + 0.1 * pulse) * near))
 
 
 func _draw_ui(n: Node2D) -> void:
