@@ -1308,6 +1308,29 @@ func _sticky(from: int) -> void:
 		for l in lines:
 			c.draw_string(font, Vector2(-h * 0.84, y), l, HORIZONTAL_ALIGNMENT_LEFT, -1, size, pen)
 			y += size * 1.02
+		# Punched: this is where the confetti came from. One to three holes, anywhere (sometimes biting into
+		# the edge), clear of the curled corner; through each one the page shows, shadowed by the cut edge.
+		var holes := 1 if r.randf() < 0.55 else (2 if r.randf() < 0.65 else 3)
+		var taken: Array = []
+		for k in holes:
+			for attempt in 10:
+				var hp := Vector2(r.randf_range(-h * 0.95, h * 0.95), r.randf_range(-h * 0.8, h * 0.95))
+				if hp.x + hp.y > s * 0.55:  # not in the curl
+					continue
+				if taken.any(func(q): return (q as Vector2).distance_to(hp) < 40.0):
+					continue
+				taken.append(hp)
+				var hr := 14.0 * r.randf_range(0.95, 1.05)
+				var poly := PackedVector2Array()
+				for j in 24:
+					poly.append(hp + Vector2.from_angle(TAU * j / 24.0) * hr * (1.0 + r.randf_range(-0.03, 0.03)))
+				c.draw_colored_polygon(poly, Color(0.945, 0.94, 0.925))  # the page underneath
+				c.draw_arc(hp + Vector2(1.2, 1.6), hr - 1.4, PI * 0.85, PI * 1.85, 16, Color(0, 0, 0, 0.16), 3.0, true)  # the cut edge's shadow
+				c.draw_arc(hp, hr, 0.0, TAU, 28, col.darkened(0.18), 1.2, true)  # the note's own cut rim
+				if r.randf() < 0.5:  # a small burr where the punch dragged
+					var ba := r.randf() * TAU
+					c.draw_line(hp + Vector2.from_angle(ba) * hr, hp + Vector2.from_angle(ba + 0.15) * (hr - 2.5), col.lightened(0.15), 2.0, true)
+				break
 	under.add_child(n)
 	bits.append({"node": n, "len": g.lens[i] + 900.0})
 

@@ -177,6 +177,9 @@ var car_model := ""
 var prop_layer: Node2D
 var coins: Array = []  # {p, got}
 var flakes: Array = []  # torn paper bits flying
+var pop_t := -9.0  # when the last piece was collected (the HUD handful pops)
+var chads_up: Array = []  # collected confetti tumbling away: {p, v, a, t, dir}
+const CHAD_SIZE := 28.0  # on the road (world px)
 var words: Array = []
 var things_dirty := true
 
@@ -812,7 +815,9 @@ func _place_things(from: int) -> void:
 		var off := rng.randf_range(-0.3, 0.3)
 		for k in 5:
 			var i := mini(i0 + k * 4, road.size() - 1)
-			coins.append({"p": road[i] + Vector2.from_angle(_dir_at(i) + PI * 0.5) * off * widths[i], "got": false})
+			# hole-punch confetti, scattered a little: never quite in a neat row
+			var jit := Vector2(rng.randf_range(-7, 7), rng.randf_range(-7, 7))
+			coins.append({"p": road[i] + Vector2.from_angle(_dir_at(i) + PI * 0.5) * off * widths[i] + jit, "got": false, "v": rng.randi() % 6, "a": rng.randf() * TAU, "f": 0})
 
 
 func _pick_prop() -> String:
@@ -1289,7 +1294,13 @@ func _score(delta: float) -> void:
 			things_dirty = true
 			coins_got += 1
 			score += 25.0
+			pop_t = clock
+			chads_up.append({"p": c["p"], "v": c["v"], "a": c["a"], "t": clock, "dir": Vector2.from_angle(vdir).rotated(rng.randf_range(-0.6, 0.6))})
 			_play("coin", -6.0)
+		elif not c["got"] and int(c["f"]) == 0 and pos.distance_to(c["p"]) < CAR_R + 70.0:
+			c["f"] = 1  # the car's wind nudges it once: it turns a little on the page and settles flat
+			c["a"] = float(c["a"]) + rng.randf_range(-0.5, 0.5)
+			things_dirty = true
 
 
 ## Near misses: brushing past a desk object without touching it. (Touching is caught by the physics.)
@@ -1489,14 +1500,38 @@ func _draw_things(n: Node2D) -> void:
 		_draw_obstacle(n, o)
 	for c in coins:
 		if not c["got"]:
-			var p: Vector2 = c["p"]
-			n.draw_circle(p + Vector2(2, 3), 9.0, Color(0, 0, 0, 0.18), true, -1.0, true)
-			n.draw_circle(p, 9.0, Color("e8b730"), true, -1.0, true)
-			n.draw_circle(p, 6.0, Color("f6d55c"), true, -1.0, true)
-			n.draw_circle(p + Vector2(-2.5, -2.5), 2.2, Color(1, 1, 1, 0.7), true, -1.0, true)
+			_draw_chad(n, c["p"], int(c["v"]), 0, float(c["a"]), 1.0, 1.0, 1.0)
+
+
+## One piece of punched confetti: a soft contact shadow (further away when it's in the air), then the
+## paper at the given tumble frame.
+func _draw_chad(n: Node2D, p: Vector2, v: int, frame: int, ang: float, scale: float, alpha: float, lift: float) -> void:
+	var tex: Texture2D = _tex("chads")
+	var src := Rect2(frame * 48, v * 48, 48, 48)
+	var sz := Vector2.ONE * CHAD_SIZE / 44.0 * 48.0 * scale
+	# Curled up off the page: a tight dark shadow right under it and a wider soft one beside it.
+	var sh := Vector2(-2.5, 3.5) * lift
+	n.draw_set_transform(p + sh * 1.8, ang, Vector2(1.0, 0.85))
+	n.draw_circle(Vector2.ZERO, CHAD_SIZE * 0.56 * scale, Color(0, 0, 0, 0.07 * alpha / lift), true, -1.0, false)  # no antialiasing: it batches
+	n.draw_set_transform(p + sh, ang, Vector2(1.0, 0.85))
+	n.draw_circle(Vector2.ZERO, CHAD_SIZE * 0.46 * scale, Color(0, 0, 0, 0.17 * alpha / lift), true, -1.0, false)
+	n.draw_set_transform(p, ang, Vector2.ONE)
+	n.draw_texture_rect_region(tex, Rect2(-sz * 0.5, sz), src, Color(1, 1, 1, alpha))
+	n.draw_set_transform(Vector2.ZERO)
 
 
 func _draw_top(n: Node2D) -> void:
+	# Collected confetti: kicked up, tumbling through its 3D frames, then gone.
+	var keep: Array = []
+	for ch in chads_up:
+		var t := (clock - float(ch["t"])) / 0.6
+		if t >= 1.0:
+			continue
+		keep.append(ch)
+		var up := sin(t * PI) * 34.0
+		var p: Vector2 = Vector2(ch["p"]) + Vector2(ch["dir"]) * t * 55.0 + Vector2(0, -up)
+		_draw_chad(n, p, int(ch["v"]), int(t * 32.0) % 16, float(ch["a"]) + t * 3.0, 1.0 + 0.35 * sin(t * PI), 1.0 - smoothstep(0.6, 1.0, t), 1.0 + up * 0.08)
+	chads_up = keep
 	for f in flakes:
 		var k := (clock - float(f["t"])) / 0.9
 		var s := float(f["s"])
@@ -1548,7 +1583,17 @@ func _draw_hud(n: Node2D) -> void:
 	var sw := font.get_string_size(s, HORIZONTAL_ALIGNMENT_LEFT, -1, 46).x
 	_text(n, font, s, Vector2((view.x - sw) * 0.5, top_y + 10), 46, Color(0.15, 0.15, 0.18))
 	_text(n, font, "%d m" % int(dist), Vector2(28, top_y), 24, Color(0.2, 0.2, 0.25))
-	_text(n, font, "%d coins" % coins_got, Vector2(28, top_y + 30), 22, Color(0.62, 0.45, 0.05))
+	# the confetti collected: the little handful, then the count
+	# it pops when a piece is collected: a quick swell with a little wobble, settling back
+	var pt := clock - pop_t
+	var pop := sin(clampf(pt / 0.28, 0.0, 1.0) * PI) if pt < 0.28 else 0.0
+	var wob := sin(pt * 40.0) * 0.12 * exp(-pt * 9.0) if pt < 0.5 else 0.0
+	var ic := Vector2(45, top_y + 33)
+	var isz := 50.0 * (1.0 + 0.32 * pop)
+	n.draw_set_transform(ic, wob, Vector2.ONE)
+	n.draw_texture_rect(_tex("handful"), Rect2(Vector2(-isz, -isz) * 0.5, Vector2(isz, isz)), false)
+	n.draw_set_transform(Vector2.ZERO)
+	_text(n, font, "%d" % coins_got, Vector2(74, top_y + 44), int(30 + 6 * pop), Color(0.2, 0.2, 0.25))
 	if mult > 1:
 		var m := "x%d COMBO" % mult
 		var mw := font.get_string_size(m, HORIZONTAL_ALIGNMENT_LEFT, -1, 26).x
@@ -1593,7 +1638,7 @@ func _show_summary() -> void:
 		"Score  %d%s" % [int(score), "   NEW BEST" if int(score) > prev_best else "   best %d" % prev_best],
 		"Distance  %d m" % int(dist),
 		"Best combo  x%d" % best_combo,
-		"Coins  %d" % coins_got,
+		"Confetti  %d" % coins_got,
 	]
 	overlay = _panel("CRASHED", lines, [["Drive again", func(): again_requested.emit()], ["Home", _home]])
 
