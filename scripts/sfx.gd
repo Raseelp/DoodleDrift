@@ -52,11 +52,8 @@ func _exit_tree() -> void:
 
 func _generate() -> void:
 	# Each sound is made on its own worker (the phone's cores in parallel); this thread waits for them.
-	# Only what Doodle Drift plays (the rest were Finding Light's lake sounds; _play skips missing keys).
+	# Only the button tap: the game's other sounds are real recordings (res://sounds). _play skips missing keys.
 	var makers := [
-		["chime", _make_chime],
-		["whoosh", _make_whoosh],
-		["bump", _make_bump],
 		["tap", _make_tap],
 	]
 	var out := {}

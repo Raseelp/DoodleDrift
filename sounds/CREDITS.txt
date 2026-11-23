@@ -1,0 +1,22 @@
+Sounds (all CC0 / public domain, no credit required; listed for the record)
+
+BigSoundBank (bigsoundbank.com), recorded by Joseph Sardin, CC0:
+- squeal_loop.ogg   from "Screeching Tires #1" (ID 2368), trimmed and made to loop
+- rip_a.ogg, rip_b.ogg   from "Torn paper #2" (ID 3239) and "Torn paper #4" (ID 3241), trimmed
+- coin_1.ogg, coin_2.ogg   single clinks cut from "Coins #1" (ID 0193)
+- pencil_write.ogg   "Pencil #2" (ID 3233), not used yet
+
+Kenney "Impact Sounds" (kenney.nl), CC0 (see kenney_license.txt):
+- bump.ogg   impactWood_light_002
+- crash.ogg   impactPlate_heavy_000
+
+OpenGameArt "racing car engine sound loops" by domasx2, CC0 (https://opengameart.org/content/racing-car-engine-sound-loops),
+cut from a public-domain pdsounds.org recording; converted to mono OGG:
+- engine_generic/loop_5.ogg   (the car engine)
+
+
+OpenGameArt "Car Sound Effects Pack (Low Quality)" by GGBotNet, CC0 (https://opengameart.org/content/car-sound-effects-pack-low-quality),
+recorded on a phone; converted to mono OGG:
+- engine_more/car_engine_start_up.ogg, car_engine_turning_off.ogg, car_acceleration.ogg, car_acceleration_2.ogg   (kept for later)
+OpenGameArt "Car engine start 01" by looneybits, CC0 (https://opengameart.org/content/car-engine-start-01):
+- engine_more/start_looneybits_1.ogg, start_looneybits_2.ogg   (kept for later)

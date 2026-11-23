@@ -84,6 +84,8 @@ func _open_dev() -> void:
 	box.add_child(_choice(Drift.CARS, String(cfg.get_value("dev", "car", "evo")), "car"))
 	box.add_child(_label("Paper", 26, null, white))
 	box.add_child(_choice(Drift.PAPERS, String(cfg.get_value("dev", "paper", "white")), "paper"))
+	box.add_child(_label("Music", 26, null, white))
+	box.add_child(_choice(Drift.MUSIC_CHOICES, String(cfg.get_value("dev", "music", "shuffle")), "music"))
 	var hold := float(cfg.get_value("dev", "hold", Drift.DEFAULT_HOLD))
 	var hold_l := _label("", 26, null, white)
 	box.add_child(hold_l)

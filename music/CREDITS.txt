@@ -1,0 +1,8 @@
+Background music (all CC0 / public domain from OpenGameArt.org, no credit required; listed for the record).
+Converted to OGG Vorbis (quality 2) with metadata stripped; otherwise unchanged.
+
+- black_diamond.ogg     "Black Diamond" by Joth            https://opengameart.org/content/black-diamond
+- space_city.ogg        "Space City" by MintoDog           https://opengameart.org/content/space-city
+- awake.ogg             "Awake! (Megawall-10)" by cynicmusic  https://opengameart.org/content/awake-megawall-10
+- the_rush.ogg          "The Rush" by tebruno99            https://opengameart.org/content/the-rush
+- midnight_cruiser.ogg  "Midnight Cruiser" by Zane Little Music  https://opengameart.org/content/midnight-cruiser

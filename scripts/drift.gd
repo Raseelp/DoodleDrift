@@ -14,6 +14,7 @@ signal again_requested
 const DrawNode = preload("res://scripts/draw_node.gd")
 const Prop = preload("res://scripts/prop.gd")
 const View3D = preload("res://scripts/view3d.gd")
+const Radio = preload("res://scripts/radio.gd")
 ## Cameras, switched in the game: looking down fixed north-up, looking down turning with the car, the
 ## same but pulling in close during drifts, and a tilted view from behind the car in 3D.
 const CAMS := ["top", "follow", "close", "tilt"]
@@ -35,8 +36,18 @@ const PAPERS := {
 }
 const DEFAULT_HOLD := 0.15  # seconds a side is held before the car flicks into a drift
 
-const SPEED := 235.0  # steady: the game never speeds up, so drifts stay controllable
+const SPEED := 290.0  # top speed: only reached on a long straight (the pull fades above STRONG_PULL)
+const STRONG_PULL := 220.0  # full acceleration up to here ...
+const TOP_EASE := 0.45  # ... then it creeps towards the top (1/s): about 4 s of straight to get near 280
 const OFF_SPEED := 140.0  # across the line
+const ACCEL := 120.0  # pulling away (px/s²): from a standstill at the start, and back up after leaving the line
+const SCRUB := 220.0  # sliding sideways bleeds speed (px/s² at a full sideways slide), as a real drift does ...
+const DRIFT_FLOOR := 140.0  # ... but never below this; let go and the car pulls back up through the gears
+## Automatic gearbox: the speed (px/s) at which each gear runs out; a long straight reaches 5th.
+const GEAR_TOP := [70.0, 125.0, 185.0, 245.0, 310.0]
+const IDLE_RPM := 1000.0
+const SHIFT_RPM := 7000.0  # changes up here ...
+const PULL_RPM := 3600.0  # ... and lands about here in the next gear
 const TURN := 2.7  # how fast the nose swings in a full drift (rad/s)
 const SLIDE_TURN := 0.45  # in the light slide before a drift, the nose swings this share of TURN
 const SLIDE_GRIP := 1.3  # full drift: the rear has let go and the car slides on the way it was going
@@ -51,6 +62,35 @@ const CAR_LEN := 76.0
 const CAR_R := 17.0
 const STEP := 8.0  # road centre points this far apart
 const SAVE := "user://drift.cfg"
+## Real recordings (sounds/CREDITS.txt). Each kind has one or more takes, picked at random.
+const SOUNDS := {
+	"rip": ["res://sounds/rip_a.ogg", "res://sounds/rip_b.ogg"],
+	"coin": ["res://sounds/coin_1.ogg", "res://sounds/coin_2.ogg"],
+	"bump": ["res://sounds/bump.ogg"],
+	"crash": ["res://sounds/crash.ogg"],
+}
+## Background music (music/CREDITS.txt). The dev setting picks one, shuffles them, or turns it off.
+const TRACKS := {
+	"black_diamond": {"name": "Black Diamond (drum & bass)", "path": "res://music/black_diamond.ogg"},
+	"space_city": {"name": "Space City (synthwave)", "path": "res://music/space_city.ogg"},
+	"awake": {"name": "Awake! (breakbeat)", "path": "res://music/awake.ogg"},
+	"the_rush": {"name": "The Rush (electronic)", "path": "res://music/the_rush.ogg"},
+	"midnight_cruiser": {"name": "Midnight Cruiser (groove)", "path": "res://music/midnight_cruiser.ogg"},
+}
+const MUSIC_CHOICES := {
+	"shuffle": {"name": "Shuffle"},
+	"off": {"name": "Off"},
+	"black_diamond": {"name": "Black Diamond (drum & bass)"},
+	"space_city": {"name": "Space City (synthwave)"},
+	"awake": {"name": "Awake! (breakbeat)"},
+	"the_rush": {"name": "The Rush (electronic)"},
+	"midnight_cruiser": {"name": "Midnight Cruiser (groove)"},
+}
+## Engine sounds (dev setting while choosing by ear). Each layer is a looped real recording and the rpm it
+## was recorded at; several layers cross-fade as the revs climb. "bov": the turbo's blow-off on a change up.
+const ENGINES := {
+	"generic": {"name": "Generic", "bov": false, "layers": [["res://sounds/engine_generic/loop_5.ogg", 3000.0]]},
+}
 const MARK_POINTS := 28  # a skid or tear being drawn is handed to a still node after this many points
 
 ## Kept for the whole session: the 3D car model (slow to load) and each car sheet's measured length.
@@ -68,7 +108,7 @@ var pos := Vector2.ZERO
 var heading := -PI * 0.5
 var vdir := -PI * 0.5  # the way it is actually travelling
 var yaw := 0.0
-var speed := SPEED
+var speed := 0.0  # each run pulls away from a standstill
 var slip := 0.0
 var hold_t := 0.0
 var steer := 0.0  # the held side, eased: -1 left .. 1 right
@@ -137,6 +177,17 @@ var top: Node2D  # car, flakes, words
 var hud: Node2D
 var ui: CanvasLayer
 var overlay: Control
+var squeal: AudioStreamPlayer  # loops all run; its volume and pitch follow the slide
+var squeal_vol := 0.0
+var shots: Array[AudioStreamPlayer] = []  # a few players for one-off sounds
+var shot_i := 0
+var snd := {}
+var rip_t := -9.0
+var engine_layers: Array = []  # [player, rpm it was recorded at]
+var engine_bov := false
+var gear := 1
+var rpm := IDLE_RPM
+var shift_t := -9.0
 
 
 func _ready() -> void:
@@ -155,6 +206,7 @@ func _ready() -> void:
 		car_len_px[car["sheet"]] = _painted_width(car_tex.get_image(), car_px)
 	car_scale = CAR_LEN / maxf(8.0, float(car_len_px[car["sheet"]]))
 	_build(load(pap["tex"]))
+	_sound_setup()
 	road.append(Vector2.ZERO)
 	widths.append(150.0)
 	lens.append(0.0)
@@ -541,7 +593,7 @@ func _on_prop_hit(o: Node) -> void:
 		speed *= 0.55
 		mult = 1
 		clean_t = 0.0
-		Sfx.crash()
+		_play("bump", 0.0)
 		_word("BUMP", pos + Vector2(0, -50), Color(0.75, 0.2, 0.2))
 
 
@@ -619,6 +671,8 @@ func _process(delta: float) -> void:
 			if state == "crashed" and clock - crash_t > 1.6 and overlay == null:
 				_show_summary()
 	_effects(delta)
+	_squeal(delta)
+	_engine(delta)
 	_follow(delta)
 	_place_paper()
 	live.queue_redraw()
@@ -695,7 +749,16 @@ func _drive(delta: float) -> void:
 		mult = 1
 	# Off the line the paper drags: the car eases down (never stops) so it can be steered back, and picks up
 	# again gently once it's back between the lines.
-	speed += ((SPEED if on_road else OFF_SPEED) - speed) * (1.0 - exp(-delta * (0.9 if on_road else 0.7)))
+	var cruise := SPEED if on_road else OFF_SPEED
+	if speed < cruise:
+		if speed < STRONG_PULL or not on_road:
+			speed = move_toward(speed, minf(cruise, STRONG_PULL) if on_road else cruise, ACCEL * delta)
+		if on_road and speed >= STRONG_PULL - 0.01:
+			speed += (cruise - speed) * (1.0 - exp(-delta * TOP_EASE))
+	else:
+		speed += (cruise - speed) * (1.0 - exp(-delta * 0.7))
+	if slip > 0.15 and speed > DRIFT_FLOOR:  # the tyres scrub: a long drift drops a gear, the exit pulls back up
+		speed = maxf(DRIFT_FLOOR, speed - SCRUB * sin(minf(slip, 1.4)) * delta)
 	pos += Vector2.from_angle(vdir) * speed * delta
 	if off > half + 170.0:
 		_crash("Lost the road")
@@ -714,7 +777,7 @@ func _wheels() -> Array:
 func _marks() -> void:
 	var wheels := _wheels()
 	var sliding := slip > 0.22
-	var ripping := slip > 0.75 and speed > 180.0 and on_road
+	var ripping := slip > 0.75 and speed > 110.0  # anywhere on the sheet: off the track is the same paper
 	for k in 2:
 		var w: Vector2 = wheels[k]
 		if sliding:
@@ -741,6 +804,9 @@ func _marks() -> void:
 				ww.append(clampf(4.0 + (slip - 0.75) * 18.0, 3.0, 11.0))
 				t["pts"] = tp
 				t["w"] = ww
+				if clock - rip_t > 0.3:  # the paper keeps tearing: a fresh rip every so often
+					rip_t = clock
+					_play("rip", -3.0, 0.9 + slip * 0.15)
 				if rng.randf() < 0.6:  # torn bits of paper kick up
 					flakes.append({"p": w, "v": Vector2.from_angle(vdir + PI + rng.randf_range(-1.0, 1.0)) * rng.randf_range(40, 120), "t": clock, "a": rng.randf() * TAU, "s": rng.randf_range(2.5, 5.0)})
 				if tp.size() >= MARK_POINTS:  # carry on seamlessly in a fresh piece
@@ -774,6 +840,123 @@ func _still(fn: Callable, p: Vector2) -> void:
 	still_marks.append({"node": n, "p": p})
 
 
+# ---------------------------------------------------------------- sound
+
+func _sound_setup() -> void:
+	for k in SOUNDS:
+		snd[k] = (SOUNDS[k] as Array).map(func(p): return load(p))
+	squeal = AudioStreamPlayer.new()
+	var loop: AudioStreamOggVorbis = (load("res://sounds/squeal_loop.ogg") as AudioStreamOggVorbis).duplicate()
+	loop.loop = true
+	squeal.stream = loop
+	squeal.volume_db = -80.0
+	add_child(squeal)
+	squeal.play()
+	for i in 5:
+		var p := AudioStreamPlayer.new()
+		add_child(p)
+		shots.append(p)
+	var eng: Dictionary = ENGINES.get(String(_load().get_value("dev", "engine", "generic")), ENGINES["generic"])
+	engine_bov = eng["bov"]
+	for layer in eng["layers"]:
+		var p := AudioStreamPlayer.new()
+		var st: AudioStreamOggVorbis = (load(layer[0]) as AudioStreamOggVorbis).duplicate()
+		st.loop = true
+		p.stream = st
+		p.volume_db = -80.0
+		add_child(p)
+		p.play()
+		engine_layers.append([p, float(layer[1])])
+	_radio()
+
+
+## The music is a session-long radio (radio.gd) on the root, so it carries on across runs.
+func _radio() -> void:
+	var pick := String(_load().get_value("dev", "music", "shuffle"))
+	var r: Node = get_tree().root.get_node_or_null("Radio")
+	if r == null:
+		r = Radio.new()
+		r.name = "Radio"
+		get_tree().root.add_child(r)
+		var paths := {}
+		for k in TRACKS:
+			paths[k] = TRACKS[k]["path"]
+		r.off = pick == "off" or not Game.music_on
+		r.setup(paths, pick)
+	else:
+		r.choose(pick)
+
+
+func _play(kind: String, db: float, pitch := 1.0) -> void:
+	if not Game.sound_on:
+		return
+	var p := shots[shot_i]
+	shot_i = (shot_i + 1) % shots.size()
+	var takes: Array = snd[kind]
+	p.stream = takes[rng.randi() % takes.size()]
+	p.volume_db = db
+	p.pitch_scale = pitch * rng.randf_range(0.94, 1.06)  # never quite the same twice
+	p.play()
+
+
+## Tyres: silent while gripping, rising in and out with the slide (and softer as the car slows). Higher
+## pitched the harder it slides.
+func _squeal(delta: float) -> void:
+	var want := 0.0
+	if state == "play" and Game.sound_on:
+		want = smoothstep(0.15, 0.9, slip) * clampf(speed / SPEED, 0.3, 1.0)
+	squeal_vol = move_toward(squeal_vol, want, delta * 3.0)
+	squeal.volume_db = linear_to_db(maxf(squeal_vol, 0.0001)) - 6.0
+	squeal.pitch_scale = 0.85 + 0.3 * clampf(slip / 1.2, 0.0, 1.0)
+
+
+## An automatic gearbox: the revs climb through each gear with speed, it changes up near the top and down
+## when the car slows (off the line), and in a drift the revs flare because the rear wheels spin. The rev
+## needle eases rather than jumps, so a change up is a quick fall and a change down a quick rise; the
+## throttle lifts for a moment at each change. One engine recording is pitched to the revs.
+func _engine(delta: float) -> void:
+	var lo := 0.0 if gear == 1 else float(GEAR_TOP[gear - 2])
+	var hi := float(GEAR_TOP[gear - 1])
+	if speed > hi and gear < GEAR_TOP.size():
+		gear += 1
+		shift_t = clock
+		if engine_bov and state == "play":
+			_play("bov", -8.0)  # the turbo dumps its boost as the throttle lifts for the change
+	elif gear > 1 and speed < lo - 12.0:
+		gear -= 1
+		shift_t = clock
+	lo = 0.0 if gear == 1 else float(GEAR_TOP[gear - 2])
+	hi = float(GEAR_TOP[gear - 1])
+	var t := clampf((speed - lo) / (hi - lo), 0.0, 1.0)
+	var want := lerpf(IDLE_RPM * 1.6 if gear == 1 else PULL_RPM, SHIFT_RPM, t)
+	if state == "play":
+		want += drift_amt * clampf(slip / 0.8, 0.0, 1.0) * 1800.0  # wheelspin in the slide
+	else:
+		want = IDLE_RPM * 1.2  # crashed: off the throttle, settling to idle
+	want = minf(want, 7800.0)
+	rpm += (want - rpm) * (1.0 - exp(-delta * 9.0))
+	var lift := smoothstep(0.0, 0.18, clock - shift_t)  # throttle lifts for the change, then back on
+	var load_k := 1.0 if state == "play" else 0.5
+	var vol := (0.55 + 0.45 * clampf((rpm - IDLE_RPM) / (SHIFT_RPM - IDLE_RPM), 0.0, 1.0)) * lerpf(0.55, 1.0, lift) * load_k
+	if not Game.sound_on:
+		vol = 0.0
+	# Each layer plays nearest the revs it was recorded at, fading into its neighbours.
+	var n := engine_layers.size()
+	for k in n:
+		var p: AudioStreamPlayer = engine_layers[k][0]
+		var base: float = engine_layers[k][1]
+		var w := 1.0
+		if n > 1:
+			var below: float = engine_layers[k - 1][1] if k > 0 else -INF
+			var above: float = engine_layers[k + 1][1] if k < n - 1 else INF
+			if rpm < base and k > 0:
+				w = clampf((rpm - below) / (base - below), 0.0, 1.0)
+			elif rpm > base and k < n - 1:
+				w = clampf((above - rpm) / (above - base), 0.0, 1.0)
+		p.volume_db = linear_to_db(maxf(vol * sqrt(w), 0.0001)) - 10.0  # equal-power fade
+		p.pitch_scale = clampf(rpm / base, 0.35, 3.0)
+
+
 # ---------------------------------------------------------------- scoring and hits
 
 func _score(delta: float) -> void:
@@ -794,7 +977,7 @@ func _score(delta: float) -> void:
 			things_dirty = true
 			coins_got += 1
 			score += 25.0
-			Sfx.chime(1.6)
+			_play("coin", -6.0)
 
 
 ## Near misses: brushing past a desk object without touching it. (Touching is caught by the physics.)
@@ -815,7 +998,7 @@ func _crash(why: String) -> void:
 	state = "crashed"
 	crash_t = clock
 	spin = 9.0 * (1.0 if rng.randf() < 0.5 else -1.0)
-	Sfx.crash()
+	_play("crash", 0.0)
 	Game.vibrate(70)
 	_word(why.to_upper(), pos + Vector2(0, -60), Color(0.75, 0.2, 0.2))
 	prev_best = int(_load().get_value("best", "score", 0))
