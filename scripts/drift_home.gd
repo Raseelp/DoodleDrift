@@ -39,6 +39,8 @@ func _ready() -> void:
 	play.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	play.add_theme_font_override("font", Game.title_font)
 	play.add_theme_font_size_override("font_size", 40)
+	for c in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
+		play.add_theme_color_override(c, Color(0.12, 0.12, 0.15))  # dark ink on the paper (temporary, UI comes later)
 	play.pressed.connect(func():
 		Sfx.tap()
 		play_requested.emit())
@@ -48,6 +50,8 @@ func _ready() -> void:
 	dev_btn.custom_minimum_size = Vector2(240, 64)
 	dev_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	dev_btn.add_theme_font_size_override("font_size", 24)
+	for c in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
+		dev_btn.add_theme_color_override(c, Color(0.12, 0.12, 0.15))  # dark ink on the paper (temporary, UI comes later)
 	dev_btn.pressed.connect(_open_dev)
 	box.add_child(dev_btn)
 

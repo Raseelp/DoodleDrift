@@ -8,9 +8,16 @@ In the order to work through them. Items marked **plan** start with research and
 - **Rips continue off the track.** Built.
 - **Engine sound:** generic engine is the default (Raseel liked it best). Dev "Engine sound" lists generic pitch variants, two phone-recorded cars and the performance-car options. Drifts now scrub speed (floor 140 px/s), so long drifts drop to 3rd and the exit shifts back up: needs a feel test. Start-up, turn-off and acceleration clips are kept in sounds/engine_more for later.
 
+## Built 2026-11-23, needs a look on the phone
+
+- **Realistic drawing, phases 1-2:** pencil strokes with pressure, grain, overshoots, lifted gaps, re-traced passes, palm smudges; page life (coffee rings, fold creases, torn binding edge with holes and page number, staples, show-through writing).
+- **Phase 3 built (scripts/scribbles.gd):** procedural writers, grammar notes with no-repeat memory, rally calls (rare), life notes (lists, sums, phone numbers), 14 doodle algorithms, ghost roads, oops corrections, sticky notes.
+- **Still to do (phase 4):** ink rules (red = out if fully past, highlighter bonus zones, blue clipping dots, crayon fill = slick, ink puddles with shine and coloured skids, pen-colour chapters with travelling handwritten explanations).
+
 ## Next
 
-1. **Driftable track design (plan).** Make the procedurally generated track itself good for drifting.
+1. **Driftable track design: built 2026-11-23, needs a feel test.** See docs/track-design-report.md. Eased corners sized from the car, run-ups, left-right links, phrases (calm/build/peak/release), corner records for scoring.
+   Old plan notes: Make the procedurally generated track itself good for drifting.
    - Research real drift tracks (for example Ebisu, Meihan, Irwindale, D1/Formula Drift layouts) and drift games: corner types, entry and exit lengths, linking corners into a flowing chain, transitions (left to right), clipping points and zones, widths, how difficulty rises.
    - Write down the design principles, then rebuild the generator around them.
    - Only the track itself for now; the area outside the track comes later (item 8).
