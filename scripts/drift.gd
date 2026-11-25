@@ -17,6 +17,7 @@ const Radio = preload("res://scripts/radio.gd")
 const Scribbles = preload("res://scripts/scribbles.gd")
 const Inks = preload("res://scripts/inks.gd")
 const TyreFx = preload("res://scripts/tyre_fx.gd")
+const StartPage = preload("res://scripts/start_page.gd")
 const PROP_NAMES := {"pencil_blue": "pencil", "pencil_white": "pencil", "set_square": "set square"}
 ## Desk objects that lie across or beside the road, and how often each turns up.
 const PROP_WEIGHTS := {"pencil": 2.0, "pencil_blue": 1.5, "pencil_white": 1.5, "ruler": 1.5, "scissors": 1.2, "set_square": 1.0, "sharpener": 1.2, "eraser": 1.5, "clip": 1.0}
@@ -119,7 +120,13 @@ static var car_len_px := {}
 var rng := RandomNumberGenerator.new()
 var view := Vector2.ZERO
 var clock := 0.0
-var state := "play"  # play, crashed, summary
+var state := "play"  # home, play, crashed, summary
+var start_home := false  # set before adding: begin parked at the start line, the home screen (start_page.gd)
+var start_page: StartPage
+var hold_lock := false  # the start hold is being ignored (see _input_side)
+var home_hold := 0.0  # how long a side has been held on the start page (a short hold starts the run)
+const HOLD_TO_START := 0.25
+var pause_btn: Button
 var hold_delay := DEFAULT_HOLD
 
 # The car
@@ -279,6 +286,17 @@ func _ready() -> void:
 	pos = road[2]
 	prev_y = pos.y
 	cam_goal_pos = pos
+	if start_home:
+		state = "home"
+		pause_btn.visible = false
+		start_page = StartPage.new()
+		add_child(start_page)
+		start_page.setup(self)  # puts the car into its tricks at the meet
+		prev_y = pos.y
+		cam.zoom = Vector2.ONE * start_page.start_zoom  # the settings view after a rebuild, else the page
+		cam_goal_zoom = cam.zoom.x
+		cam.position = start_page.start_cam
+		cam_goal_pos = cam.position
 
 
 # ---------------------------------------------------------------- nodes
@@ -345,10 +363,10 @@ func _build(paper_tex: Texture2D) -> void:
 	hud = DrawNode.new()
 	hud.draw_fn = _draw_hud
 	root.add_child(hud)
-	var pause := Game.square_button(Game.icon("pause"), 64, 26)
-	pause.position = Vector2(view.x - 24 - 64, _top() + 14)
-	pause.pressed.connect(_pause)
-	root.add_child(pause)
+	pause_btn = Game.square_button(Game.icon("pause"), 64, 26)
+	pause_btn.position = Vector2(view.x - 24 - 64, _top() + 14)
+	pause_btn.pressed.connect(_pause)
+	root.add_child(pause_btn)
 
 
 func _top() -> float:
@@ -991,6 +1009,14 @@ func _track() -> void:
 func _process(delta: float) -> void:
 	clock += delta
 	match state:
+		"home":
+			start_page.update(delta)
+			home_hold = home_hold + delta if _input_side() != 0 and start_page.mode == "home" and overlay == null else 0.0
+			if home_hold >= HOLD_TO_START:  # held a side: the car breaks off its tricks for the start line
+				state = "intro"
+				start_page.begin_exit(road[2])
+		"intro":
+			_intro(delta)
 		"play":
 			_drive(delta)
 			_track()
@@ -1006,6 +1032,8 @@ func _process(delta: float) -> void:
 			if state == "crashed" and clock - crash_t > 1.6 and overlay == null:
 				_show_summary()
 	_effects(delta)
+	if start_page != null and start_page.mode == "gone":
+		start_page.after(delta)  # the drone heads back to the pit
 	fx.step(delta)
 	inks.update()
 	_squeal(delta)
@@ -1028,20 +1056,34 @@ func _input_side() -> int:
 		t += 1
 	for id in touches:
 		t += -1 if float(touches[id]) < view.x * 0.5 else 1
+	if hold_lock:  # the hold that started the run is not steering: ignored until it is let go
+		if t != 0:
+			return 0
+		hold_lock = false
 	return clampi(t, -1, 1)
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	var page := state == "home" and start_page != null
 	if event is InputEventScreenTouch:
 		if event.pressed:
+			if page and start_page.tap(get_viewport().get_canvas_transform().affine_inverse() * event.position):
+				return  # the gear or a setting: not a hold to start
 			touches[event.index] = event.position.x
 		else:
 			touches.erase(event.index)
+			if page:
+				start_page.release()
 	elif event is InputEventScreenDrag:
-		touches[event.index] = event.position.x
+		if page:
+			start_page.drag(get_viewport().get_canvas_transform().affine_inverse() * event.position)
+		if touches.has(event.index):
+			touches[event.index] = event.position.x
 
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		_back()
 	if what in [NOTIFICATION_APPLICATION_FOCUS_OUT, NOTIFICATION_APPLICATION_PAUSED]:
 		if state == "play" and overlay == null:
 			_pause()
@@ -1118,13 +1160,45 @@ func _steer_classic(delta: float) -> void:
 		speed = maxf(DRIFT_FLOOR, speed - SCRUB * sin(minf(slip, 1.4)) * delta)
 
 
+## How far a point is from the road's centre line (nearest centre point around index i).
+func _off_line(p: Vector2, i: int) -> float:
+	var best := INF
+	for j in range(maxi(0, i - 4), mini(road.size(), i + 5)):
+		best = minf(best, p.distance_squared_to(road[j]))
+	return sqrt(best)
+
+
+## A dev setting changed on the start page: applied straight away (handling waits for the page to be redrawn).
+func apply_dev(key: String, value: Variant) -> void:
+	match key:
+		"paper":
+			paper.texture = load(PAPERS.get(String(value), PAPERS["white"])["tex"])
+		"car":
+			var car: Dictionary = CARS.get(String(value), CARS["evo"])
+			car_tex = load(car["sheet"])
+			car_px = int(car["px"])
+			if not car_len_px.has(car["sheet"]):
+				car_len_px[car["sheet"]] = _painted_width(car_tex.get_image(), car_px)
+			car_scale = CAR_LEN / maxf(8.0, float(car_len_px[car["sheet"]]))
+		"crash":
+			crash_on_hit = bool(value)
+		"hold":
+			hold_delay = float(value)
+		"music":
+			_radio()
+
+
 ## What both handling models share: staying on the line, speed, moving, page edges and the ways out.
 func _move(delta: float) -> void:
 	var i := progress_i
 	var half := widths[i] * 0.5
-	var off := pos.distance_to(road[i])
+	var off := pos.distance_to(road[i])  # the car itself: red lines and losing the road go by this
+	# The meet below the start line is open ground: coming out of it under your own control is no penalty.
+	var in_lot := start_page != null and progress_i < 8 and pos.y > -6.0 and absf(pos.x) < 420.0
+	# Only the rear tyres count for slowing: the paper drags once both of them are past the edge.
+	var wh := _wheels()
 	var was := on_road
-	on_road = off < half - CAR_R * 0.4
+	on_road = in_lot or _off_line(wh[0], i) < half or _off_line(wh[1], i) < half
 	if was and not on_road:
 		_word("LINE", pos, Color(0.35, 0.35, 0.4))
 		clean_t = 0.0
@@ -1141,6 +1215,8 @@ func _move(delta: float) -> void:
 		speed += (cruise - speed) * (1.0 - exp(-delta * 0.7))
 	pos += Vector2.from_angle(vdir) * speed * delta
 	_seam_bump()
+	if in_lot:
+		return
 	if off > half + 34.0 and inks.red_here(lens[i]):  # fully over a red line
 		inks.mark_out(pos)
 		_crash("Over the red line")
@@ -1350,7 +1426,7 @@ func _play(kind: String, db: float, pitch := 1.0) -> void:
 ## Tyres: silent while gripping, rising in and out with the slide (and softer as the car slows). Higher
 ## pitched the harder it slides.
 func _squeal(delta: float) -> void:
-	var on := state == "play" and Game.sound_on
+	var on := (_driving() or state == "home") and Game.sound_on
 	var spd := clampf(speed / SPEED, 0.3, 1.0)
 	wob += delta
 	var w := sin(wob * 1.7) * 0.025 + sin(wob * 4.3 + 1.0) * 0.015
@@ -1361,6 +1437,8 @@ func _squeal(delta: float) -> void:
 	scrub.pitch_scale = 0.9 + 0.15 * clampf(speed / SPEED, 0.0, 1.0) + w
 	# The squeal: a real drift. It comes in at the pace of the slide and tails off slower as grip returns.
 	var want := smoothstep(0.15, 0.9, slip) * spd if on else 0.0  # the original squeal, at the quieter level
+	if state == "home":
+		want *= 0.5  # the tricks at the meet, a little further off
 	squeal_vol = move_toward(squeal_vol, want, delta * 3.0)
 	squeal.volume_db = linear_to_db(maxf(squeal_vol, 0.0001)) - 11.0
 	squeal.pitch_scale = 0.85 + 0.3 * clampf(slip / 1.2, 0.0, 1.0)
@@ -1388,7 +1466,7 @@ func _engine(delta: float) -> void:
 	if speed > hi and gear < GEAR_TOP.size():
 		gear += 1
 		shift_t = clock
-		if engine_bov and state == "play":
+		if engine_bov and _driving():
 			_play("bov", -8.0)  # the turbo dumps its boost as the throttle lifts for the change
 	elif gear > 1 and speed < lo - 12.0:
 		gear -= 1
@@ -1397,14 +1475,14 @@ func _engine(delta: float) -> void:
 	hi = float(GEAR_TOP[gear - 1])
 	var t := clampf((speed - lo) / (hi - lo), 0.0, 1.0)
 	var want := lerpf(IDLE_RPM * 1.6 if gear == 1 else PULL_RPM, SHIFT_RPM, t)
-	if state == "play":
+	if _driving() or state == "home":  # the tricks on the start page rev it too
 		want += drift_amt * clampf(slip / 0.8, 0.0, 1.0) * 1800.0  # wheelspin in the slide
 	else:
 		want = IDLE_RPM * 1.2  # crashed: off the throttle, settling to idle
 	want = minf(want, 7800.0)
 	rpm += (want - rpm) * (1.0 - exp(-delta * 9.0))
 	var lift := smoothstep(0.0, 0.18, clock - shift_t)  # throttle lifts for the change, then back on
-	var load_k := 1.0 if state == "play" else 0.5
+	var load_k := 1.0 if _driving() else (0.6 if state == "home" else 0.5)
 	var vol := (0.55 + 0.45 * clampf((rpm - IDLE_RPM) / (SHIFT_RPM - IDLE_RPM), 0.0, 1.0)) * lerpf(0.55, 1.0, lift) * load_k
 	if not Game.sound_on:
 		vol = 0.0
@@ -1503,9 +1581,35 @@ func _effects(delta: float) -> void:
 
 ## The one camera: top down, north up, a little ahead of the car, zoomed to show the road coming up. If a
 ## note or drawing sits beside that stretch, it zooms out enough to show all of it rather than cut it off.
+## Driving: the run itself, or the drive out of the bay before it.
+func _driving() -> bool:
+	return state == "play" or state == "intro"
+
+
+## The car breaks off its tricks and sweeps to the start line (start_page.gd drives it), then the run is
+## the player's: it carries on exactly as it is moving, the slide's swing included.
+func _intro(delta: float) -> void:
+	var done := start_page.drive_exit(delta)
+	_marks()
+	if done or start_page.can_take_over(road[2]):  # as soon as it has turned out of the donuts, it's yours
+		state = "play"
+		slip_v = start_page.driver.slip_v
+		hold_lock = true  # still holding from the start: no drift (and no scrub) until that hold is let go
+		prev_y = pos.y
+		pause_btn.visible = true
+		start_page.leave()
+
+
 func _follow(delta: float) -> void:
 	cam_rot = 0.0
 	Prop.view_rot = 0.0
+	if state == "home":
+		# the start page (or its settings), eased; from the drive out on, the follow below eases on from it
+		cam_goal_pos = start_page.cam_pos
+		cam.position = cam.position.lerp(cam_goal_pos, 1.0 - exp(-delta * 3.5))
+		cam_goal_zoom = cam.zoom.x + (start_page.cam_zoom - cam.zoom.x) * (1.0 - exp(-delta * 3.5))
+		cam.zoom = Vector2.ONE * cam_goal_zoom
+		return
 	var lo := pos
 	var hi := pos
 	for i in range(progress_i, mini(road.size(), progress_i + 70), 5):
@@ -1739,6 +1843,8 @@ func _draw_obstacle(n: Node2D, o: Dictionary) -> void:
 
 
 func _draw_hud(n: Node2D) -> void:
+	if state in ["home", "intro"]:
+		return
 	var font: Font = Game.heading_font
 	var top_y := _top() + 46.0
 	var s := "%d" % int(score)
@@ -1760,11 +1866,6 @@ func _draw_hud(n: Node2D) -> void:
 		var m := "x%d COMBO" % mult
 		var mw := font.get_string_size(m, HORIZONTAL_ALIGNMENT_LEFT, -1, 26).x
 		_text(n, font, m, Vector2((view.x - mw) * 0.5, top_y + 46), 26, Color(0.85, 0.35, 0.15))
-	if state == "play" and dist < 25.0:
-		for k in 2:
-			var h: String = ["Hold left or right to drift that way.", "Let go to straighten. Stay between the lines."][k]
-			var hw := font.get_string_size(h, HORIZONTAL_ALIGNMENT_LEFT, -1, 24).x
-			_text(n, font, h, Vector2((view.x - hw) * 0.5, view.y * 0.72 + k * 34), 24, Color(0.2, 0.2, 0.25))
 
 
 func _text(n: Node2D, font: Font, s: String, p: Vector2, size: int, col: Color) -> void:
@@ -1773,6 +1874,77 @@ func _text(n: Node2D, font: Font, s: String, p: Vector2, size: int, col: Color) 
 
 
 # ---------------------------------------------------------------- pause and summary
+
+## The phone's back button: in a run it pauses (paused, hold to start again); on the start page it closes
+## the settings if they are open, else asks before quitting. (The proper screens come with the UI phases.)
+func _back() -> void:
+	match state:
+		"play":
+			if overlay == null:
+				get_tree().paused = true
+				overlay = HoldToGo.new()
+				overlay.on_done = func():
+					_resume()
+					hold_lock = true  # the hold that started it again is not steering
+				ui.add_child(overlay)
+		"home":
+			if overlay != null:  # back again on the question: stay
+				_stay()
+			elif start_page.mode == "settings":
+				start_page._close()
+			else:
+				overlay = _panel("QUIT?", ["Do you want to quit?"], [["Quit", func(): get_tree().quit()], ["Stay", _stay]])
+
+
+func _stay() -> void:
+	if overlay:
+		overlay.queue_free()
+	overlay = null
+
+
+## Paused from the back button: "paused", and holding anywhere for a moment starts again.
+class HoldToGo extends Control:
+	const HOLD := 0.25
+	var on_done: Callable
+	var held := 0.0
+	var down := 0  # fingers on the screen
+
+	func _ready() -> void:
+		process_mode = Node.PROCESS_MODE_ALWAYS
+		mouse_filter = Control.MOUSE_FILTER_STOP
+		size = get_viewport_rect().size
+		var dim := ColorRect.new()
+		dim.color = Color(0.05, 0.05, 0.06, 0.6)
+		dim.size = size
+		dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		add_child(dim)
+		var box := VBoxContainer.new()
+		box.alignment = BoxContainer.ALIGNMENT_CENTER
+		box.add_theme_constant_override("separation", 18)
+		box.size = size
+		box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		add_child(box)
+		for t in [["PAUSED", 60], ["hold to start", 30]]:
+			var l := Label.new()
+			l.text = t[0]
+			l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			l.add_theme_font_size_override("font_size", t[1])
+			if t[1] == 60:
+				l.add_theme_font_override("font", Game.title_font)
+			box.add_child(l)
+
+	func _gui_input(e: InputEvent) -> void:
+		if e is InputEventScreenTouch:
+			down = maxi(0, down + (1 if e.pressed else -1))
+
+	func _process(delta: float) -> void:
+		var holding := down > 0 or Input.is_action_pressed("ui_left") or Input.is_action_pressed("ui_right")
+		held = held + delta if holding else 0.0
+		if held >= HOLD and on_done.is_valid():
+			var f := on_done
+			on_done = Callable()  # once
+			f.call()
+
 
 func _pause() -> void:
 	if overlay != null or state != "play":

@@ -1,7 +1,7 @@
 extends Node
-## Switches between the Doodle Drift title screen and a run.
+## Starts Doodle Drift: home is the start line of a fresh page (drift.gd with start_home), and a run goes
+## straight on from there. "Drive again" starts a new run directly.
 
-const Home = preload("res://scripts/drift_home.gd")
 const Drift = preload("res://scripts/drift.gd")
 
 var current: Node
@@ -12,13 +12,12 @@ func _ready() -> void:
 
 
 func show_home() -> void:
-	var h := Home.new()
-	h.play_requested.connect(start_run)
-	_swap(h)
+	start_run(true)
 
 
-func start_run() -> void:
+func start_run(home := false) -> void:
 	var s: Node = Drift.new()
+	s.start_home = home
 	s.home_requested.connect(show_home)
 	s.again_requested.connect(start_run)
 	_swap(s)
