@@ -5,6 +5,7 @@ extends SubViewport
 
 signal done
 
+var tilt_deg := 35.0  # camera tilt in degrees (0 = straight down); was the old game's boat camera setting
 const VIEW := 6.0  # how much of the model the camera sees (model units, after fitting)
 
 ## Baked rings of pictures, kept for the whole session: model path -> frames.
@@ -27,8 +28,8 @@ func _ready() -> void:
 	var cam := Camera3D.new()
 	cam.projection = Camera3D.PROJECTION_ORTHOGONAL
 	cam.size = VIEW
-	var tilt := deg_to_rad(Game.boat_tilt)
-	cam.rotation_degrees = Vector3(-90.0 + Game.boat_tilt, 0, 0)
+	var tilt := deg_to_rad(tilt_deg)
+	cam.rotation_degrees = Vector3(-90.0 + tilt_deg, 0, 0)
 	cam.position = Vector3(0, 20.0 * cos(tilt), 20.0 * sin(tilt))
 	cam.far = 60.0
 	add_child(cam)
