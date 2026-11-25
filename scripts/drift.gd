@@ -16,6 +16,7 @@ const Prop = preload("res://scripts/prop.gd")
 const Radio = preload("res://scripts/radio.gd")
 const Scribbles = preload("res://scripts/scribbles.gd")
 const Inks = preload("res://scripts/inks.gd")
+const TyreFx = preload("res://scripts/tyre_fx.gd")
 const PROP_NAMES := {"pencil_blue": "pencil", "pencil_white": "pencil", "set_square": "set square"}
 ## Desk objects that lie across or beside the road, and how often each turns up.
 const PROP_WEIGHTS := {"pencil": 2.0, "pencil_blue": 1.5, "pencil_white": 1.5, "ruler": 1.5, "scissors": 1.2, "set_square": 1.0, "sharpener": 1.2, "eraser": 1.5, "clip": 1.0}
@@ -198,6 +199,7 @@ var car_model := ""
 var prop_layer: Node2D
 var coins: Array = []  # {p, got}
 var flakes: Array = []  # torn paper bits flying
+var fx: TyreFx  # smoke and rubber while sliding, graphite and eraser crumbs while tearing (tyre_fx.gd)
 var pop_t := -9.0  # when the last piece was collected (the HUD handful pops)
 var chads_up: Array = []  # collected confetti tumbling away: {p, v, a, t, dir}
 const CHAD_SIZE := 28.0  # on the road (world px)
@@ -307,6 +309,8 @@ func _build(paper_tex: Texture2D) -> void:
 	live = DrawNode.new()
 	live.draw_fn = _draw_live
 	world.add_child(live)
+	fx = TyreFx.new()
+	world.add_child(fx)
 	things = DrawNode.new()
 	things.draw_fn = _draw_things
 	world.add_child(things)
@@ -326,6 +330,7 @@ func _build(paper_tex: Texture2D) -> void:
 	top.draw_fn = _draw_top
 	top.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 	world.add_child(top)
+	world.add_child(fx.over)
 	cam = Camera2D.new()
 	add_child(cam)
 	cam.make_current()
@@ -1001,6 +1006,7 @@ func _process(delta: float) -> void:
 			if state == "crashed" and clock - crash_t > 1.6 and overlay == null:
 				_show_summary()
 	_effects(delta)
+	fx.step(delta)
 	inks.update()
 	_squeal(delta)
 	_engine(delta)
@@ -1233,6 +1239,7 @@ func _marks() -> void:
 					live_tear[k] = {"pts": PackedVector2Array([tp[tp.size() - 2], w]), "w": PackedFloat32Array([ww[ww.size() - 2], ww[ww.size() - 1]]), "seed": t["seed"] + 7.0, "joined": true}
 		elif live_tear[k] != null:
 			_still_tear(k, true)
+	fx.emit(get_process_delta_time(), [wheels[0], wheels[1]], vdir, speed, slip, SPEED, skid_on[0], ripping)
 
 
 func _still_skid(k: int) -> void:
