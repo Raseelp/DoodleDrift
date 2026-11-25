@@ -4,14 +4,16 @@ In the order to work through them. Items marked **plan** start with research and
 
 ## Built, needs a test on the phone
 
+- **Skids:** dark, unbroken marks from all four tyres (rears darker); old marks cleared once off screen.
 - **Sound:** tyre squeal follows the slide, paper rips, coins, bump and crash; radio-style music that shuffles and crossfades across runs; engine (Generic 6) with a 5-gear automatic, drift speed scrub (floor 140) and launch from standstill. Spare clips kept in sounds/ for later.
 - **Track:** drift-focused generator (docs/track-design-report.md), top speed 330 on long straights.
 - **Drawing, phases 1-3:** pencil-stroke road edges; notebook page (coffee rings, creases, torn binding edges with punched holes the car drops into, page numbers, staples, show-through); the narrator's notes, doodles, drawings, memes, ghost roads, oops corrections and sticky notes (scripts/scribbles.gd), varied by the mixer and saved decks.
+- **Handling:** flow mode (always drifting, pendulum switches, wider road) is the default; classic hold-to-drift is in dev settings.
 - **Camera:** single top-down camera that eases its zoom to fit notes beside the road.
 
 ## Next
 
-1. **Phase 4: ink rules.** Red ink = out if the car goes completely past it; highlighter bonus zones; blue clipping dots; crayon fill inside and outside the road = slick; ink puddles with shine and coloured skids; pen-colour chapters announced by handwritten notes that travel beside the track, then fade. Sticky notes can teach these.
+1. **Phase 4: ink rules - built 2026-11-25 (scripts/inks.gd), needs a phone test.** On: pen-colour chapters at page edges, red ink = out if the car goes completely past it, clipping cones in marked chapters, travelling notes that teach each rule once. Off until Raseel asks (code kept): highlighter bonus zones, crayon (slick), ink puddles. The narrator is off too (NARRATOR in scribbles.gd).
 2. **UI design system: the UI lives on the paper (plan).** Tutorial drawn beside the track (two fingers either side of the road with a handwritten note); Play, dev settings, mode select and garage as objects or handwriting near the track; the style rules for all of it.
 3. **Gameplay loop, modes and engagement (plan).** What makes a run fun, what brings players back, which modes to have.
 4. **Paper zones.** The sheet changes as you drive (white, sketch, kraft, recycled, maybe sticky notes or crumpled paper), with a seam or torn edge between zones.

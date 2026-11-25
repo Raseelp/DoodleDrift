@@ -6,6 +6,7 @@ extends Node2D
 ## (saved between sessions) so the same one doesn't turn up again.
 
 const DrawNode = preload("res://scripts/draw_node.gd")
+const NARRATOR := false  # the narrator's notes are switched off for now (Raseel will say when to bring them back)
 const FONTS := ["res://fonts/hand/Caveat.ttf", "res://fonts/hand/PatrickHand.ttf", "res://fonts/hand/GochiHand.ttf", "res://fonts/hand/ReenieBeanie.ttf"]
 const PENS := [  # colour, stroke width, weight
 	[Color(0.2, 0.2, 0.23, 0.82), 2.0, 5.0],  # pencil
@@ -29,22 +30,14 @@ const G := {
 		"this bit was straight until the coffee happened",
 		"if you're reading this you're not looking at the road",
 		"bold of you to assume i planned this",
-		"drifting is just crashing with confidence",
 		"i'd say take it easy but we both know",
 		"it gets wider later. (it doesn't)",
 		"stay inside the lines, said every teacher i ignored",
 		"i drew the road around the stain, not the other way round",
 		"left. no, the other left.",
 		"sideways is a direction if you're stubborn enough",
-		"yes, you. the one holding the phone. hi.",
 		"you're steering a drawing of a car. we're both doing great.",
 		"plot twist: there's no finish line",
-		"i'm the narrator. i also drew the road. i'm doing a lot.",
-		"this is the part of the film where the music swells. imagine it.",
-		"fun fact: you can't actually see me. i can see you though. nice thumbs.",
-		"if this were a movie i'd be played by someone taller",
-		"you've read more of my notes than she ever did",
-		"the road is fake. the feelings are real. carry on.",
 		"nobody's coming to fix this corner. that includes me.",
 		"i'd put a barrier here but i'm out of {thing}",
 	],
@@ -54,10 +47,8 @@ const G := {
 		"too tight? probably. leaving it.",
 		"redo this one ~tomorrow~ never",
 		"this corner is why i don't draw maps",
-		"hairpin. the hair is mine. pulled out.",
 		"i turned the page halfway through this one",
 		"sharp. like my landlord's emails.",
-		"u-turn. like my career.",
 	],
 	"long": [
 		"long one. pack a snack.",
@@ -67,7 +58,6 @@ const G := {
 		"long enough to regret starting it",
 	],
 	"switch": [
-		"left right left. like my opinions.",
 		"wiggly bit. the pen slipped. twice.",
 		"drew this on the bus. over speed bumps.",
 		"zigzag, like my sleep schedule",
@@ -77,25 +67,20 @@ const G := {
 		"rent due {day}. pretend not to see this.",
 		"call mum back. it's been {n2} days.",
 		"gym: monday. (it's thursday)",
-		"dentist {day} {clock}. go. don't be a baby.",
 		"do laundry before the last socks go",
 		"water the plants. they look judgy.",
 		"fix bike brake before it fixes me",
 		"return his drill. it's been a year.",
 		"{day}: bins out. both of them.",
-		"reply to her. no. don't. ok maybe.",
 		"pay him back. stop avoiding him in the corridor.",
 		"invoice the dev ~next week~ today",
 	],
 	"msg": [
 		"he still has my charger",
-		"[she said meet at 3. i was there at 2:15.|she said around 8. i was there at 7:20.|she said 6, after work. i was there at 5.]",
-		"shift swap with her on {day}? (just to see her)",
 		"wifi: {pw}",
 		"they said the meeting could've been an email. it could.",
 		"landlord said {day}. landlord can wait.",
 		"note to self: you are not a morning person. stop trying.",
-		"she likes the blue pen. using the blue pen.",
 	],
 	"pw": ["teapot4lyf", "notyourwifi", "password123 (i know)", "Kettle_99", "ask_nicely"],
 	"caption": [
@@ -104,7 +89,6 @@ const G := {
 		"self portrait (flattering)|face",
 		"what the meeting felt like|figure",
 		"how the car sees me|face",
-		"me waiting for her reply|figure",
 		"the sun, as promised|sun",
 	],
 	"speech": ["is this a road?", "i only came for the snacks", "who drew this", "can we go home now", "this counts as cardio", "i'm the flag person. apparently.", "why is everything sideways", "is it lunch yet", "pay me in coffee", "not again", "i've seen worse. not much worse."],
@@ -134,8 +118,6 @@ const G := {
 		"paying rent|buying nicer pencils",
 		"staying in the lines|making the lines wider",
 		"using the eraser|drawing it again, bigger",
-		"texting her|drawing a hairpin instead",
-		"moving on|writing her another letter",
 	],
 	"homework_short": ["homework", "the tax form", "the cover letter", "meeting notes"],
 	"nobody_me": ["draws 40 hairpins", "adds one more corner", "erases the whole page", "names the road 'final_v2'", "redraws the coffee ring on purpose", "argues with the eraser"],
@@ -154,7 +136,6 @@ const G := {
 		"this corner is shaped like her handwriting. i'd know.",
 		"i drew her a road once. she took the bus.",
 		"she likes someone who can drive. i can draw roads. close enough?",
-		"hold the slide. hold it like i held on to that 'maybe'.",
 		"drift like nobody's watching. she isn't.",
 		"you can't steer feelings. i've tried. it's all understeer.",
 		"she called me 'a friend'. the road called me 'a corner'. both hurt.",
@@ -209,7 +190,6 @@ i was right about us.",
 		"{doubter} said this looks like a potato. it's a {obj}.",
 		"a {obj}. from memory. {doubter} owes me an apology.",
 		"proof i can draw a {obj}. {doubter} can stop laughing now.",
-		"{obj}. drawn at the {place}, while waiting. for her.",
 		"this is a {obj}. if you see a {wrong_obj}, that's on you.",
 	],
 	"doubter": [
@@ -261,7 +241,7 @@ const MIX := {
 	"list": [0.8, 6], "sum": [0.7, 6], "phone": [0.5, 8],
 	"doodle": [2.4, 2], "big": [1.2, 4], "meme": [1.0, 6],
 	"sticky": [0.7, 6], "ghost": [0.6, 7], "oops": [0.5, 8],
-	"love": [0.7, 7], "letter": [0.35, 12], "drawing": [1.0, 5],
+	"drawing": [1.0, 5],
 }
 var rally_left := 0
 var slots := {}  # extra words for one line (e.g. the object under a drawing)
@@ -301,6 +281,9 @@ func save_seen() -> void:
 ## Called after each new piece of road (from = first point of it).
 func on_block(from: int) -> void:
 	var L: float = g.lens[g.lens.size() - 1]
+	if not NARRATOR or L < 3200.0:  # a clean page at the start: the first note turns up a while into the run
+		corner_done = g.corners.size()
+		return
 	if g.page_no != writer_page:
 		writer_page = g.page_no
 		_new_writer()
@@ -308,10 +291,10 @@ func on_block(from: int) -> void:
 	while corner_done < g.corners.size():
 		var c: Dictionary = g.corners[corner_done]
 		corner_done += 1
-		if g.rng.randf() < 0.32:
+		if g.rng.randf() < 0.07:
 			_corner_note(c)
 	if L >= next_item:
-		next_item = L + g.rng.randf_range(380.0, 720.0)
+		next_item = L + g.rng.randf_range(1800.0, 3200.0)  # rare: the page is for other things
 		var kind := _next_kind()
 		_put(kind, from)
 		placed += 1
@@ -472,7 +455,7 @@ func _corner_note(c: Dictionary) -> void:
 		# direction, "long" for a long corner, a caution, and the distance (m) into the next corner. Then he
 		# remembers this is drifting.
 		rally_left = rng.randi_range(3, 6)
-		var r: float = c["r"]
+		var r: float = float(c["r"]) / g.road_k  # grade by shape, whatever the road size
 		var grade := 1 if r < 140.0 else 2 if r < 170.0 else 3 if r < 210.0 else 4 if r < 260.0 else 5 if r < 350.0 else 6
 		text = "%d%s%s" % [grade, "R" if c["side"] > 0.0 else "L", " long" if kind in ["constant", "pad", "decreasing"] else ""]
 		var caution: String = ["dont cut", "keep in", "tightens" if kind == "decreasing" else "opens", "caution"][rng.randi() % 4]
@@ -481,7 +464,7 @@ func _corner_note(c: Dictionary) -> void:
 		if idx >= 0 and idx + 1 < g.corners.size():
 			var nx: Dictionary = g.corners[idx + 1]
 			var gap := (float(nx["len"]) - float(c["len"])) / 10.0
-			var nr: float = nx["r"]
+			var nr: float = float(nx["r"]) / g.road_k
 			var ng := 1 if nr < 140.0 else 2 if nr < 170.0 else 3 if nr < 210.0 else 4 if nr < 260.0 else 5 if nr < 350.0 else 6
 			text += "\n%s %d%s" % [("into" if gap < 15.0 else str(int(roundf(gap / 10.0) * 10.0))), ng, "R" if nx["side"] > 0.0 else "L"]
 		if rng.randf() < 0.75:
@@ -941,7 +924,7 @@ func _draw_obj(c: Node2D, obj: String, w: Dictionary, r: RandomNumberGenerator) 
 ## from the grammar.
 func _meme(from: int) -> void:
 	var rng: RandomNumberGenerator = g.rng
-	var fmt := _cycle("meme_fmt", ["choice", "nobody", "starter", "honest", "plan"])
+	var fmt := _cycle("meme_fmt", ["choice", "nobody", "honest", "plan"])
 	var i := rng.randi_range(from, g.road.size() - 1)
 	var box := Vector2(250, 190)
 	var p := _free_spot(g.road[i], 1.0 if rng.randf() < 0.5 else -1.0, box, i)
@@ -1243,7 +1226,7 @@ func _sticky(from: int) -> void:
 	var p := _free_spot(g.road[i], 1.0 if rng.randf() < 0.5 else -1.0, Vector2(s, s), i)
 	if p == Vector2.INF:
 		return
-	var text := _say(["tease", "tease", "dev", "love"][rng.randi() % 4])
+	var text := _say(["tease", "dev"][rng.randi() % 2])
 	var col: Color = STICKY[rng.randi() % STICKY.size()]
 	var w := writer.duplicate()
 	var seed := rng.randi()

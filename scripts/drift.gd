@@ -15,6 +15,7 @@ const DrawNode = preload("res://scripts/draw_node.gd")
 const Prop = preload("res://scripts/prop.gd")
 const Radio = preload("res://scripts/radio.gd")
 const Scribbles = preload("res://scripts/scribbles.gd")
+const Inks = preload("res://scripts/inks.gd")
 const PROP_NAMES := {"pencil_blue": "pencil", "pencil_white": "pencil", "set_square": "set square"}
 ## Desk objects that lie across or beside the road, and how often each turns up.
 const PROP_WEIGHTS := {"pencil": 2.0, "pencil_blue": 1.5, "pencil_white": 1.5, "ruler": 1.5, "scissors": 1.2, "set_square": 1.0, "sharpener": 1.2, "eraser": 1.5, "clip": 1.0}
@@ -31,6 +32,16 @@ const PAPERS := {
 	"recycled": {"name": "Recycled grey", "tex": "res://paper/recycled.jpg"},
 }
 const DEFAULT_HOLD := 0.15  # seconds a side is held before the car flicks into a drift
+## Handling models (dev "handling"). Flow: the car is always loose, a held side swings it into a slide that
+## settles at a steady angle and carries the car round; letting go or switching sides swings it back like a
+## pendulum. Classic: the older grip-then-hold-to-drift model. Flow roads are wider with bigger corners.
+const HANDLING := {"flow": {"name": "Flow (always drifting)"}, "classic": {"name": "Classic (hold to drift)"}}
+const FLOW_ROAD := 1.45  # how much wider and rounder the road is in flow mode
+const FLOW_TURN := 1.35  # how hard the slide bends the travel (rad/s at a full sideways slide)
+const FLOW_ANGLE := [32.0, 50.0]  # the settled slide angle (degrees): light hold .. held on
+const FLOW_DEEP := [18.0, 1.2, 3.5]  # held on the same side, the slide keeps deepening: + degrees, from .. to (s)
+const FLOW_SPRING := 22.0  # pendulum: how hard the car swings to the wanted angle
+const FLOW_DAMP := 6.5  # and how fast the swing settles (lower overshoots more)
 
 const SPEED := 330.0  # top speed: only reached on a long straight (the pull fades above STRONG_PULL)
 const STRONG_PULL := 250.0  # full acceleration up to here ...
@@ -118,6 +129,11 @@ var yaw := 0.0
 var speed := 0.0  # each run pulls away from a standstill
 var slip := 0.0
 var hold_t := 0.0
+var flow := true  # dev "handling" is flow
+var road_k := 1.0  # road size factor (FLOW_ROAD in flow mode)
+var slip_v := 0.0  # how fast the slide angle is swinging (flow)
+var same_t := 0.0  # how long the same side has been held (flow: a switch starts it again)
+var held_side := 0
 var steer := 0.0  # the held side, eased: -1 left .. 1 right
 var drift_amt := 0.0  # 0 gripping .. 1 full drift, eased in and out
 var spin := 0.0
@@ -150,6 +166,7 @@ var next_page := 2500.0
 var next_decor := 600.0
 var page_no := 0
 var scrib: Scribbles  # notes, doodles, abandoned roads, sticky notes (scribbles.gd)
+var inks: Inks  # what the pens mean: red edges, highlighter, dots, crayon, ink (inks.gd)
 var seams: Array = []  # page edges ahead: {y, x0, x1, holes, hit, len}
 var jolt_t := -9.0
 var jolt_k := 0.0  # how hard the last bump was (0.5 the edge, 1 a wheel in a hole)
@@ -157,7 +174,11 @@ var prev_y := 0.0
 var chunks: Array = []  # {node, end_len}: each piece of road drawn once
 
 # On the paper
-var live_skid := [null, null]  # the skid each rear wheel is drawing: {pts, a}
+var live_skid := [null, null, null, null]  # the skid each tyre is drawing (rears, then fronts): {pts, a, col, w}
+var skid_on := [false, false]  # rears, fronts: marking now
+var skid_tip := [Vector2.ZERO, Vector2.ZERO, Vector2.ZERO, Vector2.ZERO]  # where each tyre is now: the live line always reaches it
+var skid_quiet := 0.0  # how long the car has been gripping with no side held; the marks stop after SKID_GRACE
+const SKID_GRACE := 0.6
 var live_tear := [null, null]  # {pts, w, seed}
 var still_marks: Array = []
 var mark_bucket: Node2D
@@ -205,6 +226,18 @@ var ui: CanvasLayer
 var overlay: Control
 var squeal: AudioStreamPlayer  # loops all run; its volume and pitch follow the slide
 var squeal_vol := 0.0
+## Tyre sound: the one squeal loop follows the slide. Two extra layers (a light-slide scrub and a start chirp)
+## are kept behind USE_SCRUB / USE_CHIRP but switched off: they didn't sound right.
+var scrub: AudioStreamPlayer
+var scrub_vol := 0.0
+var chirp: AudioStreamPlayer
+var chirp_left := 0.0
+var chirp_t := -10.0
+var chirp_slip := 0.0  # last frame's slip, to catch the moment it lets go
+var wob := 0.0
+const CHIRP_LEN := 0.22
+const USE_CHIRP := false  # the start chirp sounded like a screech: off
+const USE_SCRUB := false  # the extra light-slide layer: off, back to the one original squeal
 var shots: Array[AudioStreamPlayer] = []  # a few players for one-off sounds
 var shot_i := 0
 var snd := {}
@@ -221,6 +254,8 @@ func _ready() -> void:
 	view = get_viewport_rect().size
 	var cfg := _load()
 	hold_delay = float(cfg.get_value("dev", "hold", DEFAULT_HOLD))
+	flow = String(cfg.get_value("dev", "handling", "flow")) != "classic"
+	road_k = FLOW_ROAD if flow else 1.0
 	crash_on_hit = bool(cfg.get_value("dev", "crash", true))
 	prop_info = JSON.parse_string(FileAccess.get_file_as_string("res://props/props.json"))
 	var car: Dictionary = CARS.get(String(cfg.get_value("dev", "car", "evo")), CARS["evo"])
@@ -234,7 +269,7 @@ func _ready() -> void:
 	_build(load(pap["tex"]))
 	_sound_setup()
 	road.append(Vector2.ZERO)
-	widths.append(150.0)
+	widths.append(150.0 * road_k)
 	lens.append(0.0)
 	_extend(-PI * 0.5, 160.0, 0.0)  # a straight start
 	_chunk(0)
@@ -264,6 +299,9 @@ func _build(paper_tex: Texture2D) -> void:
 	scrib = Scribbles.new()
 	add_child(scrib)
 	scrib.setup(self, page_under, page_over)
+	inks = Inks.new()
+	add_child(inks)
+	inks.setup(self, page_over)
 	marks_layer = Node2D.new()
 	world.add_child(marks_layer)
 	live = DrawNode.new()
@@ -354,7 +392,7 @@ func _extend(dir: float, length: float, turn: float) -> void:
 
 
 func _width_now() -> float:
-	return clampf(150.0 - lens[lens.size() - 1] / 400.0, 100.0, 150.0)  # it narrows slowly, never speeds up
+	return clampf(150.0 - lens[lens.size() - 1] / 400.0, 100.0, 150.0) * road_k  # it narrows slowly, never speeds up
 
 
 ## How far into the run (0..1): corners tighten, links shorten and peaks come more often with it.
@@ -366,7 +404,7 @@ func _difficulty() -> float:
 ## Entry eases are longer than exits, so a corner announces itself. `r2` > 0 makes it tighten half way
 ## (a decreasing-radius corner). The apex is recorded for scoring later.
 func _corner(side: float, r: float, angle: float, kind: String, r2 := 0.0) -> Array:
-	r = maxf(r, R_MIN)
+	r = maxf(r, R_MIN) * road_k
 	var k := side / r
 	var ein := r * 0.35
 	var eout := r * 0.22
@@ -378,7 +416,7 @@ func _corner(side: float, r: float, angle: float, kind: String, r2 := 0.0) -> Ar
 		arc = r * 0.2
 	var segs := [[ein, 0.0, k]]
 	if r2 > 0.0:
-		var k2 := side / maxf(r2, R_MIN)
+		var k2 := side / (maxf(r2, R_MIN) * road_k)
 		segs += [[arc * 0.45, k, k], [r * 0.3, k, k2], [arc * 0.4, k2, k2], [eout, k2, 0.0]]
 	else:
 		segs += [[arc, k, k], [eout, k, 0.0]]
@@ -388,14 +426,14 @@ func _corner(side: float, r: float, angle: float, kind: String, r2 := 0.0) -> Ar
 
 ## Run-up before a drift corner: long enough to see it coming and set up (about a second, more for hairpins).
 func _runup(secs: float) -> Array:
-	return [[maxf(60.0, secs * 0.4 * 240.0 * lerpf(1.0, 0.85, _difficulty())), 0.0, 0.0]]
+	return [[maxf(60.0, secs * 0.4 * 240.0 * lerpf(1.0, 0.85, _difficulty())) * road_k, 0.0, 0.0]]
 
 
 ## The building blocks. Each returns its segments; sizes come from the car's drift circle (see report).
 func _block(kind: String, side: float) -> Array:
 	var d := _difficulty()
 	var drift_r := func(): return lerpf(rng.randf_range(180.0, 260.0), rng.randf_range(150.0, 200.0), d)
-	var link := lerpf(rng.randf_range(60.0, 90.0), rng.randf_range(35.0, 60.0), d)
+	var link := lerpf(rng.randf_range(60.0, 90.0), rng.randf_range(35.0, 60.0), d) * road_k
 	match kind:
 		"constant":  # the signature corner: long and steady
 			return _runup(1.0) + _corner(side, drift_r.call(), rng.randf_range(1.7, 2.6), kind) + [[50.0, 0.0, 0.0]]
@@ -451,6 +489,7 @@ func _grow_road() -> void:
 				var s := rng.randi_range(0, 3)
 				style = s if s < style else s + 1  # each lap of the rhythm gets a new drawing style
 		var start := road.size() - 1
+		var c0 := corners.size()
 		var placed := false
 		for attempt in 8:
 			var kind := _pick_block()
@@ -471,6 +510,7 @@ func _grow_road() -> void:
 		_chunk(start)
 		_page_things(start)
 		scrib.on_block(start)
+		inks.on_block(start, corners.slice(c0))
 		_place_things(start)
 
 
@@ -491,6 +531,8 @@ func _pick_block() -> String:
 func _block_weight(kind: String, base: float, d: float) -> float:
 	if kind == "decreasing":
 		return base * smoothstep(0.5, 0.9, d)  # late in a run only, and rare
+	if kind == "hairpin" and flow:
+		return base * 0.4 * lerpf(0.6, 1.3, d)  # flow wants big sweepers; hairpins stay a rare treat
 	if kind in ["hairpin", "esses", "squeeze"]:
 		return base * lerpf(0.6, 1.3, d)
 	return base
@@ -546,7 +588,7 @@ func _try_block(kind: String, attempt: int) -> bool:
 		return false
 	# Record the corners (apex point, which way, how tight) for scoring later; track the left-right links.
 	for c in pending_corners:
-		if c["r"] >= 450.0:
+		if c["r"] >= 450.0 * road_k:
 			continue  # sweepers and kinks are taken flat: not drift corners
 		var i := clampi(keep + int(float(c["at"]) / STEP), 0, road.size() - 1)
 		corners.append({"apex": road[i], "len": lens[i], "side": c["side"], "r": c["r"], "kind": c["kind"]})
@@ -579,6 +621,9 @@ func _chunk(from: int) -> void:
 		if i > 0 and i < m - 1:
 			bend[i] = absf((pts[i] - pts[i - 1]).angle_to(pts[i + 1] - pts[i])) / STEP
 	var ink: Array = INK[st]
+	var red_ink: Array = inks.edge_ink(ls[0])
+	if not red_ink.is_empty():  # a red-ink chapter: the edges are walls
+		ink = red_ink
 	for side in [-1.0, 1.0]:
 		var edge := PackedVector2Array()
 		edge.resize(m)
@@ -711,6 +756,7 @@ func _page_things(from: int) -> void:
 				under.add_child(h)
 				xs.append(x)
 			x += 46.0 * rng.randf_range(0.9, 1.12)
+		inks.new_page(lens[lens.size() - 1])  # from the next stretch: it is drawn in the new pen from its first point, so ink and rule match
 		seams.append({"y": y + 15.0, "x0": mid.x - 2200.0, "x1": mid.x + 2200.0, "holes": xs, "hit": false, "len": L + 2600.0})
 		var num := DrawNode.new()
 		var txt: String = String(["p. %d", "%d", "pg %d", "- %d -"][rng.randi() % 4]) % page_no
@@ -879,6 +925,12 @@ func _progress_len() -> float:
 	return lens[mini(progress_i, lens.size() - 1)]
 
 
+## What the camera shows now, in world space.
+func _view_rect() -> Rect2:
+	var size := view / cam.zoom
+	return Rect2(cam.get_screen_center_position() - size * 0.5, size)
+
+
 ## The nearest road point to the car, searched near where it was; what's far behind is dropped.
 func _track() -> void:
 	var best := progress_i
@@ -900,6 +952,7 @@ func _track() -> void:
 		while not corners.is_empty() and float(corners[0]["len"]) < behind:
 			corners.pop_front()
 		scrib.prune(behind)
+		inks.prune(behind)
 		while not seams.is_empty() and float(seams[0]["len"]) < behind:
 			seams.pop_front()
 		while not page_bits.is_empty() and float(page_bits[0]["len"]) < behind:
@@ -917,8 +970,9 @@ func _track() -> void:
 		coins = coins.filter(func(c): return not c["got"] and Vector2(c["p"]).distance_to(pos) < 1500.0)
 		things_dirty = true
 		var keep: Array = []
+		var seen := _view_rect().grow(400.0)
 		for m in still_marks:
-			if Vector2(m["p"]).distance_to(pos) < 1600.0:
+			if seen.intersects(m["box"]):
 				keep.append(m)
 			else:
 				if m["node"] == mark_bucket:
@@ -947,6 +1001,7 @@ func _process(delta: float) -> void:
 			if state == "crashed" and clock - crash_t > 1.6 and overlay == null:
 				_show_summary()
 	_effects(delta)
+	inks.update()
 	_squeal(delta)
 	_engine(delta)
 	_follow(delta)
@@ -986,6 +1041,7 @@ func _notification(what: int) -> void:
 			_pause()
 		if scrib:
 			scrib.save_seen()  # the app may be closed from here
+			inks.save()
 
 
 ## How a real drift goes, eased so no step is sudden. A held side first loads the car into a light slide
@@ -995,6 +1051,41 @@ func _notification(what: int) -> void:
 ## towards the way the car is going (the "catch"), and the travel bends round until both line up.
 ## Nothing jumps: the turn rate has weight (YAW_LAG), and the input and the drift both ease in and out.
 func _drive(delta: float) -> void:
+	if flow:
+		_steer_flow(delta)
+	else:
+		_steer_classic(delta)
+	_move(delta)
+
+
+## Flow handling (after Absolute Drift): the slide angle is a damped spring towards a wanted angle, so it
+## settles steady in a held drift and swings through on a release or a side switch. The slide itself turns
+## the car's travel (more sideways = tighter line); throttle is always on, so speed mostly holds.
+func _steer_flow(delta: float) -> void:
+	var side := _input_side()
+	hold_t = hold_t + delta if side != 0 else 0.0
+	steer += (side - steer) * (1.0 - exp(-delta * (8.0 if side != 0 else 4.0)))
+	same_t = same_t + delta if side != 0 and side == held_side else 0.0
+	held_side = side
+	var s := wrapf(heading - vdir, -PI, PI)
+	var ang := lerpf(FLOW_ANGLE[0], FLOW_ANGLE[1], smoothstep(0.0, 1.2, hold_t))
+	ang += FLOW_DEEP[0] * smoothstep(FLOW_DEEP[1], FLOW_DEEP[2], same_t)  # deeper slide = tighter line, more scrub
+	var want := steer * deg_to_rad(ang) * smoothstep(0.0, 90.0, speed)  # no swinging the nose round while standing still
+	slip_v += ((want - s) * FLOW_SPRING - slip_v * FLOW_DAMP) * delta
+	s = clampf(s + slip_v * delta, -1.35, 1.35)
+	if absf(s) >= 1.35:
+		slip_v = 0.0
+	vdir += FLOW_TURN * sin(s) * inks.grip_mul(pos) * minf(1.0, speed / 150.0) * delta  # no pivoting on the spot
+	var old := heading
+	heading = vdir + s
+	yaw = wrapf(heading - old, -PI, PI) / maxf(delta, 0.0001)
+	slip = absf(s)
+	drift_amt = clampf(slip / 0.7, 0.0, 1.0)
+	if slip > 0.15 and speed > DRIFT_FLOOR:  # the tyres scrub like the classic drift: deeper slide, more speed lost, so the line tightens
+		speed = maxf(DRIFT_FLOOR, speed - SCRUB * sin(minf(slip, 1.4)) * delta)
+
+
+func _steer_classic(delta: float) -> void:
 	var side := _input_side()
 	hold_t = hold_t + delta if side != 0 else 0.0  # switching sides without letting go keeps the drift
 	steer += (side - steer) * (1.0 - exp(-delta * (STEER_IN if side != 0 else STEER_OUT)))
@@ -1010,12 +1101,19 @@ func _drive(delta: float) -> void:
 	yaw += (yaw_want - yaw) * (1.0 - exp(-delta * YAW_LAG))
 	heading += yaw * delta
 	var grip := lerpf(GRIP, SLIDE_GRIP, drift_amt * drift_amt)  # grip holds through a light turn, goes in the drift
+	grip *= inks.grip_mul(pos)  # crayon wax, wet ink
 	s = wrapf(heading - vdir, -PI, PI)
 	vdir += s * (1.0 - exp(-delta * grip))  # the travel bends towards the nose, harder the more grip
 	s = wrapf(heading - vdir, -PI, PI)
 	if absf(s) > 1.35:  # never more than sideways
 		vdir = heading - signf(s) * 1.35
 	slip = absf(wrapf(heading - vdir, -PI, PI))
+	if slip > 0.15 and speed > DRIFT_FLOOR:  # the tyres scrub: a long drift drops a gear, the exit pulls back up
+		speed = maxf(DRIFT_FLOOR, speed - SCRUB * sin(minf(slip, 1.4)) * delta)
+
+
+## What both handling models share: staying on the line, speed, moving, page edges and the ways out.
+func _move(delta: float) -> void:
 	var i := progress_i
 	var half := widths[i] * 0.5
 	var off := pos.distance_to(road[i])
@@ -1035,10 +1133,11 @@ func _drive(delta: float) -> void:
 			speed += (cruise - speed) * (1.0 - exp(-delta * TOP_EASE))
 	else:
 		speed += (cruise - speed) * (1.0 - exp(-delta * 0.7))
-	if slip > 0.15 and speed > DRIFT_FLOOR:  # the tyres scrub: a long drift drops a gear, the exit pulls back up
-		speed = maxf(DRIFT_FLOOR, speed - SCRUB * sin(minf(slip, 1.4)) * delta)
 	pos += Vector2.from_angle(vdir) * speed * delta
 	_seam_bump()
+	if off > half + 34.0 and inks.red_here(lens[i]):  # fully over a red line
+		inks.mark_out(pos)
+		_crash("Over the red line")
 	if off > half + 170.0:
 		_crash("Lost the road")
 
@@ -1077,19 +1176,30 @@ func _wheels() -> Array:
 	var f := Vector2.from_angle(heading)
 	var r := f.orthogonal()
 	var back := pos - f * CAR_LEN * 0.32
-	return [back + r * 13.0, back - r * 13.0]
+	var front := pos + f * CAR_LEN * 0.3
+	return [back + r * 13.0, back - r * 13.0, front + r * 13.0, front - r * 13.0]
 
 
 ## Graphite skids whenever it slides; past a hard slide the tyres start ripping the paper itself.
 func _marks() -> void:
 	var wheels := _wheels()
-	var sliding := slip > 0.22
+	# The rears mark as soon as the car slides; the fronts only in a real drift (the whole car going
+	# sideways drags them too), and lighter. Each has a higher slip to start than to stop, so no gaps.
+	# Once on, a mark only stops when the car has been gripping with no side held for a while, so a quick
+	# lift between corners never breaks the line.
+	var quiet := _input_side() == 0 and slip < 0.12 or speed < 40.0
+	skid_quiet = skid_quiet + get_process_delta_time() if quiet else 0.0
+	var stop := skid_quiet > SKID_GRACE
+	skid_on[0] = not stop if skid_on[0] else slip > 0.18 and speed > 40.0
+	skid_on[1] = not stop if skid_on[1] else slip > 0.30 and speed > 40.0
 	var ripping := slip > 0.75 and speed > 110.0  # anywhere on the sheet: off the track is the same paper
-	for k in 2:
+	for k in 4:
 		var w: Vector2 = wheels[k]
-		if sliding:
+		skid_tip[k] = w
+		var front := k >= 2
+		if skid_on[1 if front else 0]:
 			if live_skid[k] == null:
-				live_skid[k] = {"pts": PackedVector2Array([w]), "a": clampf(slip, 0.25, 0.8)}
+				live_skid[k] = {"pts": PackedVector2Array([w]), "a": 0.6 if front else 1.0, "col": inks.skid_col(), "w": 4.5 if front else 6.0}
 			var sk: Dictionary = live_skid[k]
 			var pts: PackedVector2Array = sk["pts"]
 			if pts[pts.size() - 1].distance_to(w) > 5.0:
@@ -1097,9 +1207,11 @@ func _marks() -> void:
 				sk["pts"] = pts
 				if pts.size() >= MARK_POINTS:
 					_still_skid(k)
-					live_skid[k] = {"pts": PackedVector2Array([w]), "a": sk["a"]}
+					live_skid[k] = {"pts": PackedVector2Array([w]), "a": sk["a"], "col": inks.skid_col(), "w": sk["w"]}
 		elif live_skid[k] != null:
 			_still_skid(k)
+		if front:
+			continue  # only the driven rears tear the paper
 		if ripping:
 			if live_tear[k] == null:
 				live_tear[k] = {"pts": PackedVector2Array([w]), "w": PackedFloat32Array([2.0]), "seed": rng.randf() * 100.0}
@@ -1113,7 +1225,7 @@ func _marks() -> void:
 				t["w"] = ww
 				if clock - rip_t > 0.3:  # the paper keeps tearing: a fresh rip every so often
 					rip_t = clock
-					_play("rip", -3.0, 0.9 + slip * 0.15)
+					_play("rip", -9.0, rng.randf_range(0.82, 0.9))  # low and steady: a higher pitch screeched
 				if rng.randf() < 0.6:  # torn bits of paper kick up
 					flakes.append({"p": w, "v": Vector2.from_angle(vdir + PI + rng.randf_range(-1.0, 1.0)) * rng.randf_range(40, 120), "t": clock, "a": rng.randf() * TAU, "s": rng.randf_range(2.5, 5.0)})
 				if tp.size() >= MARK_POINTS:  # carry on seamlessly in a fresh piece
@@ -1128,7 +1240,7 @@ func _still_skid(k: int) -> void:
 	live_skid[k] = null
 	if (sk["pts"] as PackedVector2Array).size() < 2:
 		return
-	_still(func(c: Node2D): _draw_skid(c, sk), sk["pts"][0])
+	_still(func(c: Node2D): _draw_skid(c, sk), sk["pts"])
 
 
 func _still_tear(k: int, ends: bool) -> void:
@@ -1137,12 +1249,16 @@ func _still_tear(k: int, ends: bool) -> void:
 	if (t["pts"] as PackedVector2Array).size() < 2:
 		return
 	t["end"] = ends
-	_still(func(c: Node2D): _draw_tear(c, t), t["pts"][0])
+	_still(func(c: Node2D): _draw_tear(c, t), t["pts"])
 
 
 ## Finished marks are drawn in groups of up to 24 per node (one node each cost the phone hundreds of draw
 ## calls on a drifty run). A group is redrawn when a mark joins it, then stays still.
-func _still(fn: Callable, p: Vector2) -> void:
+func _still(fn: Callable, pts: PackedVector2Array) -> void:
+	var box := Rect2(pts[0], Vector2.ZERO)
+	for q in pts:
+		box = box.expand(q)
+	box = box.grow(16.0)
 	if mark_bucket == null or bucket_fns.size() >= 24:
 		var fns: Array = []
 		bucket_fns = fns
@@ -1151,9 +1267,10 @@ func _still(fn: Callable, p: Vector2) -> void:
 			for f in fns:
 				(f as Callable).call(c)
 		marks_layer.add_child(mark_bucket)
-		still_marks.append({"node": mark_bucket, "p": p})
+		still_marks.append({"node": mark_bucket, "box": box})
 	bucket_fns.append(fn)
-	still_marks[still_marks.size() - 1]["p"] = p  # a group is dropped once its newest mark is far behind
+	var last: Dictionary = still_marks[still_marks.size() - 1]
+	last["box"] = (last["box"] as Rect2).merge(box)  # a group is dropped only once all of it is off screen
 	mark_bucket.queue_redraw()
 
 
@@ -1168,7 +1285,14 @@ func _sound_setup() -> void:
 	squeal.stream = loop
 	squeal.volume_db = -80.0
 	add_child(squeal)
-	squeal.play()
+	squeal.play(rng.randf() * loop.get_length())
+	scrub = AudioStreamPlayer.new()  # silent unless USE_SCRUB (its sound file was removed)
+	scrub.volume_db = -80.0
+	add_child(scrub)
+	chirp = AudioStreamPlayer.new()
+	chirp.stream = loop
+	chirp.volume_db = -80.0
+	add_child(chirp)
 	for i in 5:
 		var p := AudioStreamPlayer.new()
 		add_child(p)
@@ -1219,12 +1343,32 @@ func _play(kind: String, db: float, pitch := 1.0) -> void:
 ## Tyres: silent while gripping, rising in and out with the slide (and softer as the car slows). Higher
 ## pitched the harder it slides.
 func _squeal(delta: float) -> void:
-	var want := 0.0
-	if state == "play" and Game.sound_on:
-		want = smoothstep(0.15, 0.9, slip) * clampf(speed / SPEED, 0.3, 1.0)
+	var on := state == "play" and Game.sound_on
+	var spd := clampf(speed / SPEED, 0.3, 1.0)
+	wob += delta
+	var w := sin(wob * 1.7) * 0.025 + sin(wob * 4.3 + 1.0) * 0.015
+	# The scrub: tyres just starting to slide, a rubbery skid; it steps back as the squeal takes over.
+	var sw := smoothstep(0.06, 0.3, slip) * (1.0 - 0.6 * smoothstep(0.4, 0.9, slip)) * spd if on and USE_SCRUB else 0.0
+	scrub_vol = move_toward(scrub_vol, sw, delta * 4.0)
+	scrub.volume_db = linear_to_db(maxf(scrub_vol, 0.0001)) - 10.0
+	scrub.pitch_scale = 0.9 + 0.15 * clampf(speed / SPEED, 0.0, 1.0) + w
+	# The squeal: a real drift. It comes in at the pace of the slide and tails off slower as grip returns.
+	var want := smoothstep(0.15, 0.9, slip) * spd if on else 0.0  # the original squeal, at the quieter level
 	squeal_vol = move_toward(squeal_vol, want, delta * 3.0)
-	squeal.volume_db = linear_to_db(maxf(squeal_vol, 0.0001)) - 6.0
+	squeal.volume_db = linear_to_db(maxf(squeal_vol, 0.0001)) - 11.0
 	squeal.pitch_scale = 0.85 + 0.3 * clampf(slip / 1.2, 0.0, 1.0)
+	# The chirp: the moment the tyres let go, a short bark from a random bit of the recording.
+	if USE_CHIRP and on and chirp_slip < 0.28 and slip >= 0.28 and speed > 100.0 and clock - chirp_t > 0.8:
+		chirp_t = clock
+		chirp_left = CHIRP_LEN
+		chirp.pitch_scale = rng.randf_range(1.15, 1.3)
+		chirp.play(rng.randf() * (chirp.stream as AudioStreamOggVorbis).get_length() * 0.8)
+	chirp_slip = slip
+	if chirp_left > 0.0:
+		chirp_left -= delta
+		chirp.volume_db = linear_to_db(maxf(chirp_left / CHIRP_LEN, 0.0001)) - 13.0
+		if chirp_left <= 0.0:
+			chirp.stop()
 
 
 ## An automatic gearbox: the revs climb through each gear with speed, it changes up near the top and down
@@ -1281,7 +1425,11 @@ func _score(delta: float) -> void:
 	if slip > 0.25 and on_road:
 		var edge := absf(widths[progress_i] * 0.5 - pos.distance_to(road[progress_i]))
 		var close := 1.6 if edge < 26.0 else 1.0  # drifting close to the line pays more
-		score += rad_to_deg(slip) * delta * 0.4 * mult * close
+		score += rad_to_deg(slip) * delta * 0.4 * mult * close * inks.score_mul(lens[progress_i], pos)
+		var clips := inks.clip(pos, slip > 0.3)
+		if clips > 0:
+			score += 50.0 * mult * clips
+			_word("CLIP", pos + Vector2(0, -50), Color(0.15, 0.25, 0.65))
 		clean_t += delta
 		var m := 1 + int(clean_t / 1.6)
 		if m > mult:
@@ -1387,13 +1535,20 @@ func _draw_road(n: Node2D, pts: PackedVector2Array, ls: PackedFloat32Array) -> v
 
 
 func _draw_skid(n: Node2D, sk: Dictionary) -> void:
-	n.draw_polyline(sk["pts"], Color(0.2, 0.2, 0.22, float(sk["a"]) * 0.45), 5.0, false)  # no antialiasing: soft enough, and it batches
+	var col: Color = sk.get("col", Color(0.2, 0.2, 0.22, 0.45))
+	n.draw_polyline(sk["pts"], Color(col, col.a * float(sk["a"])), float(sk.get("w", 5.0)), false)  # no antialiasing: soft enough, and it batches
 
 
 func _draw_live(n: Node2D) -> void:
-	for k in 2:
-		if live_skid[k] != null and (live_skid[k]["pts"] as PackedVector2Array).size() >= 2:
-			_draw_skid(n, live_skid[k])
+	for k in 4:
+		if live_skid[k] != null:  # drawn on to the tyre itself, so the end doesn't jump as points are added
+			var tip: Dictionary = (live_skid[k] as Dictionary).duplicate()
+			var pts: PackedVector2Array = (tip["pts"] as PackedVector2Array).duplicate()
+			if pts[pts.size() - 1].distance_to(skid_tip[k]) > 0.5:
+				pts.append(skid_tip[k])
+			tip["pts"] = pts
+			if pts.size() >= 2:
+				_draw_skid(n, tip)
 	for k in 2:
 		if live_tear[k] != null:
 			_draw_tear(n, live_tear[k])
@@ -1702,4 +1857,5 @@ func _exit_tree() -> void:
 	get_tree().paused = false
 	if scrib:
 		scrib.save_seen()  # remember the notes seen, however the run ended
+		inks.save()
 	get_viewport().canvas_cull_mask = 0xFFFFFFFF  # a 3D camera hid the flat world; the title screen needs it back

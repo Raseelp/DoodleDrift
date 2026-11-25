@@ -2,7 +2,7 @@ Sounds (all CC0 / public domain, no credit required; listed for the record)
 
 BigSoundBank (bigsoundbank.com), recorded by Joseph Sardin, CC0:
 - squeal_loop.ogg   from "Screeching Tires #1" (ID 2368), trimmed and made to loop
-- rip_a.ogg, rip_b.ogg   from "Torn paper #2" (ID 3239) and "Torn paper #4" (ID 3241), trimmed
+- rip_a.ogg, rip_b.ogg   from "Torn paper #2" (ID 3239) and "Torn paper #4" (ID 3241), trimmed (high end softened 2026-11-25)
 - coin_1.ogg, coin_2.ogg   single clinks cut from "Coins #1" (ID 0193)
 - pencil_write.ogg   "Pencil #2" (ID 3233), not used yet
 
