@@ -21,7 +21,7 @@ In the order to work through them. Items marked **plan** start with research and
 
 ## Later
 
-6. Package name: keep `dev.raseel.findinglight` or switch.
+6. ~~Package name~~ done 2026-11-25: `dev.raseel.doodledrift`, its own repo (Raseelp/DoodleDrift, split from FindingLight `drift`).
 7. The area outside the track: what's on the paper around the road.
 8. **In-game radio controls:** let the player pick or skip tracks while driving (music is in the dev settings for now).
 9. More narrator templates when the jokes start feeling familiar (about 138 now).
