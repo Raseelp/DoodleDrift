@@ -20,10 +20,8 @@ const RED := Color(0.74, 0.1, 0.12, 0.92)
 const CRAYONS := [Color(0.93, 0.36, 0.2), Color(0.3, 0.62, 0.92), Color(0.98, 0.78, 0.18), Color(0.45, 0.78, 0.35), Color(0.82, 0.42, 0.85)]
 const INKS := [Color(0.08, 0.12, 0.42), Color(0.06, 0.06, 0.08), Color(0.05, 0.25, 0.2)]
 const TEACH := {
-	"red": ["red pen = wall.\ngo fully over it and you're done.\nnot joking. (a bit joking.)", "red lines now.\ncross one completely: game over.\ndon't make me use the red pen on you"],
-	"marked": ["cones on the inside of corners:
-get close to them while sideways.", "see the cones?
-clip them sideways. extra points."],
+	"red": ["Red lines are walls.\nIf your car goes fully over one, the run ends."],
+	"marked": ["Cones and boxes give bonus points.\nDrift past them as close as you can."],
 	"wax": ["crayon is slippery.\nyou'll slide further. enjoy it.", "someone coloured in here.\nwax. no grip. very fun."],
 	"puddle": ["spilled ink. harmless.\nyou'll just slide, and paint the page.", "ink puddle. go through it.\nyour tyres will remember."],
 }
@@ -31,15 +29,21 @@ clip them sideways. extra points."],
 var g: Node
 var layer: Node2D  # on the page, over the road ink
 var gloss: Node2D  # puddle shine, redrawn as the camera moves
-var guide_node: Node2D  # the travelling note
+var guide_node: Node2D  # the teaching note, written in a bend
 var chapters: Array = [[-INF, "plain"]]  # [start len, kind], in order
 var zones: Array = []  # highlighter: {a, b (len), side, node}
-var dots: Array = []  # {p, len, hit}
+const RING_PERFECT := 30.0  # the car's nose this close to the cone: PERFECT
+const RING_CLIP := 60.0  # this close: CLIP
+const CONE_HIT := 12.0  # touching it tips it over (no points, no penalty)
+const BOX_W := 32.0  # the outer box's depth inside the road edge
+const BOX_EDGE := 8.0  # the tail this close to the edge line (or just over it): PERFECT
+const BOX_OVER := 12.0  # further over the edge than this is too far: nothing
+var dots: Array = []  # a cone at the inside of each corner and a box on its outside: see _dot
 var waxes: Array = []  # {poly, len}
 var puddles: Array = []  # {p, r, col, poly, len, node, track}
 var marks: Array = []  # red X where a run went out
 var taught := {}
-var guide := {}  # {text, t, side}
+var guide := {}  # {text, p, len, t, kind}
 var wet_t := -9.0
 var wet_col := Color.BLACK
 var next_wax := 900.0
@@ -126,6 +130,9 @@ func prune(behind: float) -> void:
 				(it["node"] as Node).queue_free()
 	zones = zones.filter(func(x): return float(x["len"]) >= behind - 400.0)
 	puddles = puddles.filter(func(x): return float(x["len"]) >= behind - 400.0)
+	for d in dots:
+		if float(d["len"]) < behind - 400.0 and d.has("node") and is_instance_valid(d["node"]):
+			(d["node"] as Node).queue_free()
 	dots = dots.filter(func(x): return float(x["len"]) >= behind - 400.0)
 	var keep: Array = []
 	for w in waxes:
@@ -183,18 +190,57 @@ func score_mul(l: float, p: Vector2) -> float:
 	return 1.0
 
 
-## A blue dot clipped while sideways: returns how many were clipped just now.
-func clip(p: Vector2, sliding: bool) -> int:
-	if not sliding:
-		return 0
-	var n := 0
+## The clips, checked every frame: `nose` are points on the car's front, `tails` its rear corners, `body`
+## its outline (any of it touching a cone tips it over), `l` how far along the road the car is. Each cone and box scores once, at its best moment (1 = CLIP, 2 = PERFECT),
+## only while drifting. Returns what just scored: [{kind, grade, p}].
+func clip_check(nose: Array, tails: Array, body: Array, l: float, drifting: bool) -> Array:
+	var out: Array = []
 	for d in dots:
-		if not d["hit"] and p.distance_to(d["p"]) < 34.0:
-			d["hit"] = true
-			n += 1
-	if n > 0:
-		dots_node.queue_redraw()
-	return n
+		if absf(l - float(d["len"])) > 500.0:
+			continue
+		if int(d["cone_res"]) < 0:
+			var cp: Vector2 = d["p"]
+			var near := INF
+			for q in nose:
+				near = minf(near, cp.distance_to(q))
+			var touch := INF
+			var by: Vector2 = nose[0]
+			for q in body:
+				if cp.distance_to(q) < touch:
+					touch = cp.distance_to(q)
+					by = q
+			if touch < CONE_HIT and not d["tipped"]:
+				d["tipped"] = true
+				d["tip"] = (cp - by).angle()  # knocked away from whatever hit it
+				(d["node"] as Node2D).queue_redraw()
+			if drifting:
+				d["best"] = minf(float(d["best"]), near)
+			if l > float(d["len"]) + 60.0:
+				var grade := 0
+				if not d["tipped"]:
+					grade = 2 if float(d["best"]) < RING_PERFECT else (1 if float(d["best"]) < RING_CLIP else 0)
+				d["cone_res"] = grade
+				if grade > 0:
+					d["hit"] = true
+					out.append({"kind": "cone", "grade": grade, "p": cp})
+				(d["node"] as Node2D).queue_redraw()
+		if int(d["box_res"]) < 0:
+			if l >= float(d["a"]) and l <= float(d["b"]) and drifting:
+				var i := _idx(l)
+				var no := Vector2.from_angle(g._dir_at(i) + PI * 0.5) * float(d["out"])
+				for q in tails:
+					var e: float = (Vector2(q) - g.road[i]).dot(no) - g.widths[i] * 0.5  # past the edge (+) or inside (-)
+					if e > -BOX_W and e < BOX_OVER:
+						var grade := 2 if e > -BOX_EDGE else 1
+						if grade > int(d["box_best"]):
+							d["box_best"] = grade
+							d["box_p"] = q
+			if l > float(d["b"]):
+				d["box_res"] = int(d["box_best"])
+				if int(d["box_res"]) > 0:
+					(d["node"] as Node2D).queue_redraw()
+					out.append({"kind": "box", "grade": int(d["box_res"]), "p": d["box_p"]})
+	return out
 
 
 ## A red pen X where the run went over.
@@ -211,37 +257,67 @@ func update() -> void:
 
 # ---------------------------------------------------------------- teaching
 
+const TEACH_SIZE := 34
+const TEACH_LINE := 38.0
+
+
+## Write the note once, standing still on the paper in the last bend before the rule starts (the inside of
+## a hairpin if it fits, else the outside), so it is read while the car slides past. Never follows the car.
 func _teach(kind: String, at: float) -> void:
 	if taught.has(kind):
 		return
 	var arr: Array = TEACH[kind]
-	guide = {"text": arr[g.rng.randi() % arr.size()], "at": at, "t": -1.0, "kind": kind}
+	var text: String = arr[g.rng.randi() % arr.size()]
+	var font: Font = g.ui_font()
+	var lines := text.split("\n")
+	var size := Vector2(0, TEACH_LINE * lines.size())
+	for line in lines:
+		size.x = maxf(size.x, font.get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1, TEACH_SIZE).x)
+	var here: float = g.lens[mini(g.progress_i, g.lens.size() - 1)]
+	# The tightest bend in the last stretch before the rule (far enough ahead to still be read).
+	var pick := {}
+	for c in g.corners:
+		var l := float(c["len"])
+		if l < here + 500.0 or l > at - 150.0 or l < at - 1800.0:
+			continue
+		if pick.is_empty() or float(c["r"]) < float(pick["r"]):
+			pick = c
+	var i := _idx(float(pick["len"]) if not pick.is_empty() else at - 400.0)
+	var side := float(pick.get("side", 1.0))
+	var spot := Vector2.INF
+	for out in [side, -side]:  # inside of the bend first (the curve wraps round it), then outside
+		spot = g.scrib._free_spot(g.road[i], out, size, i)
+		if spot != Vector2.INF:
+			break
+	if spot == Vector2.INF:
+		return  # no paper free: try again on the next page of this pen
+	guide = {"text": text, "p": spot, "len": g.lens[i], "t": -1.0, "kind": kind}
 
 
-## The note rides beside the car for a few seconds once the car reaches where it applies, then fades.
+## Fades in as the car comes up to the bend, stays put, fades once the car is well past.
 func _draw_guide(c: Node2D) -> void:
 	if guide.is_empty():
 		return
 	var here: float = g.lens[mini(g.progress_i, g.lens.size() - 1)]
+	var l := float(guide["len"])
 	if float(guide["t"]) < 0.0:
-		if here < float(guide["at"]) - 300.0:
+		if here < l - 1100.0:
 			return
 		guide["t"] = g.clock
 		taught[guide.get("kind", "")] = true  # only counts as taught once it has actually been shown
-	var age: float = g.clock - float(guide["t"])
-	if age > 9.0:
+	if here > l + 900.0:
 		guide = {}
 		return
-	var a := smoothstep(0.0, 0.4, age) * (1.0 - smoothstep(8.0, 9.0, age))
+	var a := smoothstep(0.0, 0.5, g.clock - float(guide["t"])) * (1.0 - smoothstep(l + 500.0, l + 900.0, here))
 	var w: Dictionary = g.scrib.writer
-	var font: Font = g.scrib.fonts[int(w.get("font", 0))]
+	var font: Font = g.ui_font()
 	var col: Color = Color(w.get("col", Color(0.15, 0.15, 0.2)), a)
-	var at: Vector2 = g.pos + Vector2(110, -170)
+	var at: Vector2 = guide["p"]
 	var y := 0.0
 	for line in String(guide["text"]).split("\n"):
-		c.draw_set_transform(at + Vector2(0, y), -0.05, Vector2.ONE)
-		c.draw_string(font, Vector2.ZERO, line, HORIZONTAL_ALIGNMENT_LEFT, -1, 30, col)
-		y += 34.0
+		c.draw_set_transform(at + Vector2(0, y), -0.03, Vector2.ONE)
+		c.draw_string(font, Vector2.ZERO, line, HORIZONTAL_ALIGNMENT_LEFT, -1, TEACH_SIZE, col)
+		y += TEACH_LINE
 	c.draw_set_transform(Vector2.ZERO)
 
 
@@ -297,53 +373,177 @@ func _highlight(c: Dictionary) -> void:
 
 
 ## A blue pen dot on the inside apex: a tap of the pen, a little ink spread, sometimes a tail.
+## Clipping for one drift corner, placed the way a drift event lays out a course: a clipping point (cone)
+## at the inside apex and an outer zone (box) along the outside from just before the apex to the exit.
+## Next to the corner before it:
+## - the same way again soon after (a double apex): one long outer zone covering both, and a second cone
+##   only if the apexes are far enough apart for the two rings not to touch;
+## - the other way soon after (a switch): the earlier box stops before the new cone's rings, the new box
+##   starts after the old cone's rings, and a box left too short is dropped (not every corner has one).
 func _dot(c: Dictionary) -> void:
 	var i := _idx(float(c["len"]))
 	var inside: float = float(c["side"])
 	var nrm := Vector2.from_angle(g._dir_at(i) + PI * 0.5) * inside
 	var p: Vector2 = g.road[i] + nrm * (g.widths[i] * 0.5 - 14.0)
-	dots.append({"p": p, "len": g.lens[i], "hit": false, "seed": g.rng.randi(), "t": Vector2.from_angle(g._dir_at(i))})
-	dots_node.queue_redraw()
+	var l: float = g.lens[i]
+	var d := {"p": p, "len": l, "hit": false, "seed": g.rng.randi(), "t": Vector2.from_angle(g._dir_at(i)),
+		"tipped": false, "tip": 0.0, "best": INF, "cone": true, "cone_res": -1,
+		"a": 0.0, "b": 0.0, "out": -inside, "edge": PackedVector2Array(), "inner": PackedVector2Array(),
+		"box_best": 0, "box_res": 0, "box_p": Vector2.ZERO}
+	var box_a := l - 60.0
+	var box_b := l + 170.0
+	var prev: Dictionary = dots[dots.size() - 1] if not dots.is_empty() else {}
+	var gap := l - float(prev.get("len", -INF))
+	var holder := {}  # the latest box still open (a double apex's shared box sits on its first apex)
+	for k in range(dots.size() - 1, maxi(-1, dots.size() - 4), -1):
+		if int(dots[k]["box_res"]) == -1:
+			holder = dots[k]
+			break
+	dots.append(d)  # in the list first, so boxes trimmed below keep clear of this cone too
+	var node := DrawNode.new()
+	node.draw_fn = func(cv: Node2D): _draw_dot(cv, d)
+	layer.add_child(node)
+	d["node"] = node
+	if not prev.is_empty() and gap < 420.0 and float(prev["out"]) == -inside:  # the same way again: a double apex
+		if not holder.is_empty() and float(holder["out"]) == -inside:  # its box stretches on through this apex too
+			_box(holder, float(holder["a"]), box_b)
+		else:
+			_box(d, box_a, box_b)
+		if p.distance_to(prev["p"]) < RING_CLIP * 2.0 + 20.0:
+			d["cone"] = false  # too close to the last cone: this apex shares it
+			d["cone_res"] = 0
+	else:
+		if not prev.is_empty() and gap < 420.0:  # a switch: keep each box clear of the other corner's cone
+			var cone_reach := RING_CLIP + 30.0
+			if not holder.is_empty() and float(holder["b"]) > l - cone_reach:
+				_box(holder, float(holder["a"]), l - cone_reach)
+			box_a = maxf(box_a, float(prev["len"]) + cone_reach)
+		_box(d, box_a, box_b)
+	node.queue_redraw()
+	if not holder.is_empty() and holder.has("node"):
+		(holder["node"] as Node2D).queue_redraw()
 
 
+## Lay a dot's outer box along its outside edge between road lengths a and b, its ends pulled back until
+## they are clear of every other cone's rings (in tight bends the edge runs close to a cone even when the
+## road length says it's far), or drop it if what's left is too short to be worth aiming for.
+func _box(d: Dictionary, a: float, b: float) -> void:
+	var i0 := _idx(a)
+	var i1 := _idx(b)
+	var clear := func(k: int) -> bool:
+		var no := Vector2.from_angle(g._dir_at(k) + PI * 0.5) * float(d["out"])
+		var e: Vector2 = g.road[k] + no * g.widths[k] * 0.5
+		var n: Vector2 = g.road[k] + no * (g.widths[k] * 0.5 - BOX_W)
+		for o in dots:
+			if o != d and o.get("cone", true) and absf(float(o["len"]) - g.lens[k]) < 700.0:
+				var cp: Vector2 = o["p"]
+				if e.distance_to(cp) < RING_CLIP + 10.0 or n.distance_to(cp) < RING_CLIP + 10.0:
+					return false
+		return true
+	while i0 < i1 and not clear.call(i0):
+		i0 += 1
+	while i1 > i0 and not clear.call(i1):
+		i1 -= 1
+	if g.lens[i1] - g.lens[i0] < 100.0:
+		d["edge"] = PackedVector2Array()
+		d["inner"] = PackedVector2Array()
+		d["box_res"] = 0
+		return
+	var edge := PackedVector2Array()
+	var inner := PackedVector2Array()
+	for k in range(i0, i1 + 1):
+		var no := Vector2.from_angle(g._dir_at(k) + PI * 0.5) * float(d["out"])
+		edge.append(g.road[k] + no * g.widths[k] * 0.5)
+		inner.append(g.road[k] + no * (g.widths[k] * 0.5 - BOX_W))
+	d["edge"] = edge
+	d["inner"] = inner
+	d["a"] = g.lens[i0]
+	d["b"] = g.lens[i1]
+	d["box_res"] = -1
+
+
+## The red X marks where runs went over (each clip set draws itself: _draw_dot).
 func _draw_dots(c: Node2D) -> void:
-	var blue := Color(0.1, 0.18, 0.55)
-	# Clipping points as a drift event marks them: a hatched clip box painted along the inside edge, and a
-	# traffic cone on it, seen from above (square base, orange cone, white reflective band, its shadow).
-	for d in dots:
-		var r := RandomNumberGenerator.new()
-		r.seed = int(d["seed"])
-		var p: Vector2 = d["p"]
-		var t: Vector2 = d.get("t", Vector2.RIGHT)
-		var nrm := t.orthogonal()
-		var box := PackedVector2Array([p - t * 34.0 - nrm * 9.0, p + t * 34.0 - nrm * 9.0, p + t * 34.0 + nrm * 9.0, p - t * 34.0 + nrm * 9.0])
-		for k in 4:
-			g.scrib._wobble_line(c, box[k], box[(k + 1) % 4], Color(0.25, 0.25, 0.3, 0.55), 1.6, r)
-		for k in range(-4, 5):  # hatching inside the box
-			var q := p + t * k * 7.0
-			g.scrib._wobble_line(c, q - nrm * 7.0 - t * 4.0, q + nrm * 7.0 + t * 4.0, Color(0.25, 0.25, 0.3, 0.3), 1.2, r)
-		var cone := p + Vector2(r.randf_range(-3, 3), r.randf_range(-3, 3))
-		c.draw_set_transform(cone + Vector2(-3, 5), 0.0, Vector2(1.0, 0.8))
-		c.draw_circle(Vector2.ZERO, 11.0, Color(0, 0, 0, 0.16), true, -1.0, false)
-		var rot := r.randf_range(-0.3, 0.3)
-		c.draw_set_transform(cone, rot, Vector2.ONE)
-		var base := PackedVector2Array([Vector2(-10, -10), Vector2(10, -10), Vector2(10, 10), Vector2(-10, 10), Vector2(-10, -10)])
-		c.draw_colored_polygon(base, Color(0.95, 0.42, 0.12))
-		c.draw_polyline(base, Color(0.45, 0.18, 0.05, 0.8), 1.4)
-		c.draw_set_transform(cone, 0.0, Vector2.ONE)
-		c.draw_circle(Vector2.ZERO, 7.5, Color(1.0, 0.5, 0.16))
-		c.draw_arc(Vector2.ZERO, 5.0, 0.0, TAU, 20, Color(0.97, 0.97, 0.95), 2.2)  # the reflective band
-		c.draw_circle(Vector2.ZERO, 2.2, Color(1.0, 0.62, 0.3))  # the cone's tip
-		c.draw_arc(Vector2.ZERO, 7.5, PI * 0.9, PI * 1.6, 10, Color(1, 1, 1, 0.35), 1.4)  # light on its side
-		c.draw_set_transform(Vector2.ZERO)
-		if d["hit"]:  # clipped: ticked off beside it in blue pen
-			var tk := cone + nrm * 22.0
-			g.scrib._hand_poly(c, PackedVector2Array([tk + Vector2(-7, -1), tk + Vector2(-2, 6), tk + Vector2(9, -9)]), Color(0.1, 0.18, 0.55, 0.85), 2.2, r)
 	for p in marks:  # a red X where a run went over the red line
 		var r := RandomNumberGenerator.new()
 		r.seed = int(p.x * 7 + p.y)
 		g.scrib._wobble_line(c, p + Vector2(-18, -18), p + Vector2(18, 18), RED, 3.2, r)
 		g.scrib._wobble_line(c, p + Vector2(18, -18), p + Vector2(-18, 18), RED, 3.2, r)
+
+
+## One clip set, in its own node: a cone on a painted apex cross at the inside (two pencil rings show how
+## close to get) and a painted box along the outside edge for the tail.
+func _draw_dot(c: Node2D, d: Dictionary) -> void:
+	var r := RandomNumberGenerator.new()
+	r.seed = int(d["seed"])
+	var p: Vector2 = d["p"]
+	var t: Vector2 = d.get("t", Vector2.RIGHT)
+	var nrm := t.orthogonal()
+	var pen := Color(0.25, 0.25, 0.3)
+	# the outer box: painted along the outside edge, its edge line darker (touch it for PERFECT), hatched
+	# across, and a few stacks of old tyres just off the road behind it
+	var edge: PackedVector2Array = d.get("edge", PackedVector2Array())
+	var inner: PackedVector2Array = d.get("inner", PackedVector2Array())
+	if edge.size() > 2:
+		var swept := int(d["box_res"]) > 0
+		for k in edge.size() - 1:
+			g.scrib._wobble_line(c, edge[k], edge[k + 1], Color(pen, 0.85), 2.6, r)
+			g.scrib._wobble_line(c, inner[k], inner[k + 1], Color(pen, 0.45), 1.4, r)
+		g.scrib._wobble_line(c, edge[0], inner[0], Color(pen, 0.55), 1.4, r)
+		g.scrib._wobble_line(c, edge[edge.size() - 1], inner[inner.size() - 1], Color(pen, 0.55), 1.4, r)
+		for k in range(1, edge.size() - 1, 2):  # hatching; darker once a tail has swept through
+			g.scrib._wobble_line(c, edge[k], inner[mini(k + 1, inner.size() - 1)], Color(pen, 0.5 if swept else 0.25), 1.2, r)
+		for k in range(2, edge.size() - 2, maxi(3, edge.size() / 3)):  # tyre stacks behind the box
+			var back := edge[k] + (edge[k] - inner[k]).normalized() * 22.0
+			var along := (edge[mini(k + 1, edge.size() - 1)] - edge[k]).normalized()
+			for j in 2:
+				var tc := back + along * (j * 17.0 - 8.0)
+				c.draw_arc(tc, 8.5, 0.0, TAU, 14, Color(pen, 0.7), 1.8)
+				c.draw_arc(tc, 3.5, 0.0, TAU, 10, Color(pen, 0.45), 1.2)
+	if not d.get("cone", true):
+		return
+	# the cone's two pencil rings: inside the small one is PERFECT, inside the big one a CLIP
+	if not d["tipped"] and int(d["cone_res"]) < 0:
+		for ring in [[RING_CLIP, 0.22], [RING_PERFECT, 0.35]]:
+			var segs := 18
+			for k in segs:
+				if k % 2 == 0:
+					var a0 := TAU * k / segs + r.randf() * 0.05
+					c.draw_arc(p, float(ring[0]) + r.randf_range(-1.5, 1.5), a0, a0 + TAU / segs, 4, Color(pen, float(ring[1])), 1.3)
+	# a painted cross on the apex, under the cone
+	g.scrib._wobble_line(c, p - t * 14.0, p + t * 14.0, Color(0.95, 0.95, 0.9, 0.9), 4.0, r)
+	g.scrib._wobble_line(c, p - nrm * 8.0, p + nrm * 8.0, Color(0.95, 0.95, 0.9, 0.9), 4.0, r)
+	var cone := p + Vector2(r.randf_range(-3, 3), r.randf_range(-3, 3))
+	if d["tipped"]:  # knocked over: lying on its side, its base square kicked off behind it
+		var ta := float(d["tip"])
+		c.draw_set_transform(cone + Vector2.from_angle(ta) * 10.0, ta, Vector2.ONE)
+		var body := PackedVector2Array([Vector2(-9, -8), Vector2(14, -2.5), Vector2(14, 2.5), Vector2(-9, 8)])
+		c.draw_colored_polygon(body, Color(1.0, 0.5, 0.16))
+		c.draw_line(Vector2(-1, -6), Vector2(-1, 6), Color(0.97, 0.97, 0.95), 2.4)
+		body.append(body[0])
+		c.draw_polyline(body, Color(0.45, 0.18, 0.05, 0.8), 1.2)
+		c.draw_set_transform(cone - Vector2.from_angle(ta) * 8.0, ta + 0.7, Vector2.ONE)
+		var tb := PackedVector2Array([Vector2(-10, -10), Vector2(10, -10), Vector2(10, 10), Vector2(-10, 10), Vector2(-10, -10)])
+		c.draw_colored_polygon(tb, Color(0.95, 0.42, 0.12))
+		c.draw_polyline(tb, Color(0.45, 0.18, 0.05, 0.8), 1.4)
+		c.draw_set_transform(Vector2.ZERO)
+		return
+	c.draw_set_transform(cone + Vector2(-3, 5), 0.0, Vector2(1.0, 0.8))
+	c.draw_circle(Vector2.ZERO, 11.0, Color(0, 0, 0, 0.16), true, -1.0, false)
+	var rot := r.randf_range(-0.3, 0.3)
+	c.draw_set_transform(cone, rot, Vector2.ONE)
+	var base := PackedVector2Array([Vector2(-10, -10), Vector2(10, -10), Vector2(10, 10), Vector2(-10, 10), Vector2(-10, -10)])
+	c.draw_colored_polygon(base, Color(0.95, 0.42, 0.12))
+	c.draw_polyline(base, Color(0.45, 0.18, 0.05, 0.8), 1.4)
+	c.draw_set_transform(cone, 0.0, Vector2.ONE)
+	c.draw_circle(Vector2.ZERO, 7.5, Color(1.0, 0.5, 0.16))
+	c.draw_arc(Vector2.ZERO, 5.0, 0.0, TAU, 20, Color(0.97, 0.97, 0.95), 2.2)  # the reflective band
+	c.draw_circle(Vector2.ZERO, 2.2, Color(1.0, 0.62, 0.3))  # the cone's tip
+	c.draw_arc(Vector2.ZERO, 7.5, PI * 0.9, PI * 1.6, 10, Color(1, 1, 1, 0.35), 1.4)  # light on its side
+	c.draw_set_transform(Vector2.ZERO)
+	if d["hit"]:  # clipped: ticked off beside it in blue pen
+		var tk := cone + nrm * 22.0
+		g.scrib._hand_poly(c, PackedVector2Array([tk + Vector2(-7, -1), tk + Vector2(-2, 6), tk + Vector2(9, -9)]), Color(0.1, 0.18, 0.55, 0.85), 2.2, r)
 
 
 ## Crayon coloured in over part of the page and the road: back-and-forth waxy strokes, paper tooth showing

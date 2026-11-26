@@ -809,14 +809,14 @@ func _doodle(kind: String, rng: RandomNumberGenerator) -> Array:
 # ---------------------------------------------------------------- drawing
 
 func _draw_art(n: Node2D) -> void:
-	var font: Font = g.hand_font()
+	var font: Font = g.ui_font()
 	var hw: float = g.widths[0] * 0.5
 	_stroke(n, [Vector2(-hw + 6, START_Y), Vector2(-hw * 0.3, START_Y + 2.0), Vector2(hw * 0.3, START_Y - 1.5), Vector2(hw - 6, START_Y + 1.0)], 3.2, PENCIL, 1)
 	_stroke(n, [Vector2(-hw + 12, START_Y + 10), Vector2(hw - 14, START_Y + 11)], 1.8, SOFT, 2)
 	_stats(n, font)
 	_meet(n, font)
 	_gear(n)
-	_write(n, font, "Doodle Drift", Vector2(0, title_y), 124, -0.03, 3)
+	_write(n, font, "Doodle Drift", Vector2(0, title_y), 103, -0.03, 3)
 	_stroke(n, _wave(Vector2(-230, title_y + 24), Vector2(230, title_y + 17), 5.0, 3.0), 2.6, PENCIL, 4)
 	_best(n, font, hw)
 
@@ -826,7 +826,7 @@ func _stats(n: Node2D, font: Font) -> void:
 	var cars_c: Dictionary = _c("CARS")
 	var car: Dictionary = cars_c.get(String(_cfg().get_value("dev", "car", "evo")), cars_c["evo"])
 	var x0 := -PAGE_W * 0.46
-	_write_left(n, font, String(car["name"]), Vector2(x0, STATS_Y + 14.0), 46, -0.02, 60)
+	_write_left(n, font, String(car["name"]), Vector2(x0, STATS_Y + 14.0), 38, -0.02, 60)
 	_stroke(n, _wave(Vector2(x0, STATS_Y + 24.0), Vector2(x0 + 150.0, STATS_Y + 21.0), 2.0, 2.0), 1.8, PENCIL, 59)
 	var rows := [
 		["top speed", float(_c("SPEED")) / 400.0],
@@ -837,7 +837,7 @@ func _stats(n: Node2D, font: Font) -> void:
 	for i in rows.size():
 		var cx := x0 + (i % 2) * (PAGE_W * 0.48)
 		var ry := STATS_Y + 66.0 + (i / 2) * 44.0
-		_write_left(n, font, rows[i][0], Vector2(cx, ry), 28, 0.0, 61 + i)
+		_write_left(n, font, rows[i][0], Vector2(cx, ry), 23, 0.0, 61 + i)
 		var b := Rect2(cx + 112.0, ry - 16.0, PAGE_W * 0.46 - 130.0, 15.0)
 		_stroke(n, [b.position, Vector2(b.end.x, b.position.y), b.end, Vector2(b.position.x, b.end.y), b.position + Vector2(0, -1)], 1.6, PENCIL, 70 + i)
 		var fill: float = clampf(rows[i][1], 0.0, 1.0) * b.size.x
@@ -953,7 +953,7 @@ func _van(n: Node2D, c: Vector2, ang: float, sd: int) -> void:
 	_stroke(n, [Vector2(-30, -19), Vector2(14, -19), Vector2(14, -34), Vector2(-30, -34), Vector2(-29.5, -19)].map(t), 1.4, PENCIL, sd + 2)
 	for k in 6:  # the striped awning over the serving hatch
 		_stroke(n, [t.call(Vector2(-28 + k * 7.5, -20)), t.call(Vector2(-26 + k * 7.5, -33))], 2.4, Color(RED, 0.45), sd + 3 + k, 0.3)
-	_write(n, g.hand_font(), "coffee", t.call(Vector2(-8, 6)), 20, ang, sd + 10)
+	_write(n, g.ui_font(), "coffee", t.call(Vector2(-8, 6)), 17, ang, sd + 10)
 
 
 func _cooler(n: Node2D, c: Vector2, sd: int) -> void:
@@ -970,8 +970,8 @@ func _tripod(n: Node2D, c: Vector2, sd: int) -> void:
 func _sign(n: Node2D, font: Font, c: Vector2, sd: int) -> void:
 	var r := Rect2(c - Vector2(32, 15), Vector2(64, 30))
 	_stroke(n, [r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y), r.position + Vector2(1, -1)], 1.5, PENCIL, sd)
-	_write(n, font, "MEET", c + Vector2(0, 4), 24, -0.06, sd + 1)
-	_write(n, font, "11 pm", c + Vector2(20, 21), 14, -0.06, sd + 2)
+	_write(n, font, "MEET", c + Vector2(0, 4), 20, -0.06, sd + 1)
+	_write(n, font, "11 pm", c + Vector2(20, 21), 12, -0.06, sd + 2)
 	for s in [-1.0, 1.0]:  # tape at the top corners
 		_stroke(n, [c + Vector2(s * 30, -16), c + Vector2(s * 22, -10)], 3.5, Color(0.86, 0.82, 0.67, 0.8), sd + 3 + int(s), 0.2)
 
@@ -1073,18 +1073,18 @@ func _best(n: Node2D, font: Font, hw: float) -> void:
 		return
 	var x := hw + 40.0
 	var y := -330.0
-	_write_left(n, font, "best", Vector2(x, y), 34, -0.03, 100)
+	_write_left(n, font, "best", Vector2(x, y), 28, -0.03, 100)
 	_stroke(n, [Vector2(x, y + 7), Vector2(x + 58, y + 5)], 1.8, PENCIL, 101)
-	_write_left(n, font, "%d" % best, Vector2(x, y + 48), 48, -0.02, 102)
-	_write_left(n, font, "%d m" % int(cfg.get_value("best", "dist", 0)), Vector2(x, y + 88), 32, 0.02, 103)
-	_write_left(n, font, "x%d combo" % int(cfg.get_value("best", "combo", 1)), Vector2(x, y + 124), 32, -0.01, 104)
+	_write_left(n, font, "%d" % best, Vector2(x, y + 48), 40, -0.02, 102)
+	_write_left(n, font, "%d m" % int(cfg.get_value("best", "dist", 0)), Vector2(x, y + 88), 27, 0.02, 103)
+	_write_left(n, font, "x%d combo" % int(cfg.get_value("best", "combo", 1)), Vector2(x, y + 124), 27, -0.01, 104)
 
 
 ## The hint, either side of the road: "hold" written letter by letter, underlined with an arrow pointing
 ## the way to drift, then "drift left/right"; held, rubbed out, written again (the sides take turns).
 ## Once the run starts it stays on the paper, fully written.
 func _draw_hint(n: Node2D) -> void:
-	var font: Font = g.hand_font()
+	var font: Font = g.ui_font()
 	var hw: float = g.widths[0] * 0.5
 	for side in [-1.0, 1.0]:
 		var x: float = side * (hw + 92.0)
@@ -1096,7 +1096,7 @@ func _draw_hint(n: Node2D) -> void:
 		if fade <= 0.0:
 			continue
 		var letters := 99 if done else int(smoothstep(0.0, 0.4, u) * 5.0)
-		_write(n, font, "hold", Vector2(x, y), 54, side * 0.04, sd, fade, letters)
+		_write(n, font, "hold", Vector2(x, y), 45, side * 0.04, sd, fade, letters)
 		var ar := 1.0 if done else smoothstep(0.4, 0.55, u)
 		if ar > 0.0:
 			var a0 := Vector2(x - side * 30.0, y + 26.0)
@@ -1107,14 +1107,14 @@ func _draw_hint(n: Node2D) -> void:
 				_stroke(n, [a1 + Vector2(-side * 12.0, -9.0), a1, a1 + Vector2(-side * 12.0, 9.0)], 2.6, Color(PENCIL, PENCIL.a * fade), sd + 3)
 		var lab := 1.0 if done else smoothstep(0.55, 0.65, u)
 		if lab > 0.0:
-			_write(n, font, "drift " + ("left" if side < 0 else "right"), Vector2(x, y + 66.0), 30, side * 0.04, sd + 4, fade * lab)
+			_write(n, font, "drift " + ("left" if side < 0 else "right"), Vector2(x, y + 66.0), 25, side * 0.04, sd + 4, fade * lab)
 
 
 ## The settings, written on the paper to the right of the page, beside the gear: ticks, choices you tap
 ## through, a slider.
 ## Always there; drawn again only when something changes.
 func _panel(n: Node2D) -> void:
-	var font: Font = g.hand_font()
+	var font: Font = g.ui_font()
 	hits.clear()
 	if mode != "gone":  # on the start page, the paper behind the settings is rubbed clean so the road
 		# never runs through the writing (the same grain as the sheet, soft at the edges); the run brings it back
@@ -1126,7 +1126,7 @@ func _panel(n: Node2D) -> void:
 	var x0: float = panel_x
 	var x1: float = panel_x + PANEL_W
 	var y := panel_top
-	_write_left(n, font, "settings", Vector2(x0, y), 54, -0.02, 300)
+	_write_left(n, font, "settings", Vector2(x0, y), 45, -0.02, 300)
 	_stroke(n, _wave(Vector2(x0, y + 12), Vector2(x0 + 150, y + 9), 2.5, 2.0), 2.2, PENCIL, 301)
 	y += ROW + 8.0
 	var cfg := _cfg()
@@ -1151,19 +1151,19 @@ func _panel(n: Node2D) -> void:
 				_stroke(n, [box.position, Vector2(box.end.x + 1, box.position.y), box.end, Vector2(box.position.x, box.end.y + 1), box.position + Vector2(1, -2)], 1.9, PENCIL, sd)
 				if r[3]:
 					_stroke(n, [box.position + Vector2(3, 12), box.position + Vector2(10, 21), box.position + Vector2(30, -6)], 2.6, PENCIL, sd + 1)
-				_write_left(n, font, r[1], Vector2(x0 + 40.0, y), 34, 0.0, sd + 2)
+				_write_left(n, font, r[1], Vector2(x0 + 40.0, y), 28, 0.0, sd + 2)
 			"cycle":
 				var opts: Dictionary = _c(r[3])
 				var cur: Dictionary = opts.get(String(cfg.get_value("dev", r[2], r[4])), opts[r[4]])
-				_write_left(n, font, r[1], Vector2(x0, y - 22.0), 22, 0.0, sd)
-				_write_left(n, font, String(cur["name"]), Vector2(x0 + 6.0, y + 6.0), 28, -0.01, sd + 1)
+				_write_left(n, font, r[1], Vector2(x0, y - 22.0), 18, 0.0, sd)
+				_write_left(n, font, String(cur["name"]), Vector2(x0 + 6.0, y + 6.0), 23, -0.01, sd + 1)
 				var ax := Vector2(x1 - 6.0, y - 4.0)
 				_stroke(n, [ax + Vector2(-8, -9), ax, ax + Vector2(-8, 9)], 2.2, PENCIL, sd + 2)
 				rect = Rect2(x0 - 10.0, y - 44.0, x1 - x0 + 20.0, ROW + 6.0)
 				y += 10.0
 			"slider":
 				var v := float(cfg.get_value("dev", "hold", _c("DEFAULT_HOLD")))
-				_write_left(n, font, "%s  %.2f s" % [r[1], v], Vector2(x0, y - 18.0), 22, 0.0, sd)
+				_write_left(n, font, "%s  %.2f s" % [r[1], v], Vector2(x0, y - 18.0), 18, 0.0, sd)
 				var a := Vector2(x0 + 10.0, y + 8.0)
 				var b := Vector2(x1 - 10.0, y + 8.0)
 				_stroke(n, [a, a.lerp(b, 0.5) + Vector2(0, 1.5), b], 2.0, PENCIL, sd + 1)

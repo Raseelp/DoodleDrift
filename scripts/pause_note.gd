@@ -189,8 +189,9 @@ func _draw_ink(n: Node2D) -> void:
 	if fade <= 0.0:
 		return
 	var clean := smoothstep(0.0, 0.3, tt) * fade
+	var squash := 0.72 if kind == "pause" else note.y / note.x * 0.92  # the crash note is taller: cover all of it
 	for k in 3:  # the paper under the note, rubbed clean so it reads over anything already there
-		n.draw_set_transform(note_at + note * 0.5, -0.04, Vector2(1.0, 0.72))
+		n.draw_set_transform(note_at + note * 0.5, -0.04, Vector2(1.0, squash))
 		n.draw_circle(Vector2.ZERO, note.x * 0.6 + k * 22.0, Color(PAPER, (0.55 - k * 0.15) * clean))
 	n.draw_set_transform(Vector2.ZERO)
 	words.clear()
@@ -201,19 +202,19 @@ func _draw_ink(n: Node2D) -> void:
 
 
 func _draw_pause(n: Node2D, tt: float, fade: float) -> void:
-	var font: Font = g.hand_font()
+	var font: Font = g.ui_font()
 	var x := note_at.x + 10.0
 	var y := note_at.y + 90.0
-	_word(n, font, "paused", Vector2(x, y), 96, smoothstep(0.15, 0.55, tt), fade)
-	var w := font.get_string_size("paused", HORIZONTAL_ALIGNMENT_LEFT, -1, 96).x
+	_word(n, font, "paused", Vector2(x, y), 80, smoothstep(0.15, 0.55, tt), fade)
+	var w := font.get_string_size("paused", HORIZONTAL_ALIGNMENT_LEFT, -1, 80).x
 	_pencil(n, [Vector2(x - 4, y + 16), Vector2(x + w * 0.5, y + 20), Vector2(x + w * smoothstep(0.4, 0.7, tt), y + 13)], 4.0, fade, 11)
 	var items := [["hold to continue", Callable()], ["start over", func(): g.pause_start_over()], ["home", func(): g._home()]]
 	for k in items.size():
 		var yy := y + 84.0 + k * 66.0
 		var rv := smoothstep(0.5 + k * 0.15, 0.9 + k * 0.15, tt)
 		var text: String = items[k][0]
-		_word(n, font, text, Vector2(x + 6, yy), 50, rv, fade)
-		var tw := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, 50).x
+		_word(n, font, text, Vector2(x + 6, yy), 42, rv, fade)
+		var tw := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, 42).x
 		if k == 0:  # the hold: its underline is drawn as you hold, and when it's whole the game carries on
 			var u := 1.0 if phase == "resuming" else held / HOLD
 			if u > 0.0:
@@ -223,49 +224,83 @@ func _draw_pause(n: Node2D, tt: float, fade: float) -> void:
 			words.append([Rect2(x - 10, yy - 52, tw + 32, 72), items[k][1]])
 
 
-## The run, written up: what happened, the score (circled in red if it's a new best), the rest smaller.
+## The run, written up in one centred column, most important first: what happened (small, grey), the score
+## (big, underlined; circled in red with "new best!" under it, or the best in grey), a pencil rule, three
+## stats each with its label under it, then the one thing to do ("hold to drive again", underlined as you
+## hold) and the way out ("home", small).
 func _draw_crash(n: Node2D, tt: float) -> void:
-	var font: Font = g.hand_font()
-	var x := note_at.x + 16.0
-	var y := note_at.y + 70.0
+	var font: Font = g.ui_font()
+	var cx := note_at.x + note.x * 0.5
+	var y0 := note_at.y
+	var grey := Color(PENCIL, 0.55)
+	# what happened
 	var why := String(info.get("why", "crashed")).to_lower()
-	_word(n, font, why, Vector2(x, y), 64, smoothstep(0.1, 0.45, tt), 1.0)
-	var score := str(info.get("score", 0))
-	var sy := y + 120.0
-	_word(n, font, score, Vector2(x, sy), 120, smoothstep(0.35, 0.7, tt), 1.0)
-	var sw := font.get_string_size(score, HORIZONTAL_ALIGNMENT_LEFT, -1, 120).x
-	_pencil(n, [Vector2(x - 4, sy + 18), Vector2(x + sw * 0.5, sy + 23), Vector2(x + sw * smoothstep(0.6, 0.85, tt), sy + 15)], 4.4, 1.0, 31)
-	if info.get("new_best", false):  # circled in red pen, like a teacher's mark
+	_centred(n, font, why, cx, y0 + 52.0, 30, smoothstep(0.1, 0.45, tt), grey)
+	# the score
+	var score := _thousands(int(info.get("score", 0)))
+	var sy := y0 + 165.0
+	var sw := font.get_string_size(score, HORIZONTAL_ALIGNMENT_LEFT, -1, 104).x
+	_centred(n, font, score, cx, sy, 104, smoothstep(0.35, 0.7, tt), PENCIL)
+	if info.get("new_best", false):  # circled in red pen, like a teacher's mark, with the words under it
 		var u := smoothstep(0.8, 1.15, tt)
 		if u > 0.0:
-			_word(n, font, "new best!", Vector2(x + sw + 26, sy - 34), 44, u, 1.0, RED)
-			var c := Vector2(x + sw + 108, sy - 50)
+			var c := Vector2(cx, sy - 36.0)
+			var ra := minf(sw * 0.5 + 28.0, note.x * 0.5 - 12.0)  # always inside the note
 			var ring := PackedVector2Array()
-			for i in int(1 + 34 * u):
-				var a := -2.6 + TAU * 1.1 * i / 34.0
-				ring.append(c + Vector2(cos(a) * 104.0, sin(a) * 40.0) * (1.0 + 0.05 * i / 34.0))
+			for i in int(1 + 36 * u):
+				var a := -2.6 + TAU * 1.08 * i / 36.0
+				ring.append(c + Vector2(cos(a) * ra, sin(a) * 62.0) * (1.0 + 0.04 * i / 36.0))
 			if ring.size() > 1:
 				n.draw_polyline(ring, RED, 3.0, true)
+			_centred(n, font, "new best!", cx, sy + 62.0, 32, u, RED)
 	else:
-		_word(n, font, "best %d" % int(info.get("best", 0)), Vector2(x + sw + 26, sy - 20), 38, smoothstep(0.8, 1.1, tt), 0.7)
-	var line := "%d m    best combo x%d    %d confetti" % [int(info.get("dist", 0)), int(info.get("combo", 1)), int(info.get("confetti", 0))]
-	_word(n, font, line, Vector2(x + 2, sy + 72), 34, smoothstep(0.9, 1.3, tt), 0.75)
-	# hold to drive again: underlined as you hold (after a moment); home: a doodled arrow and the word
-	var hy := sy + 170.0
+		_pencil(n, [Vector2(cx - sw * 0.5, sy + 16), Vector2(cx, sy + 20), Vector2(cx - sw * 0.5 + sw * smoothstep(0.6, 0.85, tt), sy + 14)], 4.0, 1.0, 31)
+		_centred(n, font, "best " + _thousands(int(info.get("best", 0))), cx, sy + 62.0, 28, smoothstep(0.8, 1.1, tt), grey)
+	# a pencil rule, then the stats: value on top, what it is underneath
+	var rv := smoothstep(0.9, 1.3, tt)
+	var ry := y0 + 250.0
+	if rv > 0.0:
+		_pencil(n, [Vector2(cx - 150.0, ry), Vector2(cx, ry + 2.0), Vector2(cx - 150.0 + 300.0 * rv, ry - 1.0)], 1.8, 0.5, 33)
+	var stats := [[_thousands(int(info.get("dist", 0))) + " m", "distance"], ["x%d" % int(info.get("combo", 1)), "best combo"], [_thousands(int(info.get("confetti", 0))), "confetti"]]
+	for k in 3:
+		var sx := cx + (k - 1) * note.x * 0.31
+		_centred(n, font, String(stats[k][0]), sx, ry + 58.0, 38, rv, PENCIL)
+		_centred(n, font, String(stats[k][1]), sx, ry + 86.0, 20, rv, grey)
+	# hold to drive again: the one thing to do, underlined as you hold (after a moment)
+	var hy := y0 + 420.0
 	var hold_text := "hold to drive again"
-	_word(n, font, hold_text, Vector2(x, hy), 52, smoothstep(1.1, 1.5, tt), 1.0 if tt >= CRASH_WAIT else 0.5)
-	var hw := font.get_string_size(hold_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 52).x
+	var hw := font.get_string_size(hold_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 44).x
+	_centred(n, font, hold_text, cx, hy, 44, smoothstep(1.1, 1.5, tt), PENCIL if tt >= CRASH_WAIT else Color(PENCIL, 0.5))
 	if held > 0.0:
 		var u := held / HOLD
-		_pencil(n, [Vector2(x - 2, hy + 10), Vector2(x + hw * u * 0.5, hy + 13), Vector2(x + hw * u, hy + 9)], 3.4, 1.0, 40)
-	var my := hy + 76.0
-	var rv := smoothstep(1.3, 1.7, tt)
-	if rv > 0.0:
-		_pencil(n, [Vector2(x + 54, my - 16), Vector2(x + 30, my - 15), Vector2(x + 4, my - 16)], 2.6, rv, 41)
-		_pencil(n, [Vector2(x + 16, my - 27), Vector2(x + 3, my - 16), Vector2(x + 16, my - 5)], 2.6, rv, 42)
-		_word(n, font, "home", Vector2(x + 66, my), 48, rv, 1.0)
-		var mw := font.get_string_size("home", HORIZONTAL_ALIGNMENT_LEFT, -1, 48).x
-		words.append([Rect2(x - 10, my - 52, mw + 96, 72), func(): g._home()])
+		var hx := cx - hw * 0.5
+		_pencil(n, [Vector2(hx - 2, hy + 10), Vector2(hx + hw * u * 0.5, hy + 13), Vector2(hx + hw * u, hy + 9)], 3.4, 1.0, 40)
+	# home: small, with a doodled arrow
+	var my := y0 + 482.0
+	var hv := smoothstep(1.3, 1.7, tt)
+	if hv > 0.0:
+		var mw := font.get_string_size("home", HORIZONTAL_ALIGNMENT_LEFT, -1, 32).x
+		var mx := cx - (mw + 40.0) * 0.5
+		_pencil(n, [Vector2(mx + 30, my - 12), Vector2(mx + 16, my - 11), Vector2(mx + 2, my - 12)], 2.4, hv * 0.7, 41)
+		_pencil(n, [Vector2(mx + 11, my - 20), Vector2(mx + 1, my - 12), Vector2(mx + 11, my - 4)], 2.4, hv * 0.7, 42)
+		_word(n, font, "home", Vector2(mx + 40.0, my), 32, hv, 0.7)
+		words.append([Rect2(mx - 16, my - 44, mw + 72, 64), func(): g._home()])
+
+
+## A word written centred on `cx` (baseline at y).
+func _centred(n: Node2D, font: Font, s: String, cx: float, y: float, size_px: int, reveal: float, col: Color) -> void:
+	var w := font.get_string_size(s, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px).x
+	_word(n, font, s, Vector2(cx - w * 0.5, y), size_px, reveal, 1.0, col)
+
+
+## 12345 -> "12,345"
+static func _thousands(v: int) -> String:
+	var s := str(absi(v))
+	var out := ""
+	while s.length() > 3:
+		out = "," + s.right(3) + out
+		s = s.left(s.length() - 3)
+	return ("-" if v < 0 else "") + s + out
 
 
 ## Handwriting, letter by letter as it is written (`reveal` 0..1), with a faint second pass.

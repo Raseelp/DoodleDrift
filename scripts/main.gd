@@ -23,73 +23,116 @@ func start_run(home := false) -> void:
 	_swap(s)
 
 
-## Drive again (after a crash, or "start over"): the page turns to a fresh one, and the new run is laid
-## under it while it's covered.
+## Drive again (after a crash, or "start over"): the screen as it is now is kept as a picture, the new run
+## is laid under it straight away, and the picture is rubbed out from the top right down to the bottom in
+## zigzag strokes, uncovering the new page.
 func _again() -> void:
 	if turning:
 		return
 	turning = true
+	var shot := ImageTexture.create_from_image(get_viewport().get_texture().get_image())
 	var layer := CanvasLayer.new()
 	layer.layer = 100
 	layer.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(layer)
-	var turn := PageTurn.new()
-	var cfg := Drift._load()
-	var papers: Dictionary = Drift.PAPERS
-	turn.paper = load(papers.get(String(cfg.get_value("dev", "paper", "white")), papers["white"])["tex"])
-	turn.covered = func(): start_run(false)
-	turn.finished = func():
+	var wipe := EraseWipe.new()
+	wipe.shot = shot
+	wipe.finished = func():
 		layer.queue_free()
 		turning = false
-	layer.add_child(turn)
+	layer.add_child(wipe)
+	start_run(false)
 
 
 var turning := false
 
 
-## A fresh sheet slides in over the page from the right edge, its edge curled and shadowed like a page
-## being turned; once it covers the screen the new run is put under it, then it lifts away.
-class PageTurn extends Control:
-	const IN := 0.38
-	const OUT := 0.3
-	var paper: Texture2D
-	var covered: Callable
+## The old screen (a picture) rubbed out the way a hand rubs a page clean: six strokes from the top right,
+## right to left then back, each a little lower, bowing down in the middle the way an arm swings. Each
+## stroke picks up speed, slows into the turn and pauses there a moment before the next. The cleared swath
+## has a round leading end and a ragged edge, with a faint grey smudge just behind it that is gone a moment
+## later. Real time, so it runs the same whatever the game's time scale.
+class EraseWipe extends Control:
+	const TIME := 1.0
+	const ROWS := 6.0
+	const WAIT := 0.15  # a beat before the first stroke (the new run draws its first frame under the picture)
+	var shot: Texture2D
 	var finished: Callable
 	var t := 0.0
 	var last_us := 0
-	var swapped := false
+	var mat: ShaderMaterial
+	static var _shader: Shader
 
 	func _ready() -> void:
 		process_mode = Node.PROCESS_MODE_ALWAYS
-		mouse_filter = Control.MOUSE_FILTER_STOP
-		texture_repeat = CanvasItem.TEXTURE_REPEAT_ENABLED
+		mouse_filter = Control.MOUSE_FILTER_IGNORE  # the hold carries on into the new run
 		size = get_viewport_rect().size
 		last_us = Time.get_ticks_usec()
+		if _shader == null:
+			_shader = Shader.new()
+			_shader.code = """
+shader_type canvas_item;
+uniform float prog = 0.0;
+uniform float rows = 6.0;
+uniform float aspect = 0.5;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+float noise(vec2 p) {
+	vec2 i = floor(p); vec2 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+}
+void fragment() {
+	vec4 c = texture(TEXTURE, UV);
+	float s = prog * rows;
+	float r = min(floor(s), rows - 1.0);
+	float local = s >= rows ? 1.0 : fract(s);
+	float f = smoothstep(0.0, 0.85, local);  // speeds up, slows into the turn, rests there a moment
+	bool even = mod(r, 2.0) < 0.5;
+	float hx = even ? 1.0 - f : f;  // even strokes go right to left, odd ones back
+	hx = mix(-0.12, 1.12, hx);  // each stroke runs off both edges of the page
+	// the swath: bowed down in the middle like an arm's swing, running a little downhill, edges ragged
+	float bow = sin(clamp(UV.x, 0.0, 1.0) * 3.14159) * 0.18;
+	float hill = (even ? 1.0 - UV.x : UV.x) * 0.2;
+	float rag = (noise(UV * vec2(7.0, 3.0)) - 0.5) * 0.35 + (noise(UV * vec2(70.0, 45.0)) - 0.5) * 0.12;
+	float py = UV.y * rows - bow + hill + rag - 0.05;
+	float pr = floor(py);
+	float erased = 0.0;
+	float fresh = 0.0;
+	if (pr < r || s >= rows) {
+		erased = 1.0;
+	} else if (pr == r) {
+		float along = (even ? UV.x - hx : hx - UV.x) * aspect * rows;  // behind the leading end, in rows
+		float dy = fract(py) - 0.5;
+		float tip = length(vec2(min(along, 0.0), dy));  // the leading end is round
+		float rim = 0.5 + (noise(UV * vec2(40.0, 40.0)) - 0.5) * 0.12;
+		erased = along > 0.0 ? 1.0 : 1.0 - smoothstep(rim - 0.04, rim + 0.04, tip);
+		fresh = (1.0 - smoothstep(0.0, 0.8, max(along, 0.0))) * erased;
+	}
+	// just rubbed: a faint graphite smudge left for a moment behind the leading end
+	vec4 smudge = vec4(0.5, 0.5, 0.53, 0.15 * fresh);
+	COLOR = vec4(mix(c.rgb, smudge.rgb, erased), mix(c.a, smudge.a, erased));
+}
+"""
+		mat = ShaderMaterial.new()
+		mat.shader = _shader
+		mat.set_shader_parameter("rows", ROWS)
+		mat.set_shader_parameter("aspect", size.x / size.y)
+		var pic := TextureRect.new()
+		pic.texture = shot
+		pic.size = size
+		pic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		pic.stretch_mode = TextureRect.STRETCH_SCALE
+		pic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		pic.material = mat
+		add_child(pic)
 
 	func _process(_d: float) -> void:
 		var now := Time.get_ticks_usec()
-		t += minf(0.1, (now - last_us) / 1000000.0)
+		t += minf(0.05, (now - last_us) / 1000000.0)
 		last_us = now
-		if not swapped and t >= IN:
-			swapped = true
-			covered.call()
-		if t >= IN + OUT + 0.05:
+		mat.set_shader_parameter("prog", clampf((t - WAIT) / TIME, 0.0, 1.0))
+		if t >= WAIT + TIME + 0.05:
 			finished.call()
-		queue_redraw()
-
-	func _draw() -> void:
-		var w := size.x
-		var h := size.y
-		if t < IN:  # turning in: the sheet's edge sweeps from the right to the left
-			var e := w * (1.0 - smoothstep(0.0, IN, t))
-			var r := Rect2(e, 0, w - e + 2.0, h)
-			draw_texture_rect_region(paper, r, Rect2(r.position, r.size), Color(1, 1, 1, 1))
-			for k in 8:  # the shadow the lifted page throws on the one below
-				draw_rect(Rect2(e - (k + 1) * 6.0, 0, 6.0, h), Color(0, 0, 0, 0.05 * (1.0 - k / 8.0)))
-			draw_line(Vector2(e, 0), Vector2(e + 10.0, h), Color(0.4, 0.4, 0.42, 0.5), 2.0, true)  # the curled edge
-		else:  # covered: the new page is under it now; it lifts away
-			var a := 1.0 - smoothstep(IN, IN + OUT, t)
-			draw_texture_rect_region(paper, Rect2(Vector2.ZERO, size), Rect2(Vector2.ZERO, size), Color(1, 1, 1, a))
 
 
 func _swap(n: Node) -> void:

@@ -79,6 +79,9 @@ const SOUNDS := {
 	"coin": ["res://sounds/coin_1.ogg", "res://sounds/coin_2.ogg"],
 	"bump": ["res://sounds/bump.ogg"],
 	"crash": ["res://sounds/crash.ogg"],
+	"stamp": ["res://sounds/stamp.wav"],  # made for the game (sounds/CREDITS.txt)
+	"combo": ["res://sounds/combo_up.wav"],
+	"clip": ["res://sounds/clip.wav"],
 }
 ## Background music (music/CREDITS.txt). The dev setting picks one, shuffles them, or turns it off.
 const TRACKS := {
@@ -211,6 +214,9 @@ var flakes: Array = []  # torn paper bits flying
 var fx: TyreFx  # smoke and rubber while sliding, graphite and eraser crumbs while tearing (tyre_fx.gd)
 var pop_t := -9.0  # when the last piece was collected (the HUD handful pops)
 var chads_up: Array = []  # collected confetti tumbling away: {p, v, a, t, dir}
+var chads_fly: Array = []  # confetti won by a clip, flying from it to the counter (screen): {from, t, v, a, n, side}
+const CHAD_FLY := 0.75  # how long each piece takes to reach the counter
+const CLIP_CONFETTI := [0, 15, 30]  # per grade: CLIP, PERFECT
 const CHAD_SIZE := 28.0  # on the road (world px)
 var words: Array = []
 var things_dirty := true
@@ -218,17 +224,34 @@ var things_dirty := true
 # The run
 var score := 0.0
 var mult := 1
-## The red-stamp HUD (UI phase 3): each drift's points are gathered while it lasts, then stamped in red
-## ink beside the total and counted into it. A drift ends when the car straightens or switches sides.
-var drift_on := false
-var drift_pts := 0.0
-var drift_side := 0.0
-var drift_quiet := 0.0
-var stamps: Array = []  # {pts, t, rot}: stamped, not yet counted into the total
+## Points (2026-11-26, after Absolute Drift, Forza and real drift judging): only drifting scores.
+## A chain runs while the car drifts past CHAIN_DEG: points per second from the slide's angle (40% just
+## above it, full from 65, nothing past 90), more along the edge of the line, plus clips and near misses.
+## The chain gathers them before the combo (as Forza does); the combo multiplies the whole chain when it
+## is stamped. A switch of sides raises the combo (up to x9) once the meter
+## (side_pts) has SWITCH_PTS in it. A short grace (longer while swapping) carries the chain over a dip;
+## when it runs out, or on the line, a bump or a crash, the whole chain is banked: stamped in red ink and
+## counted into the total.
+var flights: Array = []  # clip points flying up to the chain: {pts, from (screen), t, col}
+const FLIGHT := 0.55  # how long they take to reach it
+var live_t := -9.0  # when clip points last landed in the chain (its pulse)
+var mult_t := -9.0  # when the combo last went up (its pulse)
+var total_t := -9.0  # when a stamp last landed in the total (its pulse)
+var swap_wait := false  # this low-angle moment already got the longer swap wait
+var side_pts := 0.0  # the combo meter: points (as shown, before the combo) since it last cashed in; a swap before it is full carries it over
+var chain_mile := 0  # how many 500s the chain has passed (one ping each)
+var chain_on := false
+var chain_pts := 0.0
+var chain_side := 0.0
+var chain_grace := 0.0  # seconds left before an idle chain is banked
+const CHAIN_GRACE := 0.6  # just long enough to swing through a side switch
+const SWITCH_PTS := 80.0  # a side switch only raises the combo once the meter has this many points (as shown, before the combo)
+const SWAP_GRACE := 1.4  # ... but swinging over to the other side (holding it) may take this long in all
+const CHAIN_DEG := 25.0  # below this angle the chain is not being kept up
+var stamps: Array = []  # {pts, t, rot}: banked, flying up, not yet counted into the total
 var merged_t := -9.0  # when the last stamp was counted in (the old total is crossed out)
 var merged_from := 0
 const STAMP_HOLD := 0.8  # a stamp sits this long, then slides into the total
-var clean_t := 0.0
 var best_combo := 1
 var coins_got := 0
 var dist := 0.0
@@ -906,6 +929,13 @@ static func _hole_row() -> Texture2D:
 	return page_tex["hole_row"]
 
 
+## The game's own writing (points, pause and crash notes, tutorial notes): Itim, upright and quick to read.
+static func ui_font() -> Font:
+	if not page_tex.has("ui_font"):
+		page_tex["ui_font"] = load("res://fonts/hand/Itim.ttf")
+	return page_tex["ui_font"]
+
+
 static func hand_font() -> Font:
 	if not page_tex.has("font"):
 		page_tex["font"] = load("res://fonts/hand/Caveat.ttf")
@@ -993,8 +1023,7 @@ func _on_prop_hit(o: Node) -> void:
 	elif clock - bump_t > 0.4:
 		bump_t = clock
 		speed *= 0.55
-		mult = 1
-		clean_t = 0.0
+		_bank_chain()  # a broken chain still counts
 		_play("bump", 0.0)
 		_word("BUMP", pos + Vector2(0, -50), Color(0.75, 0.2, 0.2))
 
@@ -1273,9 +1302,7 @@ func _move(delta: float) -> void:
 	on_road = in_lot or _off_line(wh[0], i) < half or _off_line(wh[1], i) < half
 	if was and not on_road:
 		_word("LINE", pos, Color(0.35, 0.35, 0.4))
-		_bank_drift()
-		clean_t = 0.0
-		mult = 1
+		_bank_chain()  # a broken chain still counts
 	# Off the line the paper drags: the car eases down (never stops) so it can be steered back, and picks up
 	# again gently once it's back between the lines.
 	var cruise := SPEED if on_road else OFF_SPEED
@@ -1484,7 +1511,7 @@ func _radio() -> void:
 		r.choose(pick)
 
 
-func _play(kind: String, db: float, pitch := 1.0) -> void:
+func _play(kind: String, db: float, pitch := 1.0, vary := true) -> void:
 	if not Game.sound_on:
 		return
 	var p := shots[shot_i]
@@ -1492,7 +1519,7 @@ func _play(kind: String, db: float, pitch := 1.0) -> void:
 	var takes: Array = snd[kind]
 	p.stream = takes[rng.randi() % takes.size()]
 	p.volume_db = db
-	p.pitch_scale = pitch * rng.randf_range(0.94, 1.06)  # never quite the same twice
+	p.pitch_scale = pitch * (rng.randf_range(0.94, 1.06) if vary else 1.0)  # never quite the same twice
 	p.play()
 
 
@@ -1579,40 +1606,58 @@ func _engine(delta: float) -> void:
 # ---------------------------------------------------------------- scoring and hits
 
 func _score(delta: float) -> void:
-	score += speed * delta * 0.05  # distance
-	var before := score
 	var side := signf(wrapf(heading - vdir, -PI, PI))
-	if slip > 0.25 and on_road and drift_on and side != drift_side and drift_pts > 5.0:
-		_bank_drift()  # switching sides: that drift is stamped and the next one starts
-	if slip > 0.25 and on_road:
+	if rad_to_deg(slip) > CHAIN_DEG and on_road:
+		if not chain_on:  # a new chain
+			for st in stamps:  # a stamp still sitting where the chain is shown flies off now, out of its way
+				st["t"] = minf(float(st["t"]), clock - STAMP_HOLD)
+			chain_on = true
+			chain_pts = 0.0
+			chain_mile = 0
+			side_pts = 0.0
+			mult = 1
+			chain_side = side
+		elif side != chain_side:  # linked from one side to the other: the combo goes up if that drift was a real one
+			chain_side = side
+			var earned := side_pts >= SWITCH_PTS
+			if earned:  # cashed in: the meter starts again; not full yet, it carries over to the new side
+				side_pts = 0.0
+			if earned and mult < 9:
+				mult += 1
+				mult_t = clock
+				best_combo = maxi(best_combo, mult)
+				_word("x%d" % mult, pos + Vector2(0, -40), Color(0.85, 0.35, 0.15))
+				_play("combo", -4.0, pow(2.0, (mult - 2) / 6.0), false)  # a whole tone higher with each combo step
+		chain_grace = CHAIN_GRACE
+		swap_wait = false
+		var deg := rad_to_deg(slip)
+		var steep := smoothstep(CHAIN_DEG, 65.0, deg)  # flow drifts settle at 32-50 and deepen to ~68 when held
+		var angle := lerpf(0.4, 1.0, steep) * (1.0 - smoothstep(85.0, 100.0, deg))  # a shallow slide still pays 40%, most from 65; past 90 is a spin
+		var pace := clampf(speed / DRIFT_FLOOR, 0.2, 1.0)  # full pay at drift speed (a drift scrubs the car down to DRIFT_FLOOR); less only when crawling
 		var edge := absf(widths[progress_i] * 0.5 - pos.distance_to(road[progress_i]))
-		var close := 1.6 if edge < 26.0 else 1.0  # drifting close to the line pays more
-		score += rad_to_deg(slip) * delta * 0.4 * mult * close * inks.score_mul(lens[progress_i], pos)
-		var clips := inks.clip(pos, slip > 0.3)
-		if clips > 0:
-			score += 50.0 * mult * clips
-			_word("CLIP", pos + Vector2(0, -50), Color(0.15, 0.25, 0.65))
-		clean_t += delta
-		var m := 1 + int(clean_t / 1.6)
-		if m > mult:
-			mult = mini(m, 9)
-			best_combo = maxi(best_combo, mult)
-			_word("x%d" % mult, pos + Vector2(0, -40), Color(0.85, 0.35, 0.15))
-	if slip > 0.25 and on_road:
-		drift_on = true
-		drift_side = side
-		drift_quiet = 0.0
-		drift_pts += score - before
-	elif drift_on:
-		drift_quiet += delta
-		if drift_quiet > 0.6:
-			_bank_drift()
+		var close := 1.6 if edge < 26.0 else 1.0  # drifting along the edge of the line pays more
+		var got := 120.0 * angle * pace * close * inks.score_mul(lens[progress_i], pos) * delta  # before the combo
+		side_pts += got
+		chain_pts += got
+		if int(chain_pts / 500.0) > chain_mile:  # every 500 points in the chain
+			chain_mile = int(chain_pts / 500.0)
+			_play("coin", -3.0, 1.45)
+	elif chain_on:
+		# Holding the other side (straight away, or pressed again before the short wait ran out after letting
+		# go): it's a swap, so the chain waits for the car to swing through. Just straightening up does not.
+		var inp := signi(_input_side())
+		if not swap_wait and inp != 0 and float(inp) != chain_side:
+			swap_wait = true
+			chain_grace += SWAP_GRACE - CHAIN_GRACE
+		chain_grace -= delta
+		if chain_grace <= 0.0:
+			_bank_chain()
+	_clips()
 	for c in coins:
 		if not c["got"] and pos.distance_to(c["p"]) < CAR_R + 12.0:
 			c["got"] = true
 			things_dirty = true
-			coins_got += 1
-			score += 25.0
+			coins_got += 1  # confetti is collected for later (the garage), not score
 			pop_t = clock
 			chads_up.append({"p": c["p"], "v": c["v"], "a": c["a"], "t": clock, "dir": Vector2.from_angle(vdir).rotated(rng.randf_range(-0.6, 0.6))})
 			_play("coin", -6.0)
@@ -1620,6 +1665,42 @@ func _score(delta: float) -> void:
 			c["f"] = 1  # the car's wind nudges it once: it turns a little on the page and settles flat
 			c["a"] = float(c["a"]) + rng.randf_range(-0.5, 0.5)
 			things_dirty = true
+
+
+## Cones and boxes (inks.gd): the nose near the cone, the tail in the box, while drifting. CLIP 150, PERFECT
+## 300 into the chain (the combo multiplies it at the stamp); the points fly from the clip up to the chain
+## (they count straight away). Any corner or side of the car touching a cone tips it over.
+func _clips() -> void:
+	var f := Vector2.from_angle(heading)
+	var r := f.orthogonal()
+	var front := pos + f * CAR_LEN * 0.5
+	var back := pos - f * CAR_LEN * 0.5
+	var nose := [front, front + r * 13.0, front - r * 13.0]
+	var tails := [back + r * 13.0, back - r * 13.0]
+	var body := nose + tails + [pos + r * 13.0, pos - r * 13.0]  # anything of the car touching a cone tips it
+	var drifting := rad_to_deg(slip) > CHAIN_DEG and on_road
+	for ev in inks.clip_check(nose, tails, body, lens[progress_i], drifting):
+		var perfect := int(ev["grade"]) == 2
+		var pts := 300 if perfect else 150  # before the combo, like everything in the chain
+		var col := Color(0.75, 0.16, 0.15) if perfect else Color(0.15, 0.25, 0.65)
+		_word("PERFECT" if perfect else "CLIP", Vector2(ev["p"]) + Vector2(0, -36), col)
+		_play("clip", -3.0, 1.3 if perfect else 1.0, false)
+		# confetti: counted now, shown as pieces flying up to the counter (each carries part of it)
+		var won: int = CLIP_CONFETTI[int(ev["grade"])]
+		var sp0 := (Vector2(ev["p"]) - cam.get_screen_center_position()) * cam.zoom + view * 0.5
+		coins_got += won
+		var pieces := 5 if perfect else 3
+		for k in pieces:
+			var share := won / pieces + (1 if k < won % pieces else 0)
+			chads_fly.append({"from": sp0 + Vector2(rng.randf_range(-14, 14), rng.randf_range(-14, 14)), "t": clock + k * 0.07,
+				"v": rng.randi() % 6, "a": rng.randf() * TAU, "n": share, "side": rng.randf_range(-1.0, 1.0)})
+		if chain_on:
+			chain_pts += pts
+			side_pts += pts
+			var sp := (Vector2(ev["p"]) - cam.get_screen_center_position()) * cam.zoom + view * 0.5
+			flights.append({"pts": pts, "from": sp, "t": clock, "col": col})
+		else:
+			_stamp_points(pts, mult, "PERFECT" if perfect else "CLIP")
 
 
 ## Near misses: brushing past a desk object without touching it. (Touching is caught by the physics.)
@@ -1630,27 +1711,39 @@ func _hits() -> void:
 		var d: float = o.gap_to(pos)
 		if d < CAR_R + 16.0 and d > CAR_R + 2.0:
 			o.near = true
-			score += 60.0 * mult
-			drift_pts += 60.0 * mult
-			if not drift_on:
-				_bank_drift()
+			if chain_on:
+				side_pts += 150.0
+				chain_pts += 150.0  # brushing past in a drift: into the chain
+			else:
+				_stamp_points(150, 1, "NEAR MISS")
 			_word("NEAR MISS", pos + Vector2(0, -50), Color(0.2, 0.4, 0.75))
 
 
-## A finished drift: stamped in red beside the total (counted in once the stamp has sat a moment).
-func _bank_drift() -> void:
-	drift_on = false
-	drift_quiet = 0.0
-	if drift_pts >= 5.0:
-		stamps.append({"pts": int(drift_pts), "t": clock, "rot": rng.randf_range(-0.22, 0.22)})
-		Game.vibrate(12)
-	drift_pts = 0.0
+## The chain is over: it's banked, stamped in red ink and counted into the total.
+func _bank_chain() -> void:
+	flights.clear()
+	if chain_on and chain_pts >= 5.0:
+		_stamp_points(int(chain_pts * mult), mult)  # the combo multiplies the whole chain here
+	chain_on = false
+	chain_pts = 0.0
+	mult = 1
+
+
+func _stamp_points(pts: int, combo := 1, label := "") -> void:
+	score += pts
+	if label == "":
+		label = "BIG DRIFT" if pts > 1500 else "DRIFT"
+	stamps.append({"pts": pts, "t": clock, "rot": rng.randf_range(-0.22, 0.22), "seed": rng.randi() % 100000, "combo": combo, "label": label})
+	_play("stamp", -2.0 if pts > 1500 else -4.0, 0.9 if pts > 1500 else 1.0)  # the stamp thumping down (a big one deeper)
+	Game.vibrate(12)
 
 
 func _crash(why: String) -> void:
 	if state != "play":
 		return
-	_bank_drift()
+	_bank_chain()  # a broken chain still counts
+	for st in stamps:  # the slow-motion freezes before a stamp could fly: count it into the total now
+		st["t"] = clock - STAMP_HOLD - 0.45
 	state = "crashed"
 	crash_t = clock
 	spin = 9.0 * (1.0 if rng.randf() < 0.5 else -1.0)
@@ -1957,12 +2050,13 @@ func _draw_obstacle(n: Node2D, o: Dictionary) -> void:
 func _draw_hud(n: Node2D) -> void:
 	if state in ["home", "intro"]:
 		return
-	var font: Font = hand_font()
+	var font: Font = ui_font()
 	var ink := Color(0.15, 0.15, 0.19, 0.92)
 	var red := Color(0.75, 0.16, 0.15, 0.9)
 	var x0 := 30.0
-	var top_y := _top() + 70.0
-	# stamps that have sat long enough are counted into the total
+	var top_y := _top() + 58.0
+	var live := Vector2(view.x * 0.5, _top() + 150.0)  # the chain being driven: top centre, a little down, where a glance reaches
+	# stamps that have flown up are counted into the total
 	var keep: Array = []
 	var counted_in := 0
 	for st in stamps:
@@ -1971,44 +2065,97 @@ func _draw_hud(n: Node2D) -> void:
 		else:
 			keep.append(st)
 	stamps = keep
-	var total := int(score - drift_pts - _stamped(stamps))
+	var total := int(score - _stamped(stamps))
 	if counted_in > 0:  # just counted in: the old total is what it was before these stamps
 		merged_from = total - counted_in
 		merged_t = clock
-	# the total, written in pencil; when a stamp is counted in, the old number is crossed out beside the new
+		total_t = clock
+		if state == "play":
+			_play("coin", -4.0, 1.15)  # counted in
+	# the total: small and quiet in the corner; when a stamp lands the old number is crossed out
 	var age := clock - merged_t
 	if age < 1.0:
 		var old := str(merged_from)
-		var ow := font.get_string_size(old, HORIZONTAL_ALIGNMENT_LEFT, -1, 62).x
+		var ow := font.get_string_size(old, HORIZONTAL_ALIGNMENT_LEFT, -1, 37).x
 		var fade := 1.0 - smoothstep(0.6, 1.0, age)
-		_text(n, font, old, Vector2(x0, top_y), 62, Color(ink, ink.a * fade))
-		n.draw_line(Vector2(x0 - 4, top_y - 16), Vector2(x0 + ow + 4, top_y - 26), Color(ink, 0.8 * fade), 3.0, true)
-		_text(n, font, str(total), Vector2(x0 + (ow + 24) * fade, top_y), 62, ink)
+		_text(n, font, old, Vector2(x0, top_y), 37, Color(ink, ink.a * fade))
+		n.draw_line(Vector2(x0 - 3, top_y - 12), Vector2(x0 + ow + 3, top_y - 19), Color(ink, 0.8 * fade), 2.4, true)
+		_text_pulse(n, font, str(total), Vector2(x0 + (ow + 18) * fade, top_y), 37, ink, clock - total_t, 0.0)
 	else:
-		_text(n, font, str(total), Vector2(x0, top_y), 62, ink)
-	_text(n, font, "%d m" % int(dist), Vector2(x0 + 4, top_y + 34), 28, Color(ink, 0.6))
-	# confetti collected: the little handful and the count, popping when one is picked up
+		_text_pulse(n, font, str(total), Vector2(x0, top_y), 37, Color(ink, 0.8), clock - total_t, 0.0)
+	# confetti won by clips flying up to the counter: they land one by one, each popping it
+	var ic := Vector2(x0 + 18, top_y + 34)
+	var pending := 0
+	var in_air: Array = []
+	for ch in chads_fly:
+		var u := (clock - float(ch["t"])) / CHAD_FLY
+		if u >= 1.0:
+			pop_t = clock
+			continue
+		in_air.append(ch)
+		pending += int(ch["n"])
+		if u < 0.0:
+			continue
+		var e := u * u * (3.0 - 2.0 * u)
+		var from: Vector2 = ch["from"]
+		var mid := from.lerp(ic, 0.5) + Vector2(90.0 * float(ch["side"]), -70.0)
+		var at := from.lerp(mid, e).lerp(mid.lerp(ic, e), e)
+		_draw_chad(n, at, int(ch["v"]), int(u * 40.0) % 16, float(ch["a"]) + u * 5.0, lerpf(1.1, 0.55, e), 1.0, 1.0 + 3.0 * sin(u * PI))
+	chads_fly = in_air
+	# confetti: hidden until the first piece, then always shown; it pops each time one comes in
 	var pt := clock - pop_t
-	var pop := sin(clampf(pt / 0.28, 0.0, 1.0) * PI) if pt < 0.28 else 0.0
-	var ic := Vector2(x0 + 150, top_y + 24)
-	var isz := 36.0 * (1.0 + 0.32 * pop)
-	n.draw_texture_rect(_tex("handful"), Rect2(ic - Vector2(isz, isz) * 0.5, Vector2(isz, isz)), false)
-	_text(n, font, "%d" % coins_got, ic + Vector2(22, 10), int(28 + 6 * pop), Color(ink, 0.7))
-	# the drift being driven, pencilled under the total
-	if drift_on and drift_pts >= 1.0:
-		var live := "drifting  +%d" % int(drift_pts)
-		_text(n, font, live, Vector2(x0 + 2, top_y + 80), 36, Color(ink, 0.8))
-		if mult > 1:
-			var lw := font.get_string_size(live, HORIZONTAL_ALIGNMENT_LEFT, -1, 36).x
-			_text(n, font, "x%d" % mult, Vector2(x0 + lw + 18, top_y + 80), 36, red)
-	# the stamps: thumped down in red ink beside the total, then slid into it
+	if coins_got > 0:
+		var pop := sin(clampf(pt / 0.28, 0.0, 1.0) * PI) if pt < 0.28 else 0.0
+		var a := 1.0
+		var isz := 34.0 * (1.0 + 0.32 * pop)
+		n.draw_texture_rect(_tex("handful"), Rect2(ic - Vector2(isz, isz) * 0.5, Vector2(isz, isz)), false, Color(1, 1, 1, a))
+		_text(n, font, "%d" % (coins_got - pending), ic + Vector2(22, 10), int(28 + 6 * pop), Color(ink, 0.7 * a))
+	# the chain being driven, top centre: points, the grace running out, the combo and its meter in red
+	if chain_on and chain_pts >= 1.0:
+		var flying := 0
+		var still: Array = []
+		for fl in flights:
+			if clock - float(fl["t"]) < FLIGHT:
+				flying += int(fl["pts"])
+				still.append(fl)
+			else:
+				live_t = clock  # landed: the chain number pops
+		flights = still
+		var txt := "+%d" % int(chain_pts - flying)
+		var tw := font.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, 54).x
+		_text_pulse(n, font, txt, live + Vector2(-tw * 0.5, 0), 54, ink, clock - live_t, tw * 0.5)
+		for fl in flights:  # clip points arcing up from the cone or box to the chain
+			var u := clampf((clock - float(fl["t"])) / FLIGHT, 0.0, 1.0)
+			var e := u * u * (3.0 - 2.0 * u)
+			var from: Vector2 = fl["from"]
+			var to := live + Vector2(0, -18)
+			var mid := from.lerp(to, 0.5) + Vector2((to.x - from.x) * 0.15 + 60.0, -40.0)
+			var at := from.lerp(mid, e).lerp(mid.lerp(to, e), e)
+			var ft := "+%d" % int(fl["pts"])
+			var sz := int(lerpf(40.0, 28.0, e))
+			var fw := font.get_string_size(ft, HORIZONTAL_ALIGNMENT_LEFT, -1, sz).x
+			_text(n, font, ft, at - Vector2(fw * 0.5, 0), sz, Color(fl["col"], 1.0 - 0.3 * e))
+		var g := clampf(chain_grace / (SWAP_GRACE if swap_wait else CHAIN_GRACE), 0.0, 1.0)  # a pencil line that shrinks as the grace runs out
+		n.draw_line(live + Vector2(-90.0 * g, 16), live + Vector2(90.0 * g, 18), Color(ink, 0.7), 3.0, true)
+		# the combo below it, with its own meter: a red line growing from the middle as this side's drift
+		# earns its way to the next step; full = ready, the switch to the other side cashes it
+		var mt := "MAX" if mult >= 9 else "x%d" % mult
+		var my := live + Vector2(0, 62)
+		var mw := font.get_string_size(mt, HORIZONTAL_ALIGNMENT_LEFT, -1, 40).x
+		_text_pulse(n, font, mt, my + Vector2(-mw * 0.5, 0), 40, red if mult > 1 else Color(red, 0.55), clock - mult_t, mw * 0.5)
+		var f := 1.0 if mult >= 9 else clampf(side_pts / SWITCH_PTS, 0.0, 1.0)
+		if f > 0.0:
+			var ready := f >= 1.0
+			var half := 70.0 * f * (1.0 + (0.08 * sin(clock * 14.0) if ready and mult < 9 else 0.0))
+			n.draw_line(my + Vector2(-half, 14), my + Vector2(half, 16), Color(red, 0.95 if ready else 0.6), 4.0 if ready else 3.0, true)
+	# the stamps: thumped down where the chain was, then flown up into the total
 	for k in stamps.size():
 		var st: Dictionary = stamps[k]
 		var sa := clock - float(st["t"])
-		var into := smoothstep(STAMP_HOLD, STAMP_HOLD + 0.45, sa)
+		var fly := smoothstep(STAMP_HOLD, STAMP_HOLD + 0.45, sa)
 		var thump := 1.0 + 0.45 * (1.0 - smoothstep(0.0, 0.12, sa))
-		var at := Vector2(x0 + 330.0 + k * 26.0, top_y - 18.0 + k * 12.0).lerp(Vector2(x0 + 70.0, top_y - 20.0), into)
-		_stamp(n, font, "+%d" % int(st["pts"]), at, float(st["rot"]), thump * (1.0 - 0.4 * into), 1.0 - smoothstep(0.7, 1.0, into), int(st["pts"]) > 400)
+		var at := (live + Vector2(k * 22.0, -20.0 + k * 10.0)).lerp(Vector2(x0 + 60.0, top_y - 14.0), fly)
+		_stamp(n, font, st, at, thump * (1.0 - 0.45 * fly), 1.0 - smoothstep(0.75, 1.0, fly))
 
 
 func _stamped(list: Array) -> float:
@@ -2019,21 +2166,98 @@ func _stamped(list: Array) -> float:
 
 
 ## A rubber stamp in red ink: a double rough border and the number, the ink a little patchy.
-func _stamp(n: Node2D, font: Font, text: String, at: Vector2, rot: float, k: float, a: float, big: bool) -> void:
-	var red := Color(0.74, 0.14, 0.13, 0.88 * a)
-	var size_px := 54 if big else 46
+## A rubber stamp pressed by hand: a wobbly double frame with rounded corners, the ink heavier on the side
+## pressed hardest and broken where the rubber missed, small caps above and below the number, the number
+## struck a touch double, paper specks showing through and a few spatters. Each stamp has its own seed.
+func _stamp(n: Node2D, font: Font, st: Dictionary, at: Vector2, k: float, a: float) -> void:
+	var sd := int(st.get("seed", 0))
+	var big := int(st["pts"]) > 1500
+	var text := "+%d" % int(st["pts"])
+	var red := Color(0.72, 0.13, 0.12, 0.9 * a)
+	var size_px := 58 if big else 50
+	var small := 20 if big else 18
 	var w := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px).x
-	n.draw_set_transform(at, rot, Vector2(k, k))
-	var r := Rect2(-w * 0.5 - 18.0, -size_px * 0.62, w + 36.0, size_px * 1.05)
-	n.draw_rect(r, red, false, 3.4)
-	n.draw_rect(r.grow(-6.0), Color(red, red.a * 0.7), false, 1.8)
-	n.draw_string(font, Vector2(-w * 0.5, size_px * 0.28), text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px, red)
-	for i in 16:  # patchy ink: specks of paper showing through
-		var f := sin(i * 12.9898 + text.length() * 3.1) * 43758.5453
-		var u := f - floorf(f)
-		var g2 := sin(i * 78.233 + 1.7) * 12345.678
-		var v := g2 - floorf(g2)
-		n.draw_rect(Rect2(r.position + Vector2(u * r.size.x, v * r.size.y), Vector2(3, 2)), Color(0.97, 0.965, 0.95, 0.75 * a))
+	var label := String(st.get("label", "DRIFT"))
+	var foot := "x%d COMBO" % int(st.get("combo", 1)) if int(st.get("combo", 1)) > 1 else ""
+	w = maxf(w, font.get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, small).x + 10.0)
+	n.draw_set_transform(at, float(st["rot"]), Vector2(k, k))
+	var r := Rect2(-w * 0.5 - 20.0, -size_px * 0.62 - small - 8.0, w + 40.0, size_px * 1.05 + small * (2.0 if foot != "" else 1.0) + 22.0)
+	var press := Vector2.from_angle(_h(sd, 1) * TAU)  # the side pressed hardest gets the most ink
+	_stamp_frame(n, r, 9.0, 3.6, red, press, sd)
+	_stamp_frame(n, r.grow(-6.5), 5.0, 1.6, Color(red, red.a * 0.75), press, sd + 7)
+	var ink := func(p: Vector2) -> Color:  # heavier towards the pressed side
+		var d := clampf(p.dot(press) / (r.size.x * 0.5), -1.0, 1.0)
+		return Color(red, red.a * (0.78 + 0.22 * d))
+	# small caps above and below the number
+	var lw := font.get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, small).x
+	n.draw_string(font, Vector2(-lw * 0.5, r.position.y + small + 7.0), label, HORIZONTAL_ALIGNMENT_LEFT, -1, small, ink.call(Vector2(0, r.position.y)))
+	if foot != "":
+		var fw := font.get_string_size(foot, HORIZONTAL_ALIGNMENT_LEFT, -1, small).x
+		n.draw_string(font, Vector2(-fw * 0.5, r.end.y - 12.0), foot, HORIZONTAL_ALIGNMENT_LEFT, -1, small, ink.call(Vector2(0, r.end.y)))
+	# the number: struck slightly double where the stamp rocked
+	var tp := Vector2(-w * 0.5 + (w - font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px).x) * 0.5, size_px * 0.28)
+	n.draw_string(font, tp + press * 1.6, text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px, Color(red, red.a * 0.28))
+	n.draw_string(font, tp, text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px, ink.call(-press * 10.0))
+	# paper showing through where the rubber didn't take ink, more on the light side
+	var paper := Color(0.97, 0.965, 0.95, 0.8 * a)
+	for i in 34:  # soft round flecks, a few streaked along the press
+		var p := r.position + Vector2(_h(sd, 10 + i) * r.size.x, _h(sd, 50 + i) * r.size.y)
+		if p.dot(press) > 0.0 and _h(sd, 90 + i) < 0.6:
+			continue
+		var sz := 0.6 + _h(sd, 130 + i) * _h(sd, 140 + i) * 2.4
+		if _h(sd, 150 + i) < 0.2:
+			n.draw_line(p, p + press.orthogonal() * (3.0 + sz * 2.0), paper, sz, true)
+		else:
+			n.draw_circle(p, sz, paper)
+	# a few spatters just outside, on the pressed side
+	for i in 5:
+		var ang := press.angle() + (_h(sd, 170 + i) - 0.5) * 1.6
+		var dist := r.size.x * 0.5 + 6.0 + _h(sd, 180 + i) * 14.0
+		var p := Vector2.from_angle(ang) * Vector2(dist, dist * r.size.y / r.size.x)
+		n.draw_circle(p, 0.8 + _h(sd, 190 + i) * 1.6, Color(red, red.a * 0.7))
+	n.draw_set_transform(Vector2.ZERO)
+
+
+## A stamp's frame: a rounded rectangle traced in short pieces that wobble a little, thicker and darker
+## on the pressed side, with small gaps where the rubber didn't print.
+func _stamp_frame(n: Node2D, r: Rect2, rad: float, width: float, col: Color, press: Vector2, sd: int) -> void:
+	var pts := PackedVector2Array()
+	var c := [r.position + Vector2(rad, rad), Vector2(r.end.x - rad, r.position.y + rad), r.end - Vector2(rad, rad), Vector2(r.position.x + rad, r.end.y - rad)]
+	for q in 4:  # each corner's arc, then the straight run to the next one
+		for j in 5:
+			var ang := PI + q * PI * 0.5 + j * PI * 0.125
+			pts.append(c[q] + Vector2.from_angle(ang) * rad)
+		var nxt: Vector2 = c[(q + 1) % 4] + Vector2.from_angle(PI + (q + 1) * PI * 0.5) * rad
+		var last := pts[pts.size() - 1]
+		var steps := int(last.distance_to(nxt) / 9.0)
+		for j in range(1, steps):
+			pts.append(last.lerp(nxt, float(j) / steps))
+	var m := pts.size()
+	for i in m:
+		var p0 := pts[i] + Vector2(sin(i * 0.9 + sd), cos(i * 0.7 + sd * 0.3)) * 0.9
+		var p1 := pts[(i + 1) % m] + Vector2(sin((i + 1) * 0.9 + sd), cos((i + 1) * 0.7 + sd * 0.3)) * 0.9
+		if _h(sd, 300 + i) < 0.07:
+			continue  # the rubber missed here
+		var d := clampf(p0.dot(press) / (r.size.x * 0.5), -1.0, 1.0)
+		n.draw_line(p0, p1, Color(col, col.a * (0.7 + 0.3 * d)), width * (0.8 + 0.35 * d), true)
+
+
+## A steady hash in 0..1 for (seed, i): the same stamp always looks the same.
+func _h(sd: int, i: int) -> float:
+	var f := sin(float(sd) * 12.9898 + float(i) * 78.233) * 43758.5453
+	return f - floorf(f)
+
+
+## Text that pops when something just happened (`age` seconds ago): swells and settles in 0.35 s, a little
+## overshoot, scaled around `pivot_x` along its baseline.
+func _text_pulse(n: Node2D, font: Font, s: String, p: Vector2, size: int, col: Color, age: float, pivot_x: float) -> void:
+	if age < 0.0 or age > 0.35:
+		_text(n, font, s, p, size, col)
+		return
+	var k := 1.0 + 0.55 * sin(age / 0.35 * PI) * (1.0 - age / 0.35 * 0.5)
+	var o := p + Vector2(pivot_x, -size * 0.35)
+	n.draw_set_transform(o, 0.0, Vector2(k, k))
+	_text(n, font, s, p - o, size, col)
 	n.draw_set_transform(Vector2.ZERO)
 
 
