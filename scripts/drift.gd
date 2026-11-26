@@ -18,6 +18,7 @@ const Scribbles = preload("res://scripts/scribbles.gd")
 const Inks = preload("res://scripts/inks.gd")
 const TyreFx = preload("res://scripts/tyre_fx.gd")
 const StartPage = preload("res://scripts/start_page.gd")
+const PauseNote = preload("res://scripts/pause_note.gd")
 const PROP_NAMES := {"pencil_blue": "pencil", "pencil_white": "pencil", "set_square": "set square"}
 ## Desk objects that lie across or beside the road, and how often each turns up.
 const PROP_WEIGHTS := {"pencil": 2.0, "pencil_blue": 1.5, "pencil_white": 1.5, "ruler": 1.5, "scissors": 1.2, "set_square": 1.0, "sharpener": 1.2, "eraser": 1.5, "clip": 1.0}
@@ -123,6 +124,7 @@ var clock := 0.0
 var state := "play"  # home, play, crashed, summary
 var start_home := false  # set before adding: begin parked at the start line, the home screen (start_page.gd)
 var start_page: StartPage
+var no_road: Array = []  # world rects the road must not run through (the start page's gear and settings)
 var hold_lock := false  # the start hold is being ignored (see _input_side)
 var home_hold := 0.0  # how long a side has been held on the start page (a short hold starts the run)
 const HOLD_TO_START := 0.25
@@ -216,6 +218,16 @@ var things_dirty := true
 # The run
 var score := 0.0
 var mult := 1
+## The red-stamp HUD (UI phase 3): each drift's points are gathered while it lasts, then stamped in red
+## ink beside the total and counted into it. A drift ends when the car straightens or switches sides.
+var drift_on := false
+var drift_pts := 0.0
+var drift_side := 0.0
+var drift_quiet := 0.0
+var stamps: Array = []  # {pts, t, rot}: stamped, not yet counted into the total
+var merged_t := -9.0  # when the last stamp was counted in (the old total is crossed out)
+var merged_from := 0
+const STAMP_HOLD := 0.8  # a stamp sits this long, then slides into the total
 var clean_t := 0.0
 var best_combo := 1
 var coins_got := 0
@@ -277,6 +289,10 @@ func _ready() -> void:
 	car_scale = CAR_LEN / maxf(8.0, float(car_len_px[car["sheet"]]))
 	_build(load(pap["tex"]))
 	_sound_setup()
+	if start_home:  # the start page's layout first: the road keeps clear of its gear and settings
+		start_page = StartPage.new()
+		start_page.layout(self)
+		no_road = start_page.keep_clear()
 	road.append(Vector2.ZERO)
 	widths.append(150.0 * road_k)
 	lens.append(0.0)
@@ -286,10 +302,12 @@ func _ready() -> void:
 	pos = road[2]
 	prev_y = pos.y
 	cam_goal_pos = pos
+	if not start_home:  # a quick restart: no empty paper below the start line, it begins at the screen's bottom
+		cam_goal_pos.y = minf(cam_goal_pos.y, _restart_floor())
+		cam.position = cam_goal_pos
 	if start_home:
 		state = "home"
 		pause_btn.visible = false
-		start_page = StartPage.new()
 		add_child(start_page)
 		start_page.setup(self)  # puts the car into its tricks at the meet
 		prev_y = pos.y
@@ -363,8 +381,8 @@ func _build(paper_tex: Texture2D) -> void:
 	hud = DrawNode.new()
 	hud.draw_fn = _draw_hud
 	root.add_child(hud)
-	pause_btn = Game.square_button(Game.icon("pause"), 64, 26)
-	pause_btn.position = Vector2(view.x - 24 - 64, _top() + 14)
+	pause_btn = PauseSign.new()
+	pause_btn.position = Vector2(view.x - 24 - 84, _top() + 8)
 	pause_btn.pressed.connect(_pause)
 	root.add_child(pause_btn)
 
@@ -528,7 +546,19 @@ func _grow_road() -> void:
 			fallbacks += 1
 			piece_w = 1.0
 			pending_corners.clear()
-			_lay([[120.0, 0.0, wrapf(-PI * 0.5 - road_dir, -PI, PI) * 0.6 / 120.0]])  # turn back up the page
+			# turn back up the page; if that would run through the gear or the settings, turn hard away instead
+			var keep := road.size()
+			var dir0 := road_dir
+			var away := _away_from_no_road()
+			var turns := [wrapf(-PI * 0.5 - road_dir, -PI, PI) * 0.6, away * 1.4, away * 2.4, -away * 1.4, -away * 2.4]
+			for k in turns.size():
+				_lay([[120.0, 0.0, float(turns[k]) / 120.0]])
+				if k == turns.size() - 1 or not (_crosses_no_road(keep) or _heads_into_no_road()):
+					break
+				road.resize(keep)
+				widths.resize(keep)
+				lens.resize(keep)
+				road_dir = dir0
 		phrase_left -= 1
 		_chunk(start)
 		_page_things(start)
@@ -574,6 +604,40 @@ func _next_side() -> float:
 
 ## Builds a block and keeps it only if it stays clear of the road already laid and keeps heading up the
 ## page. A failed try is rolled back; later tries use gentler sizes.
+## Whether the road from index `from` on runs through any no-go area (grown by half the road's width).
+func _crosses_no_road(from: int) -> bool:
+	for i in range(from, road.size(), 2):
+		for r in no_road:
+			if (r as Rect2).grow(widths[i] * 0.5 + 20.0).has_point(road[i]):
+				return true
+	return false
+
+
+## Whether the road's end is aimed at a no-go area not far ahead (so the next piece couldn't miss it).
+func _heads_into_no_road() -> bool:
+	var end := road[road.size() - 1]
+	var d := Vector2.from_angle(road_dir)
+	for r in no_road:
+		var to: Vector2 = (r as Rect2).get_center() - end
+		if to.length() < 520.0 + (r as Rect2).size.length() * 0.5 and d.dot(to.normalized()) > 0.45:
+			return true
+	return false
+
+
+## Which way to turn (+1 or -1, as the road's curvature) to steer away from the nearest no-go area.
+func _away_from_no_road() -> float:
+	var end := road[road.size() - 1]
+	var d := Vector2.from_angle(road_dir)
+	var best := INF
+	var side := 1.0
+	for r in no_road:
+		var to: Vector2 = (r as Rect2).get_center() - end
+		if to.length() < best:
+			best = to.length()
+			side = -signf(d.cross(to)) if d.cross(to) != 0.0 else 1.0
+	return side
+
+
 func _try_block(kind: String, attempt: int) -> bool:
 	var keep := road.size()
 	var start_dir := road_dir
@@ -588,6 +652,8 @@ func _try_block(kind: String, attempt: int) -> bool:
 	_lay(segs)
 	piece_w = 1.0
 	var ok := absf(wrapf(road_dir - (-PI * 0.5), -PI, PI)) < 1.9
+	if ok and (_crosses_no_road(keep) or _heads_into_no_road()):  # never through the gear or the settings
+		ok = false  # writing (close by is fine); and not aimed straight at them, so it turns away in time
 	if ok:
 		var lo := maxi(0, keep - 700)
 		var near_len := lens[keep - 1] - 500.0
@@ -1029,8 +1095,6 @@ func _process(delta: float) -> void:
 			heading += spin * delta
 			speed = move_toward(speed, 0.0, 300.0 * delta)
 			pos += Vector2.from_angle(vdir) * speed * delta
-			if state == "crashed" and clock - crash_t > 1.6 and overlay == null:
-				_show_summary()
 	_effects(delta)
 	if start_page != null and start_page.mode == "gone":
 		start_page.after(delta)  # the drone heads back to the pit
@@ -1086,7 +1150,9 @@ func _notification(what: int) -> void:
 		_back()
 	if what in [NOTIFICATION_APPLICATION_FOCUS_OUT, NOTIFICATION_APPLICATION_PAUSED]:
 		if state == "play" and overlay == null:
-			_pause()
+			_pause(true)
+		elif state == "play" and overlay is PauseNote and overlay.phase in ["slowing", "resuming"]:
+			overlay._freeze()  # leaving mid-way: frozen there and then, not left running
 		if scrib:
 			scrib.save_seen()  # the app may be closed from here
 			inks.save()
@@ -1160,6 +1226,12 @@ func _steer_classic(delta: float) -> void:
 		speed = maxf(DRIFT_FLOOR, speed - SCRUB * sin(minf(slip, 1.4)) * delta)
 
 
+## The lowest the camera's centre may sit on a quick restart: with the start line just above the screen's
+## bottom edge.
+func _restart_floor() -> float:
+	return 70.0 - view.y / maxf(cam.zoom.y, 0.01) * 0.5
+
+
 ## How far a point is from the road's centre line (nearest centre point around index i).
 func _off_line(p: Vector2, i: int) -> float:
 	var best := INF
@@ -1201,6 +1273,7 @@ func _move(delta: float) -> void:
 	on_road = in_lot or _off_line(wh[0], i) < half or _off_line(wh[1], i) < half
 	if was and not on_road:
 		_word("LINE", pos, Color(0.35, 0.35, 0.4))
+		_bank_drift()
 		clean_t = 0.0
 		mult = 1
 	# Off the line the paper drags: the car eases down (never stops) so it can be steered back, and picks up
@@ -1507,6 +1580,10 @@ func _engine(delta: float) -> void:
 
 func _score(delta: float) -> void:
 	score += speed * delta * 0.05  # distance
+	var before := score
+	var side := signf(wrapf(heading - vdir, -PI, PI))
+	if slip > 0.25 and on_road and drift_on and side != drift_side and drift_pts > 5.0:
+		_bank_drift()  # switching sides: that drift is stamped and the next one starts
 	if slip > 0.25 and on_road:
 		var edge := absf(widths[progress_i] * 0.5 - pos.distance_to(road[progress_i]))
 		var close := 1.6 if edge < 26.0 else 1.0  # drifting close to the line pays more
@@ -1521,6 +1598,15 @@ func _score(delta: float) -> void:
 			mult = mini(m, 9)
 			best_combo = maxi(best_combo, mult)
 			_word("x%d" % mult, pos + Vector2(0, -40), Color(0.85, 0.35, 0.15))
+	if slip > 0.25 and on_road:
+		drift_on = true
+		drift_side = side
+		drift_quiet = 0.0
+		drift_pts += score - before
+	elif drift_on:
+		drift_quiet += delta
+		if drift_quiet > 0.6:
+			_bank_drift()
 	for c in coins:
 		if not c["got"] and pos.distance_to(c["p"]) < CAR_R + 12.0:
 			c["got"] = true
@@ -1545,21 +1631,45 @@ func _hits() -> void:
 		if d < CAR_R + 16.0 and d > CAR_R + 2.0:
 			o.near = true
 			score += 60.0 * mult
+			drift_pts += 60.0 * mult
+			if not drift_on:
+				_bank_drift()
 			_word("NEAR MISS", pos + Vector2(0, -50), Color(0.2, 0.4, 0.75))
+
+
+## A finished drift: stamped in red beside the total (counted in once the stamp has sat a moment).
+func _bank_drift() -> void:
+	drift_on = false
+	drift_quiet = 0.0
+	if drift_pts >= 5.0:
+		stamps.append({"pts": int(drift_pts), "t": clock, "rot": rng.randf_range(-0.22, 0.22)})
+		Game.vibrate(12)
+	drift_pts = 0.0
 
 
 func _crash(why: String) -> void:
 	if state != "play":
 		return
+	_bank_drift()
 	state = "crashed"
 	crash_t = clock
 	spin = 9.0 * (1.0 if rng.randf() < 0.5 else -1.0)
 	_play("crash", 0.0)
 	Game.vibrate(70)
-	_word(why.to_upper(), pos + Vector2(0, -60), Color(0.75, 0.2, 0.2))
 	prev_best = int(_load().get_value("best", "score", 0))
 	scrib.save_seen()
 	_save()
+	# the spin-out in slow motion as the colour drains, then the run written up on the paper (pause_note.gd)
+	if overlay != null and overlay is PauseNote:  # crashed while a pause was still easing back: it gives way
+		overlay.queue_free()
+		overlay = null
+	if overlay == null:
+		var note := PauseNote.new()
+		overlay = note
+		ui.add_child(note)
+		note.setup(self, false, "crash", {"why": why, "score": int(score), "best": prev_best, "new_best": int(score) > prev_best,
+			"dist": int(dist), "combo": best_combo, "confetti": coins_got})
+		pause_btn.visible = false
 
 
 func _word(text: String, p: Vector2, col: Color) -> void:
@@ -1630,6 +1740,8 @@ func _follow(delta: float) -> void:
 	cam.zoom = Vector2.ONE * z
 	var target := box.get_center().lerp(pos, 0.45)
 	cam_goal_pos = cam_goal_pos.lerp(target, 1.0 - exp(-delta * 2.5))
+	if start_page == null and progress_i < 200:  # a quick restart: never shows the empty paper below the line
+		cam_goal_pos.y = minf(cam_goal_pos.y, _restart_floor())
 	cam.position = cam.position.lerp(cam_goal_pos, 1.0 - exp(-delta * 3.0))
 	var shake := 7.0 * _jolt()
 	cam.offset = Vector2(rng.randf_range(-shake, shake), rng.randf_range(-shake, shake))
@@ -1845,27 +1957,84 @@ func _draw_obstacle(n: Node2D, o: Dictionary) -> void:
 func _draw_hud(n: Node2D) -> void:
 	if state in ["home", "intro"]:
 		return
-	var font: Font = Game.heading_font
-	var top_y := _top() + 46.0
-	var s := "%d" % int(score)
-	var sw := font.get_string_size(s, HORIZONTAL_ALIGNMENT_LEFT, -1, 46).x
-	_text(n, font, s, Vector2((view.x - sw) * 0.5, top_y + 10), 46, Color(0.15, 0.15, 0.18))
-	_text(n, font, "%d m" % int(dist), Vector2(28, top_y), 24, Color(0.2, 0.2, 0.25))
-	# the confetti collected: the little handful, then the count
-	# it pops when a piece is collected: a quick swell with a little wobble, settling back
+	var font: Font = hand_font()
+	var ink := Color(0.15, 0.15, 0.19, 0.92)
+	var red := Color(0.75, 0.16, 0.15, 0.9)
+	var x0 := 30.0
+	var top_y := _top() + 70.0
+	# stamps that have sat long enough are counted into the total
+	var keep: Array = []
+	var counted_in := 0
+	for st in stamps:
+		if clock - float(st["t"]) >= STAMP_HOLD + 0.45:
+			counted_in += int(st["pts"])
+		else:
+			keep.append(st)
+	stamps = keep
+	var total := int(score - drift_pts - _stamped(stamps))
+	if counted_in > 0:  # just counted in: the old total is what it was before these stamps
+		merged_from = total - counted_in
+		merged_t = clock
+	# the total, written in pencil; when a stamp is counted in, the old number is crossed out beside the new
+	var age := clock - merged_t
+	if age < 1.0:
+		var old := str(merged_from)
+		var ow := font.get_string_size(old, HORIZONTAL_ALIGNMENT_LEFT, -1, 62).x
+		var fade := 1.0 - smoothstep(0.6, 1.0, age)
+		_text(n, font, old, Vector2(x0, top_y), 62, Color(ink, ink.a * fade))
+		n.draw_line(Vector2(x0 - 4, top_y - 16), Vector2(x0 + ow + 4, top_y - 26), Color(ink, 0.8 * fade), 3.0, true)
+		_text(n, font, str(total), Vector2(x0 + (ow + 24) * fade, top_y), 62, ink)
+	else:
+		_text(n, font, str(total), Vector2(x0, top_y), 62, ink)
+	_text(n, font, "%d m" % int(dist), Vector2(x0 + 4, top_y + 34), 28, Color(ink, 0.6))
+	# confetti collected: the little handful and the count, popping when one is picked up
 	var pt := clock - pop_t
 	var pop := sin(clampf(pt / 0.28, 0.0, 1.0) * PI) if pt < 0.28 else 0.0
-	var wob := sin(pt * 40.0) * 0.12 * exp(-pt * 9.0) if pt < 0.5 else 0.0
-	var ic := Vector2(45, top_y + 33)
-	var isz := 50.0 * (1.0 + 0.32 * pop)
-	n.draw_set_transform(ic, wob, Vector2.ONE)
-	n.draw_texture_rect(_tex("handful"), Rect2(Vector2(-isz, -isz) * 0.5, Vector2(isz, isz)), false)
+	var ic := Vector2(x0 + 150, top_y + 24)
+	var isz := 36.0 * (1.0 + 0.32 * pop)
+	n.draw_texture_rect(_tex("handful"), Rect2(ic - Vector2(isz, isz) * 0.5, Vector2(isz, isz)), false)
+	_text(n, font, "%d" % coins_got, ic + Vector2(22, 10), int(28 + 6 * pop), Color(ink, 0.7))
+	# the drift being driven, pencilled under the total
+	if drift_on and drift_pts >= 1.0:
+		var live := "drifting  +%d" % int(drift_pts)
+		_text(n, font, live, Vector2(x0 + 2, top_y + 80), 36, Color(ink, 0.8))
+		if mult > 1:
+			var lw := font.get_string_size(live, HORIZONTAL_ALIGNMENT_LEFT, -1, 36).x
+			_text(n, font, "x%d" % mult, Vector2(x0 + lw + 18, top_y + 80), 36, red)
+	# the stamps: thumped down in red ink beside the total, then slid into it
+	for k in stamps.size():
+		var st: Dictionary = stamps[k]
+		var sa := clock - float(st["t"])
+		var into := smoothstep(STAMP_HOLD, STAMP_HOLD + 0.45, sa)
+		var thump := 1.0 + 0.45 * (1.0 - smoothstep(0.0, 0.12, sa))
+		var at := Vector2(x0 + 330.0 + k * 26.0, top_y - 18.0 + k * 12.0).lerp(Vector2(x0 + 70.0, top_y - 20.0), into)
+		_stamp(n, font, "+%d" % int(st["pts"]), at, float(st["rot"]), thump * (1.0 - 0.4 * into), 1.0 - smoothstep(0.7, 1.0, into), int(st["pts"]) > 400)
+
+
+func _stamped(list: Array) -> float:
+	var t := 0.0
+	for st in list:
+		t += float(st["pts"])
+	return t
+
+
+## A rubber stamp in red ink: a double rough border and the number, the ink a little patchy.
+func _stamp(n: Node2D, font: Font, text: String, at: Vector2, rot: float, k: float, a: float, big: bool) -> void:
+	var red := Color(0.74, 0.14, 0.13, 0.88 * a)
+	var size_px := 54 if big else 46
+	var w := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px).x
+	n.draw_set_transform(at, rot, Vector2(k, k))
+	var r := Rect2(-w * 0.5 - 18.0, -size_px * 0.62, w + 36.0, size_px * 1.05)
+	n.draw_rect(r, red, false, 3.4)
+	n.draw_rect(r.grow(-6.0), Color(red, red.a * 0.7), false, 1.8)
+	n.draw_string(font, Vector2(-w * 0.5, size_px * 0.28), text, HORIZONTAL_ALIGNMENT_LEFT, -1, size_px, red)
+	for i in 16:  # patchy ink: specks of paper showing through
+		var f := sin(i * 12.9898 + text.length() * 3.1) * 43758.5453
+		var u := f - floorf(f)
+		var g2 := sin(i * 78.233 + 1.7) * 12345.678
+		var v := g2 - floorf(g2)
+		n.draw_rect(Rect2(r.position + Vector2(u * r.size.x, v * r.size.y), Vector2(3, 2)), Color(0.97, 0.965, 0.95, 0.75 * a))
 	n.draw_set_transform(Vector2.ZERO)
-	_text(n, font, "%d" % coins_got, Vector2(74, top_y + 44), int(30 + 6 * pop), Color(0.2, 0.2, 0.25))
-	if mult > 1:
-		var m := "x%d COMBO" % mult
-		var mw := font.get_string_size(m, HORIZONTAL_ALIGNMENT_LEFT, -1, 26).x
-		_text(n, font, m, Vector2((view.x - mw) * 0.5, top_y + 46), 26, Color(0.85, 0.35, 0.15))
 
 
 func _text(n: Node2D, font: Font, s: String, p: Vector2, size: int, col: Color) -> void:
@@ -1880,13 +2049,9 @@ func _text(n: Node2D, font: Font, s: String, p: Vector2, size: int, col: Color) 
 func _back() -> void:
 	match state:
 		"play":
-			if overlay == null:
-				get_tree().paused = true
-				overlay = HoldToGo.new()
-				overlay.on_done = func():
-					_resume()
-					hold_lock = true  # the hold that started it again is not steering
-				ui.add_child(overlay)
+			_pause()
+		"crashed", "summary":
+			_home()
 		"home":
 			if overlay != null:  # back again on the question: stay
 				_stay()
@@ -1902,55 +2067,53 @@ func _stay() -> void:
 	overlay = null
 
 
-## Paused from the back button: "paused", and holding anywhere for a moment starts again.
-class HoldToGo extends Control:
-	const HOLD := 0.25
-	var on_done: Callable
-	var held := 0.0
-	var down := 0  # fingers on the screen
-
-	func _ready() -> void:
-		process_mode = Node.PROCESS_MODE_ALWAYS
-		mouse_filter = Control.MOUSE_FILTER_STOP
-		size = get_viewport_rect().size
-		var dim := ColorRect.new()
-		dim.color = Color(0.05, 0.05, 0.06, 0.6)
-		dim.size = size
-		dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		add_child(dim)
-		var box := VBoxContainer.new()
-		box.alignment = BoxContainer.ALIGNMENT_CENTER
-		box.add_theme_constant_override("separation", 18)
-		box.size = size
-		box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		add_child(box)
-		for t in [["PAUSED", 60], ["hold to start", 30]]:
-			var l := Label.new()
-			l.text = t[0]
-			l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-			l.add_theme_font_size_override("font_size", t[1])
-			if t[1] == 60:
-				l.add_theme_font_override("font", Game.title_font)
-			box.add_child(l)
-
-	func _gui_input(e: InputEvent) -> void:
-		if e is InputEventScreenTouch:
-			down = maxi(0, down + (1 if e.pressed else -1))
-
-	func _process(delta: float) -> void:
-		var holding := down > 0 or Input.is_action_pressed("ui_left") or Input.is_action_pressed("ui_right")
-		held = held + delta if holding else 0.0
-		if held >= HOLD and on_done.is_valid():
-			var f := on_done
-			on_done = Callable()  # once
-			f.call()
-
-
-func _pause() -> void:
+## Pause (the drawn sign, the back button): slow motion into a frozen pencil sketch of the moment, with
+## the pause written beside the car (pause_note.gd). `instant` when the app is being left: straight to frozen.
+func _pause(instant := false) -> void:
 	if overlay != null or state != "play":
 		return
-	get_tree().paused = true
-	overlay = _panel("PAUSED", [], [["Resume", _resume], ["Home", _home]])
+	touches.clear()
+	var note := PauseNote.new()
+	overlay = note
+	ui.add_child(note)
+	note.setup(self, instant)
+	pause_btn.visible = false
+
+
+## The pause note has eased time back up: the run carries on.
+## The pause sign: two bars in a ring, drawn in pencil (a button, at least 48 dp to tap).
+class PauseSign extends Button:
+	func _init() -> void:
+		flat = true
+		focus_mode = Control.FOCUS_NONE
+		custom_minimum_size = Vector2(84, 84)
+		size = Vector2(84, 84)
+
+	func _draw() -> void:
+		var c := size * 0.5
+		var ink := Color(0.15, 0.15, 0.19, 0.85)
+		var ring := PackedVector2Array()
+		for i in 31:
+			var a := 0.6 + TAU * 1.08 * i / 30.0
+			var r := 26.0 * (1.0 + 0.05 * i / 30.0) + sin(i * 2.7) * 0.6
+			ring.append(c + Vector2(cos(a), sin(a)) * r)
+		draw_polyline(ring, ink, 2.6, true)
+		draw_polyline(PackedVector2Array([c + Vector2(-7, -11), c + Vector2(-7.6, 0), c + Vector2(-7.2, 11)]), ink, 4.2, true)
+		draw_polyline(PackedVector2Array([c + Vector2(7, -11), c + Vector2(7.5, 0), c + Vector2(7.1, 11.5)]), ink, 4.2, true)
+
+
+func pause_done(note: Node) -> void:
+	note.queue_free()
+	overlay = null
+	pause_btn.visible = true
+
+
+func pause_start_over() -> void:
+	again_requested.emit()  # main.gd turns the page to a fresh run
+
+
+func drive_again() -> void:
+	again_requested.emit()
 
 
 func _resume() -> void:
@@ -1964,17 +2127,6 @@ func _resume() -> void:
 func _home() -> void:
 	get_tree().paused = false
 	home_requested.emit()
-
-
-func _show_summary() -> void:
-	state = "summary"
-	var lines := [
-		"Score  %d%s" % [int(score), "   NEW BEST" if int(score) > prev_best else "   best %d" % prev_best],
-		"Distance  %d m" % int(dist),
-		"Best combo  x%d" % best_combo,
-		"Confetti  %d" % coins_got,
-	]
-	overlay = _panel("CRASHED", lines, [["Drive again", func(): again_requested.emit()], ["Home", _home]])
 
 
 func _panel(title: String, lines: Array, buttons: Array) -> Control:
@@ -2034,6 +2186,8 @@ func _save() -> void:
 
 func _exit_tree() -> void:
 	get_tree().paused = false
+	Engine.time_scale = 1.0  # never leave the game slowed or muffled (a pause may be mid-way)
+	AudioServer.playback_speed_scale = 1.0
 	if scrib:
 		scrib.save_seen()  # remember the notes seen, however the run ended
 		inks.save()

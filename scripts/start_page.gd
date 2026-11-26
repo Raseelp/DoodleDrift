@@ -78,7 +78,9 @@ var shade_tex: Texture2D
 var shade_rect := Rect2()
 
 
-func setup(game: Node) -> void:
+## Where everything on the page goes (the camera, the title, the meet, the gear and the settings),
+## worked out before the road is drawn so the road can keep clear of the gear and the settings.
+func layout(game: Node) -> void:
 	g = game
 	# Fit the page across the screen; on a short, wide screen (a tablet) fit its height instead, so the
 	# whole page (best run, road, stats, meet and title) is always on screen.
@@ -97,6 +99,18 @@ func setup(game: Node) -> void:
 	panel_top = gear.y + 10.0
 	panel_x = maxf(395.0, half_w + 45.0)
 	settings_cam = Vector2(panel_x - 15.0, panel_top + 280.0)
+
+
+## The places the road must not run through (world rects): the gear and the settings writing.
+## It may pass close by or around them.
+func keep_clear() -> Array:
+	return [Rect2(gear - Vector2.ONE * (GEAR_R + 30.0), Vector2.ONE * (GEAR_R + 30.0) * 2.0), _panel_rect()]
+
+
+func setup(game: Node) -> void:
+	layout(game)
+	var half_h: float = g.view.y / home_zoom * 0.5
+	var half_w: float = g.view.x / home_zoom * 0.5
 	_build_meet()
 	# The still drawing is thousands of pencil strokes: drawn once into an image, which the page shows.
 	var art_top := minf(-430.0, gear.y - 50.0)  # from the gear at the top of the screen
